@@ -37,4 +37,47 @@ M2 adversarial-test plan: `brief-20260513-cz9x`.
 
 ## Status
 
-Design phase. No code yet. First concrete milestone: a 3-URL liveness watch that proves source → observation → triage → finding → pipe → channel → dispatch end-to-end.
+Slice 0 (project scaffolding) complete. Python package layout, Click CLI stub, SQLite migration scaffolding, systemd unit template, smoke test. Runtime features arrive in later slices.
+
+## Install
+
+```sh
+pip install -e .
+```
+
+## Run
+
+```sh
+angelus --help
+```
+
+Slice 0 only guarantees the root CLI help surface. A placeholder `angelus daemon` command is present for the service template and future slices.
+
+## Storage
+
+SQLite is the authoritative lifecycle store. Migrations live in `migrations/` as ordered SQL files named `<NNNN>_<name>.sql`. The storage initializer enables WAL mode and applies pending migrations in order, with each migration and its `schema_migrations` bookkeeping recorded atomically.
+
+The initial migration creates the v3.1 tables:
+
+- `source_fires`
+- `observations`
+- `findings`
+- `incidents`
+- `triager_state`
+- `pipe_queues`
+- `dispatches`
+- `dep_health`
+- `schedule_registry`
+- `backoff_store`
+
+`observations` and `findings` both include a `status` column for the later `writing` to `ready` write-order protocol.
+
+## Service template
+
+`deploy/angelus.service` is checked in as a template only. Not installed or enabled by this repository.
+
+## Development
+
+```sh
+pytest
+```

@@ -1,17 +1,3 @@
-# SKEIN local state — registered globally via ~/.skein/projects.json
-.skein/
-
-# Python / Node / etc. — pre-populate as the project grows
+*.egg-info/
 __pycache__/
-*.pyc
-.venv/
-node_modules/
-
-# Editor / OS noise
-*~
-*#
-.#*
-.DS_Store
-
-# Patrick's scratch
-topost
+.pytest_cache/

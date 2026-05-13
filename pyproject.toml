@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "angelus"
+version = "0.1.0"
+description = "Scheduling, consolidation, and escalation spine for autonomous agent work."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "apscheduler",
+    "click",
+    "httpx",
+    "pyyaml",
+    "watchdog",
+]
+
+[project.scripts]
+angelus = "angelus.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["angelus*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
