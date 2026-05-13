@@ -6,6 +6,8 @@ __pycache__/
 *.pyc
 .venv/
 node_modules/
+*.egg-info/
+.pytest_cache/
 
 # Editor / OS noise
 *~
