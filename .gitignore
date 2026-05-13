@@ -9,6 +9,12 @@ node_modules/
 *.egg-info/
 .pytest_cache/
 
+# Angelus runtime state
+state/
+observations/
+findings/
+dispatches.log
+
 # Editor / OS noise
 *~
 *#
