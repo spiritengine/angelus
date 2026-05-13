@@ -46,12 +46,37 @@ def migrate(
     for path in migration_paths:
         if path.name in applied:
             continue
-        with connection:
-            connection.executescript(path.read_text(encoding="utf-8"))
+        connection.execute("BEGIN")
+        try:
+            for statement in _iter_sql_statements(path.read_text(encoding="utf-8")):
+                connection.execute(statement)
             connection.execute(
                 "INSERT INTO schema_migrations (version) VALUES (?)",
                 (path.name,),
             )
+        except Exception:
+            connection.rollback()
+            raise
+        else:
+            connection.commit()
+
+
+def _iter_sql_statements(sql: str) -> list[str]:
+    """Split a migration file into complete SQLite statements."""
+    statements: list[str] = []
+    buffer: list[str] = []
+    for line in sql.splitlines():
+        buffer.append(line)
+        candidate = "\n".join(buffer).strip()
+        if candidate and sqlite3.complete_statement(candidate):
+            statements.append(candidate)
+            buffer.clear()
+
+    trailing = "\n".join(buffer).strip()
+    if trailing:
+        raise sqlite3.ProgrammingError("incomplete SQL statement in migration")
+
+    return statements
 
 
 def init_db(
