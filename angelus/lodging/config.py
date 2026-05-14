@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -31,8 +31,10 @@ class Pipe:
     name: str
     cadence: str
     render_kind: str
-    template: str
+    template: str | None
     channels: list[str]
+    render: dict[str, Any] = field(default_factory=dict)
+    rate_limit: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -40,6 +42,7 @@ class Channel:
     name: str
     kind: str
     command: str
+    to: str | None = None
 
 
 @dataclass(frozen=True)
@@ -115,14 +118,22 @@ def _load_pipes(root: Path) -> dict[str, Pipe]:
         data = _read_yaml(path)
         name = path.stem
         render = _required_dict(data, "render", path)
-        if render.get("kind") != "dumb-alert":
-            raise ValueError(f"{path}: only render.kind=dumb-alert is supported")
+        if render.get("kind") == "dumb-alert":
+            render_kind = "dumb-alert"
+            template = _required_str(render, "template", path)
+        elif isinstance(render.get("preamble"), list) and isinstance(render.get("body"), dict):
+            render_kind = "digest"
+            template = None
+        else:
+            raise ValueError(f"{path}: unsupported render shape")
         loaded[name] = Pipe(
             name=name,
             cadence=_required_str(data, "cadence", path),
-            render_kind="dumb-alert",
-            template=_required_str(render, "template", path),
+            render_kind=render_kind,
+            template=template,
             channels=list(data.get("channels") or []),
+            render=render,
+            rate_limit=dict(data.get("rate_limit") or {}),
         )
     return loaded
 
@@ -132,12 +143,25 @@ def _load_channels(root: Path) -> dict[str, Channel]:
     for path in sorted((root / "channels").glob("*.yaml")):
         data = _read_yaml(path)
         name = path.stem
-        if data.get("kind") != "push":
-            raise ValueError(f"{path}: only channel kind=push is supported")
+        kind = data.get("kind")
+        if kind not in {"push", "email"}:
+            raise ValueError(f"{path}: unsupported channel kind={kind!r}")
+        if kind == "email":
+            to = _required_str(data, "to", path)
+        else:
+            to = None
         loaded[name] = Channel(
             name=name,
-            kind="push",
-            command=str(data.get("command") or "notify-pat"),
+            kind=str(kind),
+            command=str(
+                data.get("command")
+                or (
+                    "/home/user/projects/patbot-email/patbot-email"
+                    if kind == "email"
+                    else "notify-pat"
+                )
+            ),
+            to=to,
         )
     return loaded
 

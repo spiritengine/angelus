@@ -6,7 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from angelus.daemon import AngelusDaemon, _cadence_seconds
+from apscheduler.triggers.cron import CronTrigger
+
+from angelus.daemon import AngelusDaemon, _cadence_seconds, _make_trigger
 from angelus.lodging import load_lodging
 from angelus.storage import Catalog, init_db
 from angelus.triage import run_python_triager
@@ -117,10 +119,12 @@ def test_cadence_parser_requires_unit_suffix() -> None:
 
     with pytest.raises(ValueError, match="unit suffix"):
         _cadence_seconds("15")
-    with pytest.raises(ValueError, match="cron"):
-        _cadence_seconds("0 8 * * *")
     with pytest.raises(ValueError, match="positive"):
         _cadence_seconds("0s")
+
+
+def test_make_trigger_accepts_crontab_cadence() -> None:
+    assert isinstance(_make_trigger("0 8 * * *"), CronTrigger)
 
 
 def _write_minimal_lodging(root: Path) -> None:

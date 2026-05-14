@@ -9,6 +9,7 @@ import signal
 from pathlib import Path
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from angelus.lodging import Lodging, ScheduledSource, load_lodging
@@ -63,7 +64,9 @@ class AngelusDaemon:
             scheduler_started = True
             LOGGER.info("scheduler started with %d jobs", len(self.scheduler.get_jobs()))
             self.tasks.append(asyncio.create_task(self._triage_loop(), name="triage-loop"))
-            for pipe_name in self.pipe_drains:
+            for pipe_name, pipe in self.lodging.pipes.items():
+                if pipe.cadence != "immediate":
+                    continue
                 self.tasks.append(
                     asyncio.create_task(self._pipe_loop(pipe_name), name=f"pipe-{pipe_name}")
                 )
@@ -90,7 +93,7 @@ class AngelusDaemon:
 
     def _register_sources(self) -> None:
         for source in self.lodging.sources.values():
-            trigger = IntervalTrigger(seconds=_cadence_seconds(source.cadence))
+            trigger = _make_trigger(source.cadence)
             self.scheduler.add_job(
                 self._fire_source,
                 trigger,
@@ -100,10 +103,22 @@ class AngelusDaemon:
                 coalesce=True,
             )
             LOGGER.info(
-                "registered scheduled source %s every %s",
+                "registered scheduled source %s on %s",
                 source.source_ref,
                 source.cadence,
             )
+        for pipe in self.lodging.pipes.values():
+            if pipe.cadence == "immediate":
+                continue
+            trigger = _make_trigger(pipe.cadence)
+            self.scheduler.add_job(
+                self.pipe_drains[pipe.name].drain_once,
+                trigger,
+                id=f"pipe:{pipe.name}",
+                max_instances=1,
+                coalesce=True,
+            )
+            LOGGER.info("registered pipe %s on %s", pipe.name, pipe.cadence)
 
     async def _fire_source(self, source: ScheduledSource) -> None:
         async with self.scheduler_semaphore:
@@ -219,8 +234,7 @@ _CADENCE_UNITS = {
 def _cadence_seconds(cadence: str) -> int:
     """Parse interval cadence strings like '15m', '30s', '2h'.
 
-    Cron expressions are not yet supported (slice 3). A unit suffix is required —
-    bare integers are rejected so 'cadence: 15' cannot silently mean 15 seconds.
+    A unit suffix is required so 'cadence: 15' cannot silently mean 15 seconds.
     """
     text = cadence.strip().lower()
     for suffix in sorted(_CADENCE_UNITS, key=len, reverse=True):
@@ -234,9 +248,15 @@ def _cadence_seconds(cadence: str) -> int:
                 raise ValueError(f"invalid cadence {cadence!r}: must be positive")
             return magnitude * _CADENCE_UNITS[suffix]
     raise ValueError(
-        f"invalid cadence {cadence!r}: expected unit suffix (s, m, h); "
-        "cron expressions land in slice 3"
+        f"invalid cadence {cadence!r}: expected unit suffix (s, m, h)"
     )
+
+
+def _make_trigger(cadence: str):
+    """Build an APScheduler trigger from an interval or crontab cadence."""
+    if any(char.isspace() for char in cadence.strip()):
+        return CronTrigger.from_crontab(cadence)
+    return IntervalTrigger(seconds=_cadence_seconds(cadence))
 
 
 def main(root: Path | None = None) -> None:

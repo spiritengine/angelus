@@ -16,6 +16,7 @@ EXPECTED_TABLES = {
     "triager_state",
     "pipe_queues",
     "dispatches",
+    "pipe_state",
     "dep_health",
     "schedule_registry",
     "backoff_store",
