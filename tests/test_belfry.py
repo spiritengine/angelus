@@ -125,6 +125,20 @@ def test_pid_missing_path_hits_down_and_escalates(tmp_path, monkeypatch) -> None
     assert "missing PID file" in calls[0][1]
 
 
+def test_pid_permission_error_is_treated_as_alive(tmp_path, monkeypatch, capsys) -> None:
+    belfry = _load_belfry()
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "angelus.pid").write_text("12345", encoding="utf-8")
+
+    def deny_kill(_pid: int, _signal: int) -> None:
+        raise PermissionError
+
+    monkeypatch.setattr(belfry.os, "kill", deny_kill)
+
+    assert belfry.pid_failure(tmp_path / "state" / "angelus.pid") is None
+    assert "permission denied" in capsys.readouterr().err
+
+
 def test_wedge_path_hits_down_and_escalates(tmp_path, monkeypatch) -> None:
     belfry = _load_belfry()
     _set_urls(monkeypatch)

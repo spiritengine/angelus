@@ -28,7 +28,7 @@ def main(argv: list[str] | None = None) -> int:
     wedge_reason = None if dead_reason else wedge_failure(state / "angelus.sqlite3")
 
     if dead_reason or wedge_reason:
-        reason = dead_reason or wedge_reason or "unknown failure"
+        reason = dead_reason or wedge_reason
         ok = ping_env("ANGELUS_BELFRY_DOWN_URL")
         ok = notify(reason) and ok
         print(f"angelus belfry: DOWN: {reason}", file=sys.stderr)
@@ -53,6 +53,8 @@ def pid_failure(pid_file: Path) -> str | None:
     except ProcessLookupError:
         return f"dead: PID {pid} is not running"
     except PermissionError:
+        # EPERM still implies the process exists even if cron cannot signal it.
+        print(f"angelus belfry: cannot confirm PID {pid} via os.kill(0): permission denied", file=sys.stderr)
         return None
     return None
 
@@ -93,8 +95,11 @@ def wedge_threshold() -> timedelta:
 def latest_fire(db_path: Path) -> datetime | None:
     quoted = urllib.parse.quote(str(db_path), safe="/:")
     uri = f"file:{quoted}?mode=ro"
-    with sqlite3.connect(uri, uri=True) as connection:
+    connection = sqlite3.connect(uri, uri=True)
+    try:
         row = connection.execute("SELECT max(fired_at) FROM source_fires").fetchone()
+    finally:
+        connection.close()
     value = row[0] if row else None
     if value is None:
         return None

@@ -41,8 +41,8 @@ class AngelusDaemon:
 
     async def run(self) -> None:
         scheduler_started = False
-        self.pid_file.write_text(str(os.getpid()), encoding="utf-8")
         try:
+            self.pid_file.write_text(str(os.getpid()), encoding="utf-8")
             LOGGER.info(
                 "loaded lodging: %d sources, %d triagers, %d pipes, %d channels",
                 len(self.lodging.sources),
