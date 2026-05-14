@@ -122,33 +122,131 @@ def test_cadence_parser_requires_unit_suffix() -> None:
         _cadence_seconds("0s")
 
 
-def test_triage_semaphore_bounds_concurrency() -> None:
-    """The triage loop must fan out so the semaphore actually bounds parallelism.
-    The slice-1-merged version awaited inline, making the semaphore a no-op."""
+def _write_minimal_lodging(root: Path) -> None:
+    (root / "sources" / "scheduled").mkdir(parents=True)
+    (root / "sources" / "scheduled" / "fanout.yaml").write_text(
+        "cadence: 1h\n"
+        "check:\n"
+        "  kind: shell\n"
+        "  command: 'echo {}'\n"
+    )
+    (root / "triagers" / "handlers").mkdir(parents=True)
+    (root / "triagers" / "fanout.yaml").write_text(
+        "inputs:\n"
+        "  source: scheduled/fanout\n"
+        "handler:\n"
+        "  kind: python\n"
+        "  path: triagers/handlers/fanout.py\n"
+    )
+    (root / "triagers" / "handlers" / "fanout.py").write_text(
+        "import json, sys\n"
+        "print(json.dumps({'findings': [], 'new_state': {}}))\n"
+    )
+    (root / "pipes").mkdir()
+    (root / "pipes" / "now.yaml").write_text(
+        "cadence: immediate\n"
+        "channels: [push]\n"
+        "render:\n"
+        "  kind: dumb-alert\n"
+        "  template: 'x'\n"
+    )
+    (root / "channels").mkdir()
+    (root / "channels" / "push.yaml").write_text(
+        "kind: push\ncommand: 'true'\n"
+    )
+
+
+def _measure_triage_peak_concurrency(
+    tmp_path: Path, loop_impl
+) -> int:
+    """Run `loop_impl` as a daemon's `_triage_loop` and return observed peak
+    in-flight concurrency. `loop_impl` is an async coroutine function bound to
+    a daemon, so callers can compare fan-out vs inline-await shapes."""
+    from angelus.daemon import AngelusDaemon
+
+    daemon = AngelusDaemon(tmp_path)
     sem_size = 3
-    job_count = 8
-    sem = asyncio.Semaphore(sem_size)
+    daemon.triage_semaphore = asyncio.Semaphore(sem_size)
+
+    for _ in range(8):
+        daemon.catalog.write_observation(
+            "scheduled/fanout", {"x": 1}, {"source": "scheduled/fanout"}
+        )
+
     in_flight = 0
     peak = 0
     release = asyncio.Event()
 
-    async def fake_handler() -> None:
+    async def fake_run_triager(_row, _triager_name: str) -> None:
         nonlocal in_flight, peak
-        async with sem:
-            in_flight += 1
-            peak = max(peak, in_flight)
+        in_flight += 1
+        peak = max(peak, in_flight)
+        try:
             await release.wait()
+        finally:
             in_flight -= 1
 
+    daemon._run_triager = fake_run_triager  # type: ignore[method-assign]
+
     async def driver() -> None:
-        tasks = [asyncio.create_task(fake_handler()) for _ in range(job_count)]
-        await asyncio.sleep(0.05)
-        assert in_flight == sem_size, f"semaphore did not cap at {sem_size}"
+        loop_task = asyncio.create_task(loop_impl(daemon))
+        for _ in range(30):
+            await asyncio.sleep(0.05)
+            if in_flight >= sem_size:
+                break
+        daemon.stop_event.set()
         release.set()
-        await asyncio.gather(*tasks)
+        try:
+            await asyncio.wait_for(loop_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            loop_task.cancel()
 
     asyncio.run(driver())
-    assert peak == sem_size
+    daemon.connection.close()
+    return peak
+
+
+async def _inline_await_triage_loop(daemon) -> None:
+    """The pre-cleanup shape: await `_run_triager` inline under the semaphore.
+    Mirrors what slice 1 originally shipped. Should produce peak concurrency 1."""
+    while not daemon.stop_event.is_set():
+        did_work = False
+        for triager in daemon.lodging.triagers.values():
+            rows = daemon.catalog.ready_observations_for(
+                triager.name, triager.source_ref
+            )
+            for row in rows:
+                did_work = True
+                daemon.catalog.mark_triage_processing(row["id"], triager.name)
+                async with daemon.triage_semaphore:
+                    await daemon._run_triager(row, triager.name)
+        if not did_work:
+            await asyncio.sleep(0.05)
+
+
+def test_triage_loop_fans_out_concurrently(tmp_path, monkeypatch) -> None:
+    """The triage loop must spawn tasks rather than await inline; otherwise the
+    triage semaphore caps nothing. The current `_triage_loop` should observe
+    peak concurrency equal to the semaphore size; the inline-await shape should
+    observe peak 1. Asserting both makes the test discriminating, not tautological."""
+    _write_minimal_lodging(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    from angelus.daemon import AngelusDaemon
+
+    fanout_peak = _measure_triage_peak_concurrency(
+        tmp_path, lambda d: AngelusDaemon._triage_loop(d)
+    )
+    assert fanout_peak == 3, (
+        f"current _triage_loop did not fan out: peak={fanout_peak}, expected 3"
+    )
+
+    inline_peak = _measure_triage_peak_concurrency(
+        tmp_path, _inline_await_triage_loop
+    )
+    assert inline_peak == 1, (
+        f"inline-await control case unexpectedly concurrent: peak={inline_peak}"
+    )
 
 
 def test_mark_triage_processing_raises_on_duplicate(tmp_path) -> None:
