@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from angelus.daemon import _cadence_seconds
+from angelus.daemon import AngelusDaemon, _cadence_seconds
 from angelus.lodging import load_lodging
 from angelus.storage import Catalog, init_db
 from angelus.triage import run_python_triager
@@ -142,18 +142,6 @@ def _write_minimal_lodging(root: Path) -> None:
         "import json, sys\n"
         "print(json.dumps({'findings': [], 'new_state': {}}))\n"
     )
-    (root / "pipes").mkdir()
-    (root / "pipes" / "now.yaml").write_text(
-        "cadence: immediate\n"
-        "channels: [push]\n"
-        "render:\n"
-        "  kind: dumb-alert\n"
-        "  template: 'x'\n"
-    )
-    (root / "channels").mkdir()
-    (root / "channels" / "push.yaml").write_text(
-        "kind: push\ncommand: 'true'\n"
-    )
 
 
 def _measure_triage_peak_concurrency(
@@ -162,8 +150,6 @@ def _measure_triage_peak_concurrency(
     """Run `loop_impl` as a daemon's `_triage_loop` and return observed peak
     in-flight concurrency. `loop_impl` is an async coroutine function bound to
     a daemon, so callers can compare fan-out vs inline-await shapes."""
-    from angelus.daemon import AngelusDaemon
-
     daemon = AngelusDaemon(tmp_path)
     sem_size = 3
     daemon.triage_semaphore = asyncio.Semaphore(sem_size)
@@ -224,18 +210,15 @@ async def _inline_await_triage_loop(daemon) -> None:
             await asyncio.sleep(0.05)
 
 
-def test_triage_loop_fans_out_concurrently(tmp_path, monkeypatch) -> None:
+def test_triage_loop_fans_out_concurrently(tmp_path) -> None:
     """The triage loop must spawn tasks rather than await inline; otherwise the
     triage semaphore caps nothing. The current `_triage_loop` should observe
     peak concurrency equal to the semaphore size; the inline-await shape should
     observe peak 1. Asserting both makes the test discriminating, not tautological."""
     _write_minimal_lodging(tmp_path)
-    monkeypatch.chdir(tmp_path)
-
-    from angelus.daemon import AngelusDaemon
 
     fanout_peak = _measure_triage_peak_concurrency(
-        tmp_path, lambda d: AngelusDaemon._triage_loop(d)
+        tmp_path, AngelusDaemon._triage_loop
     )
     assert fanout_peak == 3, (
         f"current _triage_loop did not fan out: peak={fanout_peak}, expected 3"
