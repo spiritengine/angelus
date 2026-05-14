@@ -56,6 +56,8 @@ class AngelusDaemon:
             self._install_signal_handlers()
             recovered, failed = self.catalog.recover_writing_rows()
             LOGGER.info("startup recovery: %d ready, %d failed", recovered, failed)
+            # Channels stay unhealthy only until daemon restart (slice 2 scope).
+            self.catalog.clear_channel_health()
             self._register_sources()
             self.scheduler.start()
             scheduler_started = True

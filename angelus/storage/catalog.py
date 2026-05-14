@@ -380,6 +380,21 @@ class Catalog:
             (channel, error, utcnow()),
         )
 
+    def is_channel_unhealthy(self, channel: str) -> bool:
+        row = self.connection.execute(
+            """
+            SELECT 1
+            FROM channel_health
+            WHERE channel = ? AND status = 'unhealthy'
+            """,
+            (channel,),
+        ).fetchone()
+        return row is not None
+
+    def clear_channel_health(self) -> None:
+        self.connection.execute("DELETE FROM channel_health")
+        self.connection.commit()
+
     def write_internal_finding(
         self, source: str, finding_type: str, entity: str, body: str, known_pipes: set[str]
     ) -> int:

@@ -34,6 +34,8 @@ class PipeDrain:
                 finding_id = int(row["id"])
                 message = self._render(row)
                 for channel_name in self.pipe.channels:
+                    if self.catalog.is_channel_unhealthy(channel_name):
+                        continue
                     channel = self.channels[channel_name]
                     try:
                         await send_push(channel, message, self.workdir)

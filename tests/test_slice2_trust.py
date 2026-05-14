@@ -243,6 +243,66 @@ def test_dispatch_retry_schedule_and_internal_finding(tmp_path, monkeypatch) -> 
     assert internal["severity"] == "high"
 
 
+def test_drain_skips_unhealthy_channel_and_leaves_queue_pending(
+    tmp_path, monkeypatch
+) -> None:
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    pipe = Pipe(
+        name="now",
+        cadence="immediate",
+        render_kind="dumb-alert",
+        template="{type}:{entity}:{body}",
+        channels=["push"],
+    )
+    channel = Channel(name="push", kind="push", command="notify-pat")
+    drain = PipeDrain(catalog, pipe, {"push": channel}, tmp_path, {"now"})
+    observation_id = catalog.write_observation("scheduled/a", {}, {"source": "scheduled/a"})
+    finding_id = catalog.write_finding(
+        observation_id,
+        {
+            "source": "scheduled/a",
+            "type": "down",
+            "entity": "example",
+            "severity": "high",
+            "target_pipes": ["now"],
+        },
+        {"now"},
+    )
+    catalog.mark_channel_unhealthy("push", "still down")
+    connection.commit()
+
+    attempts = 0
+
+    async def fail_if_called(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise AssertionError("send_push should not run for unhealthy channels")
+
+    monkeypatch.setattr(pipe_runner, "send_push", fail_if_called)
+    try:
+        asyncio.run(drain.drain_once())
+        queue = connection.execute(
+            """
+            SELECT status, attempts, next_attempt_at
+            FROM pipe_queues
+            WHERE finding_id = ? AND pipe = 'now'
+            """,
+            (finding_id,),
+        ).fetchone()
+        dispatch_count = connection.execute(
+            "SELECT COUNT(*) AS n FROM dispatches"
+        ).fetchone()
+    finally:
+        connection.close()
+
+    assert attempts == 0
+    assert queue["status"] == "pending"
+    assert queue["attempts"] == 0
+    assert queue["next_attempt_at"] is None
+    assert dispatch_count["n"] == 0
+
+
 def test_triager_source_mutex_serializes_same_pair_but_not_different_pairs(tmp_path) -> None:
     _write_trust_lodging(tmp_path)
     angelus = AngelusDaemon(tmp_path)
@@ -343,3 +403,36 @@ def test_startup_recovery_marks_writing_rows_by_body_presence(tmp_path) -> None:
         connection.close()
 
     assert rows == {1: "ready", 2: "failed"}
+
+
+def test_startup_clears_channel_health(tmp_path) -> None:
+    _write_trust_lodging(tmp_path)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    connection = init_db(state_dir / "angelus.sqlite3")
+    connection.execute(
+        """
+        INSERT INTO channel_health (channel, status, last_error)
+        VALUES ('push', 'unhealthy', 'broke earlier')
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    angelus = AngelusDaemon(tmp_path)
+
+    async def run_briefly() -> None:
+        run_task = asyncio.create_task(angelus.run())
+        await asyncio.sleep(0.05)
+        angelus.request_stop()
+        await asyncio.wait_for(run_task, timeout=2.0)
+
+    asyncio.run(run_briefly())
+
+    connection = init_db(state_dir / "angelus.sqlite3")
+    try:
+        rows = list(connection.execute("SELECT channel, status FROM channel_health"))
+    finally:
+        connection.close()
+
+    assert rows == []
