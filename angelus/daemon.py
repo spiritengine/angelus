@@ -13,7 +13,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from angelus.lodging import Lodging, ScheduledSource, load_lodging
 from angelus.pipes import PipeDrain
 from angelus.sources import run_shell_source
-from angelus.storage import Catalog, init_db, utcnow
+from angelus.storage import Catalog, init_db
 from angelus.triage import run_python_triager
 
 LOGGER = logging.getLogger(__name__)
@@ -87,10 +87,13 @@ class AngelusDaemon:
 
     async def _fire_source(self, source: ScheduledSource) -> None:
         async with self.scheduler_semaphore:
-            scheduled_at = utcnow()
             ok, payload = await run_shell_source(source)
             outcome = "ok" if ok else "check_failed"
-            self.catalog.record_source_fire(source.source_ref, scheduled_at, outcome)
+            # scheduled_at left NULL: APScheduler does not pass planned-fire time
+            # into the job body. Belt overdue (slice 2) reads fired_at; belfry
+            # wedge detection (slice 4) reads fired_at. Wire the planned time
+            # via a job listener if a real consumer appears.
+            self.catalog.record_source_fire(source.source_ref, None, outcome)
             if ok:
                 observation_id = self.catalog.write_observation(
                     source.source_ref,
@@ -102,20 +105,38 @@ class AngelusDaemon:
                 LOGGER.warning("source %s failed: %s", source.source_ref, payload)
 
     async def _triage_loop(self) -> None:
-        while not self.stop_event.is_set():
-            did_work = False
-            for triager in self.lodging.triagers.values():
-                rows = self.catalog.ready_observations_for(
-                    triager.name, triager.source_ref
-                )
-                for row in rows:
-                    did_work = True
-                    if not self.catalog.mark_triage_processing(row["id"], triager.name):
-                        continue
-                    async with self.triage_semaphore:
-                        await self._run_triager(row, triager.name)
-            if not did_work:
-                await asyncio.sleep(1)
+        in_flight: set[asyncio.Task[None]] = set()
+        try:
+            while not self.stop_event.is_set():
+                self._reap_triage_tasks(in_flight)
+                did_work = False
+                for triager in self.lodging.triagers.values():
+                    rows = self.catalog.ready_observations_for(
+                        triager.name, triager.source_ref
+                    )
+                    for row in rows:
+                        did_work = True
+                        self.catalog.mark_triage_processing(row["id"], triager.name)
+                        task = asyncio.create_task(
+                            self._triage_under_semaphore(row, triager.name)
+                        )
+                        in_flight.add(task)
+                await asyncio.sleep(0.1 if did_work or in_flight else 1)
+        finally:
+            if in_flight:
+                await asyncio.gather(*in_flight, return_exceptions=True)
+                self._reap_triage_tasks(in_flight)
+
+    def _reap_triage_tasks(self, in_flight: set[asyncio.Task[None]]) -> None:
+        for task in [t for t in in_flight if t.done()]:
+            in_flight.discard(task)
+            exc = task.exception()
+            if exc is not None:
+                LOGGER.error("triage task crashed", exc_info=exc)
+
+    async def _triage_under_semaphore(self, row, triager_name: str) -> None:
+        async with self.triage_semaphore:
+            await self._run_triager(row, triager_name)
 
     async def _run_triager(self, row, triager_name: str) -> None:
         triager = self.lodging.triagers[triager_name]

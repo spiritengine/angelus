@@ -120,3 +120,51 @@ def test_cadence_parser_requires_unit_suffix() -> None:
         _cadence_seconds("0 8 * * *")
     with pytest.raises(ValueError, match="positive"):
         _cadence_seconds("0s")
+
+
+def test_triage_semaphore_bounds_concurrency() -> None:
+    """The triage loop must fan out so the semaphore actually bounds parallelism.
+    The slice-1-merged version awaited inline, making the semaphore a no-op."""
+    sem_size = 3
+    job_count = 8
+    sem = asyncio.Semaphore(sem_size)
+    in_flight = 0
+    peak = 0
+    release = asyncio.Event()
+
+    async def fake_handler() -> None:
+        nonlocal in_flight, peak
+        async with sem:
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await release.wait()
+            in_flight -= 1
+
+    async def driver() -> None:
+        tasks = [asyncio.create_task(fake_handler()) for _ in range(job_count)]
+        await asyncio.sleep(0.05)
+        assert in_flight == sem_size, f"semaphore did not cap at {sem_size}"
+        release.set()
+        await asyncio.gather(*tasks)
+
+    asyncio.run(driver())
+    assert peak == sem_size
+
+
+def test_mark_triage_processing_raises_on_duplicate(tmp_path) -> None:
+    """Slice 1's loop never double-marks (the JOIN filters processed rows), so
+    swallowing IntegrityError hid logic bugs. After cleanup, a duplicate raises
+    loudly so a regression in the routing surfaces immediately."""
+    import sqlite3
+
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    try:
+        observation_id = catalog.write_observation(
+            "scheduled/test", {}, {"source": "scheduled/test"}
+        )
+        catalog.mark_triage_processing(observation_id, "dead-link")
+        with pytest.raises(sqlite3.IntegrityError):
+            catalog.mark_triage_processing(observation_id, "dead-link")
+    finally:
+        connection.close()
