@@ -26,7 +26,16 @@ async def run_python_triager(
         {"observation": observation, "prior_state": prior_state},
         sort_keys=True,
     ).encode("utf-8")
-    stdout, stderr = await process.communicate(payload)
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(payload), timeout=triager.timeout_seconds
+        )
+    except TimeoutError as exc:
+        process.kill()
+        await process.wait()
+        raise RuntimeError(
+            f"triager {triager.name} timed out after {triager.timeout_seconds:g}s"
+        ) from exc
     if stderr:
         sys.stderr.write(stderr.decode("utf-8", errors="replace"))
     if process.returncode != 0:

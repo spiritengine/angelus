@@ -14,7 +14,17 @@ async def run_shell_source(source: ScheduledSource) -> tuple[bool, dict[str, obj
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await process.communicate()
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(), timeout=source.timeout_seconds
+        )
+    except TimeoutError:
+        process.kill()
+        await process.wait()
+        return False, {
+            "error": f"shell check timed out after {source.timeout_seconds:g}s",
+            "timeout_seconds": source.timeout_seconds,
+        }
     if process.returncode != 0:
         error = stderr.decode("utf-8", errors="replace").strip()
         return False, {"error": error, "returncode": process.returncode}
