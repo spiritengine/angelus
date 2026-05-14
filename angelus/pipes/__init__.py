@@ -1,4 +1,3 @@
-"""Pipe drain scaffolding."""
 """Pipe runners."""
 
 from .runner import PipeDrain

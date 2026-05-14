@@ -1,4 +1,3 @@
-"""Channel scaffolding."""
 """Channel senders."""
 
 from .push import send_push
