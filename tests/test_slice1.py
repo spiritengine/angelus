@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 
+import pytest
+
+from angelus.daemon import _cadence_seconds
 from angelus.lodging import load_lodging
 from angelus.storage import Catalog, init_db
 from angelus.triage import run_python_triager
@@ -73,3 +76,47 @@ def test_observation_and_finding_write_order(tmp_path) -> None:
     assert finding["status"] == "ready"
     assert (tmp_path / finding["body_ref"]).exists()
     assert queue["status"] == "pending"
+
+
+def test_writing_row_visible_when_body_write_fails(tmp_path) -> None:
+    """Spec §Storage: recovery scans `writing` rows. The first commit must land
+    before the body write, so a crash mid-write leaves a recoverable row."""
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("simulated mid-write crash")
+
+    catalog._write_body = boom  # type: ignore[method-assign]
+    try:
+        with pytest.raises(RuntimeError):
+            catalog.write_observation(
+                "scheduled/test",
+                {"k": "v"},
+                {"source": "scheduled/test"},
+            )
+
+        rows = list(
+            connection.execute(
+                "SELECT status FROM observations WHERE source = 'scheduled/test'"
+            )
+        )
+    finally:
+        connection.close()
+
+    assert len(rows) == 1
+    assert rows[0]["status"] == "writing"
+
+
+def test_cadence_parser_requires_unit_suffix() -> None:
+    assert _cadence_seconds("15m") == 900
+    assert _cadence_seconds("30s") == 30
+    assert _cadence_seconds("2h") == 7200
+    assert _cadence_seconds("15min") == 900
+
+    with pytest.raises(ValueError, match="unit suffix"):
+        _cadence_seconds("15")
+    with pytest.raises(ValueError, match="cron"):
+        _cadence_seconds("0 8 * * *")
+    with pytest.raises(ValueError, match="positive"):
+        _cadence_seconds("0s")

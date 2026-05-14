@@ -14,7 +14,6 @@ class ScheduledSource:
     name: str
     source_ref: str
     cadence: str
-    url: str
     command: str
 
 
@@ -77,12 +76,10 @@ def _load_sources(root: Path) -> dict[str, ScheduledSource]:
         check = _required_dict(data, "check", path)
         if check.get("kind") != "shell":
             raise ValueError(f"{path}: only check.kind=shell is supported")
-        url = _required_str(data, "url", path)
         loaded[source_ref] = ScheduledSource(
             name=name,
             source_ref=source_ref,
             cadence=_required_str(data, "cadence", path),
-            url=url,
             command=_required_str(check, "command", path),
         )
     return loaded

@@ -146,17 +146,37 @@ class AngelusDaemon:
             await asyncio.sleep(1)
 
 
+_CADENCE_UNITS = {
+    "s": 1,
+    "sec": 1,
+    "m": 60,
+    "min": 60,
+    "h": 3600,
+    "hr": 3600,
+}
+
+
 def _cadence_seconds(cadence: str) -> int:
+    """Parse interval cadence strings like '15m', '30s', '2h'.
+
+    Cron expressions are not yet supported (slice 3). A unit suffix is required —
+    bare integers are rejected so 'cadence: 15' cannot silently mean 15 seconds.
+    """
     text = cadence.strip().lower()
-    if text.endswith("min"):
-        return int(text[:-3].strip()) * 60
-    if text.endswith("m"):
-        return int(text[:-1]) * 60
-    if text.endswith("s"):
-        return int(text[:-1])
-    if text.endswith("h"):
-        return int(text[:-1]) * 3600
-    return int(text)
+    for suffix in sorted(_CADENCE_UNITS, key=len, reverse=True):
+        if text.endswith(suffix):
+            value = text[: -len(suffix)].strip()
+            try:
+                magnitude = int(value)
+            except ValueError as exc:
+                raise ValueError(f"invalid cadence {cadence!r}: {exc}") from None
+            if magnitude <= 0:
+                raise ValueError(f"invalid cadence {cadence!r}: must be positive")
+            return magnitude * _CADENCE_UNITS[suffix]
+    raise ValueError(
+        f"invalid cadence {cadence!r}: expected unit suffix (s, m, h); "
+        "cron expressions land in slice 3"
+    )
 
 
 def main(root: Path | None = None) -> None:

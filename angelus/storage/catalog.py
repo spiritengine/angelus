@@ -42,6 +42,7 @@ class Catalog:
             (source_ref, json.dumps(provenance, sort_keys=True), now),
         )
         observation_id = int(cursor.lastrowid)
+        self.connection.commit()
         body_ref = self._write_body("observations", observation_id, payload)
         self.connection.execute(
             """
@@ -180,6 +181,7 @@ class Catalog:
             ),
         )
         finding_id = int(cursor.lastrowid)
+        self.connection.commit()
         body_ref = self._write_body("findings", finding_id, body_obj)
         self.connection.execute(
             """
