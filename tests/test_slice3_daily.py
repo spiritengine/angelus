@@ -25,16 +25,8 @@ def _daily_pipe() -> Pipe:
         channels=["push"],
         render={
             "preamble": [
-                {
-                    "kind": "structured",
-                    "source": "suppressed_findings",
-                    "template": "rate-limit-callout",
-                },
-                {
-                    "kind": "structured",
-                    "source": "open_incidents",
-                    "template": "incident-status",
-                },
+                {"kind": "structured", "template": "rate-limit-callout"},
+                {"kind": "structured", "template": "incident-status"},
             ],
             "body": {"kind": "llm", "mantle": "chronicler"},
         },
@@ -97,8 +89,7 @@ def _write_lodging(root: Path) -> None:
         "cadence: '0 8 * * *'\nchannels: [push]\n"
         "render:\n"
         "  preamble:\n"
-        "    - kind: structured\n      source: suppressed_findings\n"
-        "      template: rate-limit-callout\n"
+        "    - kind: structured\n      template: rate-limit-callout\n"
         "  body:\n    kind: llm\n    mantle: chronicler\n",
         encoding="utf-8",
     )
@@ -253,6 +244,97 @@ def test_two_zone_render_dispatches_preamble_then_llm_body(tmp_path, monkeypatch
     assert "Incidents:" in sent[0]
 
 
+def test_digest_partial_channel_failure_does_not_resend_success_channel(
+    tmp_path, monkeypatch
+) -> None:
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    _write_templates(tmp_path)
+    drain = PipeDrain(
+        catalog,
+        Pipe(
+            name="daily",
+            cadence="0 8 * * *",
+            render_kind="digest",
+            template=None,
+            channels=["push", "email"],
+            render=_daily_pipe().render,
+        ),
+        {
+            "push": Channel(name="push", kind="push", command="notify-pat"),
+            "email": Channel(
+                name="email",
+                kind="email",
+                command="/home/user/projects/patbot-email/patbot-email",
+                to="person@example.com",
+            ),
+        },
+        tmp_path,
+        {"now", "daily"},
+    )
+    finding_id = catalog.write_finding(
+        None,
+        {
+            "source": "scheduled/test",
+            "type": "down",
+            "entity": "site",
+            "severity": "high",
+            "target_pipes": ["daily"],
+        },
+        {"daily"},
+    )
+    push_messages: list[str] = []
+    email_attempts = 0
+
+    async def fake_push(_channel, message: str, _workdir: Path) -> None:
+        push_messages.append(message)
+
+    async def fake_email(_channel, _subject: str, _body: str, _workdir: Path) -> None:
+        nonlocal email_attempts
+        email_attempts += 1
+        raise RuntimeError("email broke")
+
+    async def fake_llm(self, _structured):
+        return "This is the chronicler body.", None
+
+    monkeypatch.setattr(pipe_runner, "send_push", fake_push)
+    monkeypatch.setattr(pipe_runner, "send_email", fake_email)
+    monkeypatch.setattr(PipeDrain, "_render_llm_body", fake_llm)
+
+    try:
+        asyncio.run(drain.drain_once())
+        first_queue = connection.execute(
+            """
+            SELECT status, attempts, next_attempt_at
+            FROM pipe_queues
+            WHERE finding_id = ? AND pipe = 'daily'
+            """,
+            (finding_id,),
+        ).fetchone()
+        first_drain_at = catalog.last_pipe_drain_at("daily")
+        asyncio.run(drain.drain_once())
+        sent_dispatches = list(
+            connection.execute(
+                """
+                SELECT channel, status
+                FROM dispatches
+                WHERE pipe = 'daily' AND status = 'sent'
+                ORDER BY id
+                """
+            )
+        )
+    finally:
+        connection.close()
+
+    assert first_queue["status"] == "dispatched"
+    assert first_queue["attempts"] == 1
+    assert first_queue["next_attempt_at"] is not None
+    assert first_drain_at is not None
+    assert len(push_messages) == 1
+    assert email_attempts == 1
+    assert [row["channel"] for row in sent_dispatches] == ["push"]
+
+
 def test_suppressed_overflow_stays_out_of_llm_inputs(tmp_path, monkeypatch) -> None:
     connection = init_db(tmp_path / "angelus.sqlite3")
     catalog = Catalog(connection, tmp_path)
@@ -346,6 +428,62 @@ def test_llm_nonzero_fallback_dispatches_and_emits_internal_finding(
     assert queued["status"] == "pending"
 
 
+def test_empty_day_channel_failure_warns_without_phantom_dispatch(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    _write_templates(tmp_path)
+    drain = PipeDrain(
+        catalog,
+        Pipe(
+            name="daily",
+            cadence="0 8 * * *",
+            render_kind="digest",
+            template=None,
+            channels=["email"],
+            render=_daily_pipe().render,
+        ),
+        {
+            "email": Channel(
+                name="email",
+                kind="email",
+                command="/home/user/projects/patbot-email/patbot-email",
+                to="person@example.com",
+            )
+        },
+        tmp_path,
+        {"now", "daily"},
+    )
+
+    async def fake_email(_channel, _subject: str, _body: str, _workdir: Path) -> None:
+        raise RuntimeError("email broke")
+
+    async def fake_llm(self, _structured):
+        return "This is the chronicler body.", None
+
+    monkeypatch.setattr(pipe_runner, "send_email", fake_email)
+    monkeypatch.setattr(PipeDrain, "_render_llm_body", fake_llm)
+
+    try:
+        with caplog.at_level("WARNING"):
+            asyncio.run(drain.drain_once())
+        dispatches = list(
+            connection.execute(
+                """
+                SELECT finding_ids, status
+                FROM dispatches
+                WHERE pipe = 'daily'
+                """
+            )
+        )
+    finally:
+        connection.close()
+
+    assert dispatches == []
+    assert "channel unhealthy escalation is deferred until a non-empty drain" in caplog.text
+
+
 def test_llm_timeout_kills_subprocess_and_falls_back(tmp_path, monkeypatch) -> None:
     connection = init_db(tmp_path / "angelus.sqlite3")
     catalog = Catalog(connection, tmp_path)
@@ -417,6 +555,7 @@ def test_pipe_state_updates_and_scopes_next_drain(tmp_path, monkeypatch) -> None
         return "This is the chronicler body.", None
 
     monkeypatch.setattr(pipe_runner, "send_push", fake_push)
+    monkeypatch.setattr(pipe_runner, "_is_same_utc_day", lambda *_args: False)
     monkeypatch.setattr(PipeDrain, "_render_llm_body", fake_llm)
 
     try:
@@ -442,6 +581,58 @@ def test_pipe_state_updates_and_scopes_next_drain(tmp_path, monkeypatch) -> None
     assert structured_counts == [1, 0]
     assert second_state is not None
     assert second_state >= first_state
+
+
+def test_daily_drain_processes_all_pending_items(tmp_path, monkeypatch) -> None:
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    _write_templates(tmp_path)
+    drain = PipeDrain(
+        catalog,
+        _daily_pipe(),
+        {"push": Channel(name="push", kind="push", command="notify-pat")},
+        tmp_path,
+        {"now", "daily"},
+    )
+    llm_inputs: list[dict] = []
+
+    async def fake_push(_channel, _message: str, _workdir: Path) -> None:
+        return None
+
+    async def fake_llm(self, structured):
+        llm_inputs.append(structured)
+        return "This is the chronicler body.", None
+
+    monkeypatch.setattr(pipe_runner, "send_push", fake_push)
+    monkeypatch.setattr(PipeDrain, "_render_llm_body", fake_llm)
+
+    try:
+        for idx in range(25):
+            catalog.write_finding(
+                None,
+                {
+                    "source": "scheduled/test",
+                    "type": "down",
+                    "entity": f"site-{idx}",
+                    "severity": "high",
+                    "target_pipes": ["daily"],
+                },
+                {"daily"},
+            )
+        asyncio.run(drain.drain_once())
+        dispatched = connection.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM pipe_queues
+            WHERE pipe = 'daily' AND status = 'dispatched'
+            """
+        ).fetchone()
+    finally:
+        connection.close()
+
+    assert len(llm_inputs) == 1
+    assert len(llm_inputs[0]["findings_since_last_drain"]) == 25
+    assert dispatched["n"] == 25
 
 
 def test_email_channel_invokes_patbot_with_subject_and_stdin(tmp_path, monkeypatch) -> None:
@@ -479,3 +670,27 @@ def test_email_channel_loaded_from_repo_lodging() -> None:
 
     assert lodging.channels["email"].kind == "email"
     assert lodging.channels["email"].to == "$env:ANGELUS_EMAIL_TO"
+
+
+def test_digest_preamble_blocks_reject_source_field(tmp_path) -> None:
+    _write_lodging(tmp_path)
+    (tmp_path / "pipes" / "daily.yaml").write_text(
+        "cadence: '0 8 * * *'\nchannels: [push]\n"
+        "render:\n"
+        "  preamble:\n"
+        "    - kind: structured\n      source: suppressed_findings\n"
+        "      template: rate-limit-callout\n"
+        "  body:\n    kind: llm\n    mantle: chronicler\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="do not accept source"):
+        load_lodging(tmp_path)
+
+
+def test_channel_command_is_required(tmp_path) -> None:
+    _write_lodging(tmp_path)
+    (tmp_path / "channels" / "push.yaml").write_text("kind: push\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="non-empty string command"):
+        load_lodging(tmp_path)

@@ -278,20 +278,22 @@ class Catalog:
         self.connection.commit()
         return finding_id
 
-    def pending_pipe_items(self, pipe: str) -> list[sqlite3.Row]:
+    def pending_pipe_items(self, pipe: str, limit: int | None = 20) -> list[sqlite3.Row]:
         now = utcnow()
+        limit_sql = "" if limit is None else "LIMIT ?"
+        params: tuple[Any, ...] = (pipe, now) if limit is None else (pipe, now, limit)
         return list(
             self.connection.execute(
-                """
+                f"""
                 SELECT pq.finding_id, pq.pipe, f.*
                 FROM pipe_queues pq
                 JOIN findings f ON f.id = pq.finding_id
                 WHERE pq.pipe = ? AND pq.status = 'pending' AND f.status = 'ready'
                   AND (pq.next_attempt_at IS NULL OR pq.next_attempt_at <= ?)
                 ORDER BY pq.created_at, pq.finding_id
-                LIMIT 20
+                {limit_sql}
                 """,
-                (pipe, now),
+                params,
             )
         )
 

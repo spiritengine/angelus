@@ -122,6 +122,11 @@ def _load_pipes(root: Path) -> dict[str, Pipe]:
             render_kind = "dumb-alert"
             template = _required_str(render, "template", path)
         elif isinstance(render.get("preamble"), list) and isinstance(render.get("body"), dict):
+            for block in render["preamble"]:
+                if not isinstance(block, dict):
+                    raise ValueError(f"{path}: expected preamble blocks to be mappings")
+                if "source" in block:
+                    raise ValueError(f"{path}: preamble blocks do not accept source")
             render_kind = "digest"
             template = None
         else:
@@ -153,14 +158,7 @@ def _load_channels(root: Path) -> dict[str, Channel]:
         loaded[name] = Channel(
             name=name,
             kind=str(kind),
-            command=str(
-                data.get("command")
-                or (
-                    "/home/user/projects/patbot-email/patbot-email"
-                    if kind == "email"
-                    else "notify-pat"
-                )
-            ),
+            command=_required_str(data, "command", path),
             to=to,
         )
     return loaded

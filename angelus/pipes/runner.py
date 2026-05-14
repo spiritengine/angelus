@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ from angelus.lodging import Channel, Pipe
 from angelus.storage import Catalog, utcnow
 
 LLM_FALLBACK_FOOTER = "LLM digest body unavailable — see structured data above."
+LOGGER = logging.getLogger(__name__)
 
 
 class PipeDrain:
@@ -94,9 +96,11 @@ class PipeDrain:
     async def _drain_digest(self) -> None:
         drained_at = utcnow()
         last_drain_at = self.catalog.last_pipe_drain_at(self.pipe.name)
-        pending_rows = self.catalog.pending_pipe_items(self.pipe.name)
+        pending_rows = self.catalog.pending_pipe_items(self.pipe.name, limit=None)
         finding_ids = [int(row["id"]) for row in pending_rows]
         structured = self._structured_inputs(last_drain_at)
+        if not pending_rows and _is_same_utc_day(last_drain_at, drained_at):
+            return
         preamble = self._render_preamble(structured)
         body, llm_error = await self._render_llm_body(structured)
         if llm_error is not None:
@@ -111,18 +115,23 @@ class PipeDrain:
         message = "\n\n".join(part for part in (preamble, body) if part)
         subject = f"Angelus daily {datetime.now().astimezone().date().isoformat()}"
 
-        sent_channels: list[str] = []
-        sent_all = True
+        any_channel_succeeded = False
         for channel_name in self.pipe.channels:
             if self.catalog.is_channel_unhealthy(channel_name):
-                sent_all = False
                 continue
             channel = self.channels[channel_name]
             try:
                 await self._send_channel(channel, message, subject)
             except Exception as exc:
-                sent_all = False
-                for finding_id in finding_ids or [0]:
+                if not finding_ids:
+                    LOGGER.warning(
+                        "digest channel %s failed with no pending findings; "
+                        "channel unhealthy escalation is deferred until a non-empty drain: %s",
+                        channel.name,
+                        exc,
+                    )
+                    continue
+                for finding_id in finding_ids:
                     exhausted = self.catalog.record_pipe_send_failure(
                         self.pipe.name,
                         channel.name,
@@ -138,16 +147,15 @@ class PipeDrain:
                             self.known_pipes,
                         )
             else:
-                sent_channels.append(channel.name)
-        if sent_all:
-            for channel_name in sent_channels:
+                any_channel_succeeded = True
                 self.catalog.record_dispatch(
                     self.pipe.name,
-                    channel_name,
+                    channel.name,
                     finding_ids,
                     "sent",
                     mark_queue=False,
                 )
+        if any_channel_succeeded:
             self.catalog.mark_pipe_items_dispatched(self.pipe.name, finding_ids)
             self.catalog.mark_pipe_drained(self.pipe.name, drained_at)
 
@@ -261,3 +269,13 @@ def _parse_hourly_limit(value: str | None) -> int | None:
     if amount <= 0:
         raise ValueError(f"unsupported rate limit {value!r}")
     return amount
+
+
+def _is_same_utc_day(left: str | None, right: str | None) -> bool:
+    if not left or not right:
+        return False
+    return _parse_utc(left).date() == _parse_utc(right).date()
+
+
+def _parse_utc(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
