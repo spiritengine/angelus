@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
@@ -230,6 +231,31 @@ def test_triage_loop_fans_out_concurrently(tmp_path) -> None:
     assert inline_peak == 1, (
         f"inline-await control case unexpectedly concurrent: peak={inline_peak}"
     )
+
+
+def test_daemon_writes_and_removes_pid_file(tmp_path) -> None:
+    _write_minimal_lodging(tmp_path)
+
+    async def driver() -> None:
+        daemon = AngelusDaemon(tmp_path)
+        task = asyncio.create_task(daemon.run())
+        pid_file = tmp_path / "state" / "angelus.pid"
+        try:
+            for _ in range(30):
+                if pid_file.exists():
+                    break
+                await asyncio.sleep(0.05)
+            assert pid_file.read_text(encoding="utf-8") == str(os.getpid())
+            daemon.request_stop()
+            await asyncio.wait_for(task, timeout=2.0)
+            assert not pid_file.exists()
+        finally:
+            if not task.done():
+                daemon.request_stop()
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(driver())
 
 
 def test_mark_triage_processing_raises_on_duplicate(tmp_path) -> None:

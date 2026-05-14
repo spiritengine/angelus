@@ -1,0 +1,5 @@
+# Set these in the crontab environment or an env file sourced by cron:
+# ANGELUS_BELFRY_SUCCESS_URL=https://hc-ping.com/<angelus-belfry-ping-uuid>
+# ANGELUS_BELFRY_DOWN_URL=https://hc-ping.com/<angelus-daemon-down-uuid>
+
+*/5 * * * * cd /path/to/angelus && /usr/bin/env python belfry/belfry.py >> state/belfry.log 2>&1

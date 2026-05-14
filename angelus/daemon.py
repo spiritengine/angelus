@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 from pathlib import Path
 
@@ -24,6 +25,7 @@ class AngelusDaemon:
         self.root = root
         state_dir = root / "state"
         state_dir.mkdir(parents=True, exist_ok=True)
+        self.pid_file = state_dir / "angelus.pid"
         self.connection = init_db(state_dir / "angelus.sqlite3")
         self.catalog = Catalog(self.connection, root)
         self.lodging: Lodging = load_lodging(root)
@@ -38,27 +40,38 @@ class AngelusDaemon:
         }
 
     async def run(self) -> None:
-        LOGGER.info(
-            "loaded lodging: %d sources, %d triagers, %d pipes, %d channels",
-            len(self.lodging.sources),
-            len(self.lodging.triagers),
-            len(self.lodging.pipes),
-            len(self.lodging.channels),
-        )
-        self._install_signal_handlers()
-        self._register_sources()
-        self.scheduler.start()
-        LOGGER.info("scheduler started with %d jobs", len(self.scheduler.get_jobs()))
-        self.tasks.append(asyncio.create_task(self._triage_loop(), name="triage-loop"))
-        for pipe_name in self.pipe_drains:
-            self.tasks.append(
-                asyncio.create_task(self._pipe_loop(pipe_name), name=f"pipe-{pipe_name}")
+        scheduler_started = False
+        self.pid_file.write_text(str(os.getpid()), encoding="utf-8")
+        try:
+            LOGGER.info(
+                "loaded lodging: %d sources, %d triagers, %d pipes, %d channels",
+                len(self.lodging.sources),
+                len(self.lodging.triagers),
+                len(self.lodging.pipes),
+                len(self.lodging.channels),
             )
-        await self.stop_event.wait()
-        LOGGER.info("shutdown requested")
-        self.scheduler.shutdown(wait=True)
-        await asyncio.gather(*self.tasks, return_exceptions=True)
-        self.connection.close()
+            self._install_signal_handlers()
+            self._register_sources()
+            self.scheduler.start()
+            scheduler_started = True
+            LOGGER.info("scheduler started with %d jobs", len(self.scheduler.get_jobs()))
+            self.tasks.append(asyncio.create_task(self._triage_loop(), name="triage-loop"))
+            for pipe_name in self.pipe_drains:
+                self.tasks.append(
+                    asyncio.create_task(self._pipe_loop(pipe_name), name=f"pipe-{pipe_name}")
+                )
+            await self.stop_event.wait()
+            LOGGER.info("shutdown requested")
+        finally:
+            if scheduler_started:
+                self.scheduler.shutdown(wait=True)
+            if self.tasks:
+                await asyncio.gather(*self.tasks, return_exceptions=True)
+            try:
+                self.pid_file.unlink(missing_ok=True)
+            except OSError:
+                LOGGER.warning("failed to remove PID file %s", self.pid_file, exc_info=True)
+            self.connection.close()
 
     def request_stop(self) -> None:
         self.stop_event.set()

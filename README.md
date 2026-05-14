@@ -25,7 +25,7 @@ Pipeline shape:
 - **Channel** — an output sink (push, email, skein, etc.).
 - **Dispatch** — one send action.
 - **Dependencies** — things angelus rests on; their failure is also angelus's failure.
-- **Watchdog** — runs **health checks** to external sinks so angelus-dying is alerted independently.
+- **Belfry** — runs **health checks** to external sinks so angelus-dying is alerted independently.
 
 ## Design
 
@@ -56,6 +56,25 @@ angelus daemon
 
 Set `ANGELUS_DRY_RUN=1` to write push payloads to `dispatches.log` instead of
 calling `notify-pat`.
+
+## Reliability
+
+The belfry is the external reliability layer. It runs outside the daemon from
+raw cron, checks `state/angelus.pid`, reads `source_fires` from
+`state/angelus.sqlite3` in read-only mode, pings healthchecks.io, and calls
+`notify-pat` directly when the daemon is dead or wedged.
+
+Setup:
+
+1. Register two healthchecks.io URLs as described in `belfry/healthchecks.example`.
+2. Export `ANGELUS_BELFRY_SUCCESS_URL` and `ANGELUS_BELFRY_DOWN_URL` for cron.
+3. Paste the entry from `belfry/crontab.example`.
+
+The default wedge threshold is 10 minutes. Override it with
+`ANGELUS_BELFRY_WEDGE_THRESHOLD_SEC` if your source cadence needs more slack.
+
+Optional boots layer: add a system crontab check for the watcher itself, such as
+`*/30 * * * * test $(find /path/to/angelus/state/belfry.log -mmin -1440 | wc -l) -eq 1 || echo "angelus belfry stale" | mail -s "angelus belfry stale" you@example.com`.
 
 ## Storage
 

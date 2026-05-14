@@ -1,0 +1,13 @@
+# healthchecks.io checks for angelus belfry
+
+Register two checks:
+
+1. Angelus belfry ping
+   - Schedule: expect a ping every 5 minutes.
+   - Alert: if missing for 15 minutes.
+   - Use this URL as ANGELUS_BELFRY_SUCCESS_URL.
+
+2. Angelus daemon down
+   - Schedule: expect never.
+   - Alert: immediately if pinged.
+   - Use this URL as ANGELUS_BELFRY_DOWN_URL.
