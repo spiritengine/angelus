@@ -12,6 +12,7 @@ dependencies = [
     "apscheduler",
     "click",
     "httpx",
+    "jinja2",
     "pyyaml",
     "watchdog",
 ]

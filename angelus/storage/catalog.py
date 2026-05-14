@@ -1,4 +1,9 @@
-"""SQLite lifecycle operations for slice 1."""
+"""SQLite lifecycle operations.
+
+Rate-limit accounting intentionally uses the dispatches table. Slice 3 stores
+the finding source redundantly on each dispatch row so the per-source rolling
+count is a simple indexed lookup instead of parsing finding_ids JSON.
+"""
 
 from __future__ import annotations
 
@@ -273,20 +278,22 @@ class Catalog:
         self.connection.commit()
         return finding_id
 
-    def pending_pipe_items(self, pipe: str) -> list[sqlite3.Row]:
+    def pending_pipe_items(self, pipe: str, limit: int | None = 20) -> list[sqlite3.Row]:
         now = utcnow()
+        limit_sql = "" if limit is None else "LIMIT ?"
+        params: tuple[Any, ...] = (pipe, now) if limit is None else (pipe, now, limit)
         return list(
             self.connection.execute(
-                """
+                f"""
                 SELECT pq.finding_id, pq.pipe, f.*
                 FROM pipe_queues pq
                 JOIN findings f ON f.id = pq.finding_id
                 WHERE pq.pipe = ? AND pq.status = 'pending' AND f.status = 'ready'
                   AND (pq.next_attempt_at IS NULL OR pq.next_attempt_at <= ?)
                 ORDER BY pq.created_at, pq.finding_id
-                LIMIT 20
+                {limit_sql}
                 """,
-                (pipe, now),
+                params,
             )
         )
 
@@ -297,17 +304,19 @@ class Catalog:
         finding_ids: list[int],
         status: str,
         error: str | None = None,
+        source: str | None = None,
+        mark_queue: bool = True,
     ) -> None:
         self.connection.execute(
             """
             INSERT INTO dispatches (
-                pipe, channel, finding_ids, status, attempts, last_error, dispatched_at
+                pipe, channel, finding_ids, status, attempts, last_error, dispatched_at, source
             )
-            VALUES (?, ?, ?, ?, 1, ?, ?)
+            VALUES (?, ?, ?, ?, 1, ?, ?, ?)
             """,
-            (pipe, channel, json.dumps(finding_ids), status, error, utcnow()),
+            (pipe, channel, json.dumps(finding_ids), status, error, utcnow(), source),
         )
-        if status == "sent":
+        if status == "sent" and mark_queue:
             for finding_id in finding_ids:
                 self.connection.execute(
                     """
@@ -318,6 +327,143 @@ class Catalog:
                     (utcnow(), utcnow(), finding_id, pipe),
                 )
         self.connection.commit()
+
+    def mark_pipe_items_dispatched(self, pipe: str, finding_ids: list[int]) -> None:
+        now = utcnow()
+        for finding_id in finding_ids:
+            self.connection.execute(
+                """
+                UPDATE pipe_queues
+                SET status = 'dispatched', dispatched_at = ?, updated_at = ?
+                WHERE finding_id = ? AND pipe = ?
+                """,
+                (now, now, finding_id, pipe),
+            )
+        self.connection.commit()
+
+    def sent_dispatch_count_for_channel(self, channel: str, since: str) -> int:
+        row = self.connection.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM dispatches
+            WHERE channel = ? AND dispatched_at > ? AND status = 'sent'
+            """,
+            (channel, since),
+        ).fetchone()
+        return int(row["n"])
+
+    def sent_dispatch_count_for_source(self, source: str, since: str) -> int:
+        row = self.connection.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM dispatches
+            WHERE source = ? AND dispatched_at > ? AND status = 'sent'
+            """,
+            (source, since),
+        ).fetchone()
+        return int(row["n"])
+
+    def suppress_pipe_item_to_daily(self, finding_id: int, pipe: str) -> None:
+        now = utcnow()
+        self.connection.execute(
+            """
+            UPDATE pipe_queues
+            SET status = 'suppressed', updated_at = ?
+            WHERE finding_id = ? AND pipe = ?
+            """,
+            (now, finding_id, pipe),
+        )
+        self.connection.execute(
+            """
+            INSERT OR IGNORE INTO pipe_queues (finding_id, pipe, status)
+            VALUES (?, 'daily', 'pending')
+            """,
+            (finding_id,),
+        )
+        self.connection.commit()
+
+    def last_pipe_drain_at(self, pipe_name: str) -> str | None:
+        row = self.connection.execute(
+            "SELECT last_drain_at FROM pipe_state WHERE pipe_name = ?",
+            (pipe_name,),
+        ).fetchone()
+        return None if row is None else row["last_drain_at"]
+
+    def mark_pipe_drained(self, pipe_name: str, drained_at: str | None = None) -> str:
+        drained_at = drained_at or utcnow()
+        self.connection.execute(
+            """
+            INSERT INTO pipe_state (pipe_name, last_drain_at)
+            VALUES (?, ?)
+            ON CONFLICT (pipe_name) DO UPDATE SET
+                last_drain_at = excluded.last_drain_at
+            """,
+            (pipe_name, drained_at),
+        )
+        self.connection.commit()
+        return drained_at
+
+    def suppressed_findings_since(self, since: str | None) -> list[dict[str, Any]]:
+        clause = "AND pq.created_at > ?" if since else ""
+        params: tuple[Any, ...] = (since,) if since else ()
+        rows = self.connection.execute(
+            f"""
+            SELECT f.*, pq.created_at AS queued_at
+            FROM pipe_queues pq
+            JOIN findings f ON f.id = pq.finding_id
+            WHERE pq.status = 'suppressed' {clause}
+            ORDER BY pq.created_at, f.id
+            """,
+            params,
+        )
+        return [self._finding_dict(row) for row in rows]
+
+    def findings_for_pipe_since(self, pipe: str, since: str | None) -> list[dict[str, Any]]:
+        clause = "AND f.created_at > ?" if since else ""
+        params: tuple[Any, ...] = (pipe, since) if since else (pipe,)
+        rows = self.connection.execute(
+            f"""
+            SELECT f.*, pq.created_at AS queued_at
+            FROM pipe_queues pq
+            JOIN findings f ON f.id = pq.finding_id
+            WHERE pq.pipe = ? AND f.status = 'ready' {clause}
+              AND NOT EXISTS (
+                SELECT 1
+                FROM pipe_queues suppressed
+                WHERE suppressed.finding_id = f.id
+                  AND suppressed.status = 'suppressed'
+              )
+            ORDER BY f.created_at, f.id
+            """,
+            params,
+        )
+        return [self._finding_dict(row) for row in rows]
+
+    def open_incidents(self) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """
+            SELECT i.*, f.severity
+            FROM incidents i
+            LEFT JOIN findings f ON f.id = i.latest_finding_id
+            WHERE i.status = 'open'
+            ORDER BY i.opened_at, i.id
+            """
+        )
+        return [dict(row) for row in rows]
+
+    def clearance_findings_since(self, since: str | None) -> list[dict[str, Any]]:
+        clause = "AND f.created_at > ?" if since else ""
+        params: tuple[Any, ...] = (since,) if since else ()
+        rows = self.connection.execute(
+            f"""
+            SELECT f.*
+            FROM findings f
+            WHERE f.type = 'clearance' AND f.status = 'ready' {clause}
+            ORDER BY f.created_at, f.id
+            """,
+            params,
+        )
+        return [self._finding_dict(row) for row in rows]
 
     def record_pipe_send_failure(
         self, pipe: str, channel: str, finding_id: int, error: str
@@ -445,6 +591,17 @@ class Catalog:
         path = directory / "body.json"
         path.write_text(json.dumps(body or {}, sort_keys=True) + "\n", encoding="utf-8")
         return str(path.relative_to(self.root))
+
+    def _finding_dict(self, row) -> dict[str, Any]:
+        item = dict(row)
+        body = self.read_body(item.get("body_ref"))
+        item["body"] = body
+        item["body_text"] = str(body.get("text") or "")
+        try:
+            item["target_pipes"] = json.loads(item.get("target_pipes") or "[]")
+        except json.JSONDecodeError:
+            item["target_pipes"] = []
+        return item
 
     def _upsert_incident(
         self, source: str, finding_type: str, entity: str, dedup_key: str, finding_id: int
