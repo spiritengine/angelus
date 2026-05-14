@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import click
 
+from angelus.daemon import main as daemon_main
+
 
 @click.group()
 def main() -> None:
@@ -13,4 +15,4 @@ def main() -> None:
 @main.command()
 def daemon() -> None:
     """Start the Angelus daemon."""
-    click.echo("angelus daemon is not implemented yet")
+    daemon_main()

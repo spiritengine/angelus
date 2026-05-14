@@ -37,7 +37,9 @@ M2 adversarial-test plan: `brief-20260513-cz9x`.
 
 ## Status
 
-Slice 0 (project scaffolding) complete. Python package layout, Click CLI stub, SQLite migration scaffolding, systemd unit template, smoke test. Runtime features arrive in later slices.
+Slice 1 implements the first load-bearing vertical path: scheduled shell source,
+observation storage, pull-based triage, finding and incident lifecycle, the `now`
+pipe, and the `push` channel.
 
 ## Install
 
@@ -49,9 +51,11 @@ pip install -e .
 
 ```sh
 angelus --help
+angelus daemon
 ```
 
-Slice 0 only guarantees the root CLI help surface. A placeholder `angelus daemon` command is present for the service template and future slices.
+Set `ANGELUS_DRY_RUN=1` to write push payloads to `dispatches.log` instead of
+calling `notify-pat`.
 
 ## Storage
 
