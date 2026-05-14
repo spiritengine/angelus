@@ -4,13 +4,29 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+TRUST_RETRY_DELAYS = (
+    timedelta(minutes=1),
+    timedelta(minutes=10),
+    timedelta(hours=1),
+    timedelta(hours=8),
+)
+MAX_RETRY_ATTEMPTS = 5
 
 
 def utcnow() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _utcnow_dt() -> datetime:
+    return datetime.now(UTC)
+
+
+def _format_time(value: datetime) -> str:
+    return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 class Catalog:
@@ -56,6 +72,7 @@ class Catalog:
         return observation_id
 
     def ready_observations_for(self, triager_name: str, source_ref: str) -> list[sqlite3.Row]:
+        now = utcnow()
         return list(
             self.connection.execute(
                 """
@@ -65,11 +82,17 @@ class Catalog:
                   ON ot.observation_id = o.id AND ot.triager_name = ?
                 WHERE o.status = 'ready'
                   AND o.source = ?
-                  AND ot.observation_id IS NULL
+                  AND (
+                    ot.observation_id IS NULL
+                    OR (
+                        ot.status = 'failed'
+                        AND (ot.next_attempt_at IS NULL OR ot.next_attempt_at <= ?)
+                    )
+                  )
                 ORDER BY o.id
                 LIMIT 20
                 """,
-                (triager_name, source_ref),
+                (triager_name, source_ref, now),
             )
         )
 
@@ -86,6 +109,10 @@ class Catalog:
             """
             INSERT INTO observation_triage (observation_id, triager_name, status)
             VALUES (?, ?, 'processing')
+            ON CONFLICT (observation_id, triager_name) DO UPDATE SET
+                status = 'processing',
+                next_attempt_at = NULL,
+                updated_at = excluded.updated_at
             """,
             (observation_id, triager_name),
         )
@@ -95,7 +122,9 @@ class Catalog:
         self.connection.execute(
             """
             UPDATE observation_triage
-            SET status = 'success', updated_at = ?
+            SET status = 'success',
+                next_attempt_at = NULL,
+                updated_at = ?
             WHERE observation_id = ? AND triager_name = ?
             """,
             (utcnow(), observation_id, triager_name),
@@ -104,16 +133,57 @@ class Catalog:
 
     def mark_triage_failed(
         self, observation_id: int, triager_name: str, error: str
-    ) -> None:
+    ) -> bool:
+        row = self.connection.execute(
+            """
+            SELECT attempt FROM observation_triage
+            WHERE observation_id = ? AND triager_name = ?
+            """,
+            (observation_id, triager_name),
+        ).fetchone()
+        attempt = int(row["attempt"]) if row is not None else 1
+        if attempt >= MAX_RETRY_ATTEMPTS:
+            now = utcnow()
+            self.connection.execute(
+                """
+                UPDATE observation_triage
+                SET status = 'failed',
+                    last_error = ?,
+                    next_attempt_at = NULL,
+                    updated_at = ?
+                WHERE observation_id = ? AND triager_name = ?
+                """,
+                (error, now, observation_id, triager_name),
+            )
+            self.connection.execute(
+                """
+                UPDATE observations
+                SET status = 'triage_failed', updated_at = ?
+                WHERE id = ?
+                """,
+                (now, observation_id),
+            )
+            self.connection.commit()
+            return True
+
+        next_attempt = attempt + 1
+        next_attempt_at = _format_time(
+            _utcnow_dt() + TRUST_RETRY_DELAYS[attempt - 1]
+        )
         self.connection.execute(
             """
             UPDATE observation_triage
-            SET status = 'failed', last_error = ?, updated_at = ?
+            SET status = 'failed',
+                attempt = ?,
+                next_attempt_at = ?,
+                last_error = ?,
+                updated_at = ?
             WHERE observation_id = ? AND triager_name = ?
             """,
-            (error, utcnow(), observation_id, triager_name),
+            (next_attempt, next_attempt_at, error, utcnow(), observation_id, triager_name),
         )
         self.connection.commit()
+        return False
 
     def prior_state(self, triager_name: str, source_ref: str) -> dict[str, Any]:
         row = self.connection.execute(
@@ -145,7 +215,7 @@ class Catalog:
 
     def write_finding(
         self,
-        observation_id: int,
+        observation_id: int | None,
         finding: dict[str, Any],
         known_pipes: set[str],
     ) -> int:
@@ -204,6 +274,7 @@ class Catalog:
         return finding_id
 
     def pending_pipe_items(self, pipe: str) -> list[sqlite3.Row]:
+        now = utcnow()
         return list(
             self.connection.execute(
                 """
@@ -211,10 +282,11 @@ class Catalog:
                 FROM pipe_queues pq
                 JOIN findings f ON f.id = pq.finding_id
                 WHERE pq.pipe = ? AND pq.status = 'pending' AND f.status = 'ready'
+                  AND (pq.next_attempt_at IS NULL OR pq.next_attempt_at <= ?)
                 ORDER BY pq.created_at, pq.finding_id
                 LIMIT 20
                 """,
-                (pipe,),
+                (pipe, now),
             )
         )
 
@@ -246,6 +318,110 @@ class Catalog:
                     (utcnow(), utcnow(), finding_id, pipe),
                 )
         self.connection.commit()
+
+    def record_pipe_send_failure(
+        self, pipe: str, channel: str, finding_id: int, error: str
+    ) -> bool:
+        self.record_dispatch(pipe, channel, [finding_id], "failed", error)
+        row = self.connection.execute(
+            """
+            SELECT attempts FROM pipe_queues
+            WHERE finding_id = ? AND pipe = ?
+            """,
+            (finding_id, pipe),
+        ).fetchone()
+        attempts = int(row["attempts"]) if row is not None else 0
+        next_attempt = attempts + 1
+        if next_attempt >= MAX_RETRY_ATTEMPTS:
+            now = utcnow()
+            self.connection.execute(
+                """
+                UPDATE pipe_queues
+                SET attempts = ?,
+                    last_error = ?,
+                    next_attempt_at = NULL,
+                    status = 'failed',
+                    updated_at = ?
+                WHERE finding_id = ? AND pipe = ?
+                """,
+                (next_attempt, error, now, finding_id, pipe),
+            )
+            self.mark_channel_unhealthy(channel, error)
+            self.connection.commit()
+            return True
+
+        next_attempt_at = _format_time(
+            _utcnow_dt() + TRUST_RETRY_DELAYS[next_attempt - 1]
+        )
+        self.connection.execute(
+            """
+            UPDATE pipe_queues
+            SET attempts = ?,
+                last_error = ?,
+                next_attempt_at = ?,
+                updated_at = ?
+            WHERE finding_id = ? AND pipe = ?
+            """,
+            (next_attempt, error, next_attempt_at, utcnow(), finding_id, pipe),
+        )
+        self.connection.commit()
+        return False
+
+    def mark_channel_unhealthy(self, channel: str, error: str) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO channel_health (channel, status, last_error, updated_at)
+            VALUES (?, 'unhealthy', ?, ?)
+            ON CONFLICT (channel) DO UPDATE SET
+                status = 'unhealthy',
+                last_error = excluded.last_error,
+                updated_at = excluded.updated_at
+            """,
+            (channel, error, utcnow()),
+        )
+
+    def write_internal_finding(
+        self, source: str, finding_type: str, entity: str, body: str, known_pipes: set[str]
+    ) -> int:
+        return self.write_finding(
+            None,
+            {
+                "source": source,
+                "type": finding_type,
+                "entity": entity,
+                "severity": "high",
+                "target_pipes": ["now"],
+                "body": body,
+            },
+            known_pipes,
+        )
+
+    def recover_writing_rows(self) -> tuple[int, int]:
+        recovered = 0
+        failed = 0
+        for table in ("observations", "findings"):
+            rows = list(
+                self.connection.execute(
+                    f"SELECT id, body_ref FROM {table} WHERE status = 'writing'"
+                )
+            )
+            for row in rows:
+                body_ref = row["body_ref"]
+                status = (
+                    "ready"
+                    if body_ref and (self.root / body_ref).exists()
+                    else "failed"
+                )
+                if status == "ready":
+                    recovered += 1
+                else:
+                    failed += 1
+                self.connection.execute(
+                    f"UPDATE {table} SET status = ?, updated_at = ? WHERE id = ?",
+                    (status, utcnow(), row["id"]),
+                )
+        self.connection.commit()
+        return recovered, failed
 
     def _write_body(self, kind: str, row_id: int, body: dict[str, Any]) -> str:
         date = utcnow()[:10]

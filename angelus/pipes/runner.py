@@ -18,11 +18,13 @@ class PipeDrain:
         pipe: Pipe,
         channels: dict[str, Channel],
         workdir: Path,
+        known_pipes: set[str],
     ) -> None:
         self.catalog = catalog
         self.pipe = pipe
         self.channels = channels
         self.workdir = workdir
+        self.known_pipes = known_pipes
         self.lock = asyncio.Lock()
 
     async def drain_once(self) -> None:
@@ -36,13 +38,20 @@ class PipeDrain:
                     try:
                         await send_push(channel, message, self.workdir)
                     except Exception as exc:
-                        self.catalog.record_dispatch(
+                        exhausted = self.catalog.record_pipe_send_failure(
                             self.pipe.name,
                             channel.name,
-                            [finding_id],
-                            "failed",
+                            finding_id,
                             str(exc),
                         )
+                        if exhausted:
+                            self.catalog.write_internal_finding(
+                                "internal/dispatch",
+                                "channel_unhealthy",
+                                channel.name,
+                                str(exc),
+                                self.known_pipes,
+                            )
                     else:
                         self.catalog.record_dispatch(
                             self.pipe.name, channel.name, [finding_id], "sent"

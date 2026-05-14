@@ -32,10 +32,13 @@ class AngelusDaemon:
         self.scheduler = AsyncIOScheduler(timezone="UTC")
         self.scheduler_semaphore = asyncio.Semaphore(10)
         self.triage_semaphore = asyncio.Semaphore(10)
+        self.triager_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self.stop_event = asyncio.Event()
         self.tasks: list[asyncio.Task[None]] = []
         self.pipe_drains = {
-            name: PipeDrain(self.catalog, pipe, self.lodging.channels, root)
+            name: PipeDrain(
+                self.catalog, pipe, self.lodging.channels, root, set(self.lodging.pipes)
+            )
             for name, pipe in self.lodging.pipes.items()
         }
 
@@ -51,6 +54,8 @@ class AngelusDaemon:
                 len(self.lodging.channels),
             )
             self._install_signal_handlers()
+            recovered, failed = self.catalog.recover_writing_rows()
+            LOGGER.info("startup recovery: %d ready, %d failed", recovered, failed)
             self._register_sources()
             self.scheduler.start()
             scheduler_started = True
@@ -115,6 +120,11 @@ class AngelusDaemon:
                 )
                 LOGGER.info("observation %s ready for %s", observation_id, source.source_ref)
             else:
+                observation_id = self.catalog.write_observation(
+                    source.source_ref,
+                    {"type": "check_failed", **payload},
+                    {"source": source.source_ref, "check": "shell", "outcome": outcome},
+                )
                 LOGGER.warning("source %s failed: %s", source.source_ref, payload)
 
     async def _triage_loop(self) -> None:
@@ -149,7 +159,11 @@ class AngelusDaemon:
 
     async def _triage_under_semaphore(self, row, triager_name: str) -> None:
         async with self.triage_semaphore:
-            await self._run_triager(row, triager_name)
+            triager = self.lodging.triagers[triager_name]
+            lock_key = (triager.name, triager.source_ref)
+            lock = self.triager_locks.setdefault(lock_key, asyncio.Lock())
+            async with lock:
+                await self._run_triager(row, triager_name)
 
     async def _run_triager(self, row, triager_name: str) -> None:
         triager = self.lodging.triagers[triager_name]
@@ -171,7 +185,17 @@ class AngelusDaemon:
             self.catalog.mark_triage_success(observation_id, triager.name)
         except Exception as exc:
             LOGGER.exception("triage failed for observation %s", observation_id)
-            self.catalog.mark_triage_failed(observation_id, triager.name, str(exc))
+            exhausted = self.catalog.mark_triage_failed(
+                observation_id, triager.name, str(exc)
+            )
+            if exhausted:
+                self.catalog.write_internal_finding(
+                    "internal/triage",
+                    "triage_failed",
+                    triager.name,
+                    str(exc),
+                    set(self.lodging.pipes),
+                )
 
     async def _pipe_loop(self, pipe_name: str) -> None:
         drain = self.pipe_drains[pipe_name]

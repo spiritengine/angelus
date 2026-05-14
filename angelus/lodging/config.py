@@ -15,6 +15,7 @@ class ScheduledSource:
     source_ref: str
     cadence: str
     command: str
+    timeout_seconds: float = 30.0
 
 
 @dataclass(frozen=True)
@@ -22,6 +23,7 @@ class Triager:
     name: str
     source_ref: str
     handler_path: Path
+    timeout_seconds: float = 60.0
 
 
 @dataclass(frozen=True)
@@ -81,6 +83,7 @@ def _load_sources(root: Path) -> dict[str, ScheduledSource]:
             source_ref=source_ref,
             cadence=_required_str(data, "cadence", path),
             command=_required_str(check, "command", path),
+            timeout_seconds=_optional_timeout(check, path, 30.0),
         )
     return loaded
 
@@ -101,6 +104,7 @@ def _load_triagers(root: Path) -> dict[str, Triager]:
             name=name,
             source_ref=_required_str(inputs, "source", path),
             handler_path=handler_path,
+            timeout_seconds=_optional_timeout(handler, path, 60.0),
         )
     return loaded
 
@@ -157,3 +161,10 @@ def _required_str(data: dict[str, Any], key: str, path: Path) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{path}: expected non-empty string {key}")
     return value
+
+
+def _optional_timeout(data: dict[str, Any], path: Path, default: float) -> float:
+    value = data.get("timeout_seconds", data.get("timeout", default))
+    if not isinstance(value, int | float) or value <= 0:
+        raise ValueError(f"{path}: expected positive numeric timeout")
+    return float(value)

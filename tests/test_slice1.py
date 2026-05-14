@@ -125,20 +125,22 @@ def test_cadence_parser_requires_unit_suffix() -> None:
 
 def _write_minimal_lodging(root: Path) -> None:
     (root / "sources" / "scheduled").mkdir(parents=True)
-    (root / "sources" / "scheduled" / "fanout.yaml").write_text(
-        "cadence: 1h\n"
-        "check:\n"
-        "  kind: shell\n"
-        "  command: 'echo {}'\n"
-    )
+    for name in ("fanout-a", "fanout-b", "fanout-c"):
+        (root / "sources" / "scheduled" / f"{name}.yaml").write_text(
+            "cadence: 1h\n"
+            "check:\n"
+            "  kind: shell\n"
+            "  command: 'echo {}'\n"
+        )
     (root / "triagers" / "handlers").mkdir(parents=True)
-    (root / "triagers" / "fanout.yaml").write_text(
-        "inputs:\n"
-        "  source: scheduled/fanout\n"
-        "handler:\n"
-        "  kind: python\n"
-        "  path: triagers/handlers/fanout.py\n"
-    )
+    for name in ("fanout-a", "fanout-b", "fanout-c"):
+        (root / "triagers" / f"{name}.yaml").write_text(
+            "inputs:\n"
+            f"  source: scheduled/{name}\n"
+            "handler:\n"
+            "  kind: python\n"
+            "  path: triagers/handlers/fanout.py\n"
+        )
     (root / "triagers" / "handlers" / "fanout.py").write_text(
         "import json, sys\n"
         "print(json.dumps({'findings': [], 'new_state': {}}))\n"
@@ -155,9 +157,9 @@ def _measure_triage_peak_concurrency(
     sem_size = 3
     daemon.triage_semaphore = asyncio.Semaphore(sem_size)
 
-    for _ in range(8):
+    for source_ref in daemon.lodging.sources:
         daemon.catalog.write_observation(
-            "scheduled/fanout", {"x": 1}, {"source": "scheduled/fanout"}
+            source_ref, {"x": 1}, {"source": source_ref}
         )
 
     in_flight = 0
@@ -258,12 +260,7 @@ def test_daemon_writes_and_removes_pid_file(tmp_path) -> None:
     asyncio.run(driver())
 
 
-def test_mark_triage_processing_raises_on_duplicate(tmp_path) -> None:
-    """Slice 1's loop never double-marks (the JOIN filters processed rows), so
-    swallowing IntegrityError hid logic bugs. After cleanup, a duplicate raises
-    loudly so a regression in the routing surfaces immediately."""
-    import sqlite3
-
+def test_mark_triage_processing_requeues_failed_attempt(tmp_path) -> None:
     connection = init_db(tmp_path / "angelus.sqlite3")
     catalog = Catalog(connection, tmp_path)
     try:
@@ -271,7 +268,19 @@ def test_mark_triage_processing_raises_on_duplicate(tmp_path) -> None:
             "scheduled/test", {}, {"source": "scheduled/test"}
         )
         catalog.mark_triage_processing(observation_id, "dead-link")
-        with pytest.raises(sqlite3.IntegrityError):
-            catalog.mark_triage_processing(observation_id, "dead-link")
+        catalog.mark_triage_failed(observation_id, "dead-link", "boom")
+        catalog.mark_triage_processing(observation_id, "dead-link")
+        row = connection.execute(
+            """
+            SELECT status, attempt, next_attempt_at
+            FROM observation_triage
+            WHERE observation_id = ? AND triager_name = 'dead-link'
+            """,
+            (observation_id,),
+        ).fetchone()
     finally:
         connection.close()
+
+    assert row["status"] == "processing"
+    assert row["attempt"] == 2
+    assert row["next_attempt_at"] is None
