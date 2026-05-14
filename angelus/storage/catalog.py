@@ -81,19 +81,15 @@ class Catalog:
             raise ValueError(f"body is not a JSON object: {body_ref}")
         return data
 
-    def mark_triage_processing(self, observation_id: int, triager_name: str) -> bool:
-        try:
-            self.connection.execute(
-                """
-                INSERT INTO observation_triage (observation_id, triager_name, status)
-                VALUES (?, ?, 'processing')
-                """,
-                (observation_id, triager_name),
-            )
-        except sqlite3.IntegrityError:
-            return False
+    def mark_triage_processing(self, observation_id: int, triager_name: str) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO observation_triage (observation_id, triager_name, status)
+            VALUES (?, ?, 'processing')
+            """,
+            (observation_id, triager_name),
+        )
         self.connection.commit()
-        return True
 
     def mark_triage_success(self, observation_id: int, triager_name: str) -> None:
         self.connection.execute(

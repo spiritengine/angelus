@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from angelus.daemon import _cadence_seconds
+from angelus.daemon import AngelusDaemon, _cadence_seconds
 from angelus.lodging import load_lodging
 from angelus.storage import Catalog, init_db
 from angelus.triage import run_python_triager
@@ -120,3 +120,132 @@ def test_cadence_parser_requires_unit_suffix() -> None:
         _cadence_seconds("0 8 * * *")
     with pytest.raises(ValueError, match="positive"):
         _cadence_seconds("0s")
+
+
+def _write_minimal_lodging(root: Path) -> None:
+    (root / "sources" / "scheduled").mkdir(parents=True)
+    (root / "sources" / "scheduled" / "fanout.yaml").write_text(
+        "cadence: 1h\n"
+        "check:\n"
+        "  kind: shell\n"
+        "  command: 'echo {}'\n"
+    )
+    (root / "triagers" / "handlers").mkdir(parents=True)
+    (root / "triagers" / "fanout.yaml").write_text(
+        "inputs:\n"
+        "  source: scheduled/fanout\n"
+        "handler:\n"
+        "  kind: python\n"
+        "  path: triagers/handlers/fanout.py\n"
+    )
+    (root / "triagers" / "handlers" / "fanout.py").write_text(
+        "import json, sys\n"
+        "print(json.dumps({'findings': [], 'new_state': {}}))\n"
+    )
+
+
+def _measure_triage_peak_concurrency(
+    tmp_path: Path, loop_impl
+) -> int:
+    """Run `loop_impl` as a daemon's `_triage_loop` and return observed peak
+    in-flight concurrency. `loop_impl` is an async coroutine function bound to
+    a daemon, so callers can compare fan-out vs inline-await shapes."""
+    daemon = AngelusDaemon(tmp_path)
+    sem_size = 3
+    daemon.triage_semaphore = asyncio.Semaphore(sem_size)
+
+    for _ in range(8):
+        daemon.catalog.write_observation(
+            "scheduled/fanout", {"x": 1}, {"source": "scheduled/fanout"}
+        )
+
+    in_flight = 0
+    peak = 0
+    release = asyncio.Event()
+
+    async def fake_run_triager(_row, _triager_name: str) -> None:
+        nonlocal in_flight, peak
+        in_flight += 1
+        peak = max(peak, in_flight)
+        try:
+            await release.wait()
+        finally:
+            in_flight -= 1
+
+    daemon._run_triager = fake_run_triager  # type: ignore[method-assign]
+
+    async def driver() -> None:
+        loop_task = asyncio.create_task(loop_impl(daemon))
+        for _ in range(30):
+            await asyncio.sleep(0.05)
+            if in_flight >= sem_size:
+                break
+        daemon.stop_event.set()
+        release.set()
+        try:
+            await asyncio.wait_for(loop_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            loop_task.cancel()
+
+    asyncio.run(driver())
+    daemon.connection.close()
+    return peak
+
+
+async def _inline_await_triage_loop(daemon) -> None:
+    """The pre-cleanup shape: await `_run_triager` inline under the semaphore.
+    Mirrors what slice 1 originally shipped. Should produce peak concurrency 1."""
+    while not daemon.stop_event.is_set():
+        did_work = False
+        for triager in daemon.lodging.triagers.values():
+            rows = daemon.catalog.ready_observations_for(
+                triager.name, triager.source_ref
+            )
+            for row in rows:
+                did_work = True
+                daemon.catalog.mark_triage_processing(row["id"], triager.name)
+                async with daemon.triage_semaphore:
+                    await daemon._run_triager(row, triager.name)
+        if not did_work:
+            await asyncio.sleep(0.05)
+
+
+def test_triage_loop_fans_out_concurrently(tmp_path) -> None:
+    """The triage loop must spawn tasks rather than await inline; otherwise the
+    triage semaphore caps nothing. The current `_triage_loop` should observe
+    peak concurrency equal to the semaphore size; the inline-await shape should
+    observe peak 1. Asserting both makes the test discriminating, not tautological."""
+    _write_minimal_lodging(tmp_path)
+
+    fanout_peak = _measure_triage_peak_concurrency(
+        tmp_path, AngelusDaemon._triage_loop
+    )
+    assert fanout_peak == 3, (
+        f"current _triage_loop did not fan out: peak={fanout_peak}, expected 3"
+    )
+
+    inline_peak = _measure_triage_peak_concurrency(
+        tmp_path, _inline_await_triage_loop
+    )
+    assert inline_peak == 1, (
+        f"inline-await control case unexpectedly concurrent: peak={inline_peak}"
+    )
+
+
+def test_mark_triage_processing_raises_on_duplicate(tmp_path) -> None:
+    """Slice 1's loop never double-marks (the JOIN filters processed rows), so
+    swallowing IntegrityError hid logic bugs. After cleanup, a duplicate raises
+    loudly so a regression in the routing surfaces immediately."""
+    import sqlite3
+
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    try:
+        observation_id = catalog.write_observation(
+            "scheduled/test", {}, {"source": "scheduled/test"}
+        )
+        catalog.mark_triage_processing(observation_id, "dead-link")
+        with pytest.raises(sqlite3.IntegrityError):
+            catalog.mark_triage_processing(observation_id, "dead-link")
+    finally:
+        connection.close()
