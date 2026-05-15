@@ -1,4 +1,9 @@
-"""One-shot lodging loader for slice 1."""
+"""Lodging YAML loader.
+
+Slice 5a exposes per-file parsers and a standalone cross-reference validator
+so the hot-reload watcher can re-load a single file and validate it against
+the rest of the live state without re-walking every directory.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +19,8 @@ SUPPORTED_DIGEST_INPUTS = (
     "suppressed_findings",
     "recent_closures",
 )
+
+DISABLED_SUFFIX = ".disabled"
 
 
 @dataclass(frozen=True)
@@ -61,120 +68,163 @@ class Lodging:
 
 
 def load_lodging(root: Path) -> Lodging:
-    sources = _load_sources(root)
-    triagers = _load_triagers(root)
-    pipes = _load_pipes(root)
-    channels = _load_channels(root)
+    lodging = Lodging(
+        sources=_load_sources(root),
+        triagers=_load_triagers(root),
+        pipes=_load_pipes(root),
+        channels=_load_channels(root),
+    )
+    errors = validate_cross_refs(lodging)
+    if errors:
+        raise ValueError("; ".join(errors))
+    return lodging
 
-    for triager in triagers.values():
-        if triager.source_ref not in sources:
-            raise ValueError(
+
+def validate_cross_refs(lodging: Lodging) -> list[str]:
+    """Return a list of cross-reference errors. Empty list means consistent."""
+    errors: list[str] = []
+    for triager in lodging.triagers.values():
+        if triager.source_ref not in lodging.sources:
+            errors.append(
                 f"triager {triager.name} references missing source {triager.source_ref}"
             )
-    for pipe in pipes.values():
+    for pipe in lodging.pipes.values():
         for channel in pipe.channels:
-            if channel not in channels:
-                raise ValueError(f"pipe {pipe.name} references missing channel {channel}")
+            if channel not in lodging.channels:
+                errors.append(
+                    f"pipe {pipe.name} references missing channel {channel}"
+                )
         overflow = pipe.rate_limit.get("overflow")
-        if overflow is not None and overflow not in pipes:
-            raise ValueError(
+        if overflow is not None and overflow not in lodging.pipes:
+            errors.append(
                 f"pipe {pipe.name} rate_limit.overflow references unknown pipe "
-                f"{overflow!r}; expected one of {sorted(pipes)}"
+                f"{overflow!r}"
             )
+    return errors
 
-    return Lodging(sources=sources, triagers=triagers, pipes=pipes, channels=channels)
+
+def parse_source(path: Path) -> ScheduledSource:
+    data = _read_yaml(path)
+    name = path.stem
+    check = _required_dict(data, "check", path)
+    if check.get("kind") != "shell":
+        raise ValueError(f"{path}: only check.kind=shell is supported")
+    return ScheduledSource(
+        name=name,
+        source_ref=f"scheduled/{name}",
+        cadence=_required_str(data, "cadence", path),
+        command=_required_str(check, "command", path),
+        timeout_seconds=_optional_timeout(check, path, 30.0),
+    )
+
+
+def parse_triager(root: Path, path: Path) -> Triager:
+    data = _read_yaml(path)
+    name = path.stem
+    inputs = _required_dict(data, "inputs", path)
+    handler = _required_dict(data, "handler", path)
+    if handler.get("kind") != "python":
+        raise ValueError(f"{path}: only handler.kind=python is supported")
+    handler_path = root / _required_str(handler, "path", path)
+    if not handler_path.exists():
+        raise ValueError(f"{path}: handler path does not exist: {handler_path}")
+    return Triager(
+        name=name,
+        source_ref=_required_str(inputs, "source", path),
+        handler_path=handler_path,
+        timeout_seconds=_optional_timeout(handler, path, 60.0),
+    )
+
+
+def parse_pipe(path: Path) -> Pipe:
+    data = _read_yaml(path)
+    name = path.stem
+    render = _required_dict(data, "render", path)
+    if render.get("kind") == "dumb-alert":
+        render_kind = "dumb-alert"
+        template: str | None = _required_str(render, "template", path)
+    elif isinstance(render.get("preamble"), list) and isinstance(render.get("body"), dict):
+        for block in render["preamble"]:
+            if not isinstance(block, dict):
+                raise ValueError(f"{path}: expected preamble blocks to be mappings")
+            if "source" in block:
+                raise ValueError(f"{path}: preamble blocks do not accept source")
+        _validate_digest_body(render["body"], path)
+        render_kind = "digest"
+        template = None
+    else:
+        raise ValueError(f"{path}: unsupported render shape")
+    return Pipe(
+        name=name,
+        cadence=_required_str(data, "cadence", path),
+        render_kind=render_kind,
+        template=template,
+        channels=list(data.get("channels") or []),
+        render=render,
+        rate_limit=dict(data.get("rate_limit") or {}),
+    )
+
+
+def parse_channel(path: Path) -> Channel:
+    data = _read_yaml(path)
+    name = path.stem
+    kind = data.get("kind")
+    if kind not in {"push", "email"}:
+        raise ValueError(f"{path}: unsupported channel kind={kind!r}")
+    if kind == "email":
+        to = _required_str(data, "to", path)
+    else:
+        to = None
+    return Channel(
+        name=name,
+        kind=str(kind),
+        command=_required_str(data, "command", path),
+        to=to,
+    )
+
+
+def _enabled_yaml_files(directory: Path) -> list[Path]:
+    """Return *.yaml files under directory, skipping any that have a sibling
+    .disabled twin (or are themselves named *.yaml.disabled)."""
+    if not directory.exists():
+        return []
+    files = sorted(directory.glob("*.yaml"))
+    return [
+        path
+        for path in files
+        if not (path.parent / (path.name + DISABLED_SUFFIX)).exists()
+    ]
 
 
 def _load_sources(root: Path) -> dict[str, ScheduledSource]:
     loaded: dict[str, ScheduledSource] = {}
-    for path in sorted((root / "sources" / "scheduled").glob("*.yaml")):
-        data = _read_yaml(path)
-        name = path.stem
-        source_ref = f"scheduled/{name}"
-        check = _required_dict(data, "check", path)
-        if check.get("kind") != "shell":
-            raise ValueError(f"{path}: only check.kind=shell is supported")
-        loaded[source_ref] = ScheduledSource(
-            name=name,
-            source_ref=source_ref,
-            cadence=_required_str(data, "cadence", path),
-            command=_required_str(check, "command", path),
-            timeout_seconds=_optional_timeout(check, path, 30.0),
-        )
+    for path in _enabled_yaml_files(root / "sources" / "scheduled"):
+        source = parse_source(path)
+        loaded[source.source_ref] = source
     return loaded
 
 
 def _load_triagers(root: Path) -> dict[str, Triager]:
     loaded: dict[str, Triager] = {}
-    for path in sorted((root / "triagers").glob("*.yaml")):
-        data = _read_yaml(path)
-        name = path.stem
-        inputs = _required_dict(data, "inputs", path)
-        handler = _required_dict(data, "handler", path)
-        if handler.get("kind") != "python":
-            raise ValueError(f"{path}: only handler.kind=python is supported")
-        handler_path = root / _required_str(handler, "path", path)
-        if not handler_path.exists():
-            raise ValueError(f"{path}: handler path does not exist: {handler_path}")
-        loaded[name] = Triager(
-            name=name,
-            source_ref=_required_str(inputs, "source", path),
-            handler_path=handler_path,
-            timeout_seconds=_optional_timeout(handler, path, 60.0),
-        )
+    for path in _enabled_yaml_files(root / "triagers"):
+        triager = parse_triager(root, path)
+        loaded[triager.name] = triager
     return loaded
 
 
 def _load_pipes(root: Path) -> dict[str, Pipe]:
     loaded: dict[str, Pipe] = {}
-    for path in sorted((root / "pipes").glob("*.yaml")):
-        data = _read_yaml(path)
-        name = path.stem
-        render = _required_dict(data, "render", path)
-        if render.get("kind") == "dumb-alert":
-            render_kind = "dumb-alert"
-            template = _required_str(render, "template", path)
-        elif isinstance(render.get("preamble"), list) and isinstance(render.get("body"), dict):
-            for block in render["preamble"]:
-                if not isinstance(block, dict):
-                    raise ValueError(f"{path}: expected preamble blocks to be mappings")
-                if "source" in block:
-                    raise ValueError(f"{path}: preamble blocks do not accept source")
-            _validate_digest_body(render["body"], path)
-            render_kind = "digest"
-            template = None
-        else:
-            raise ValueError(f"{path}: unsupported render shape")
-        loaded[name] = Pipe(
-            name=name,
-            cadence=_required_str(data, "cadence", path),
-            render_kind=render_kind,
-            template=template,
-            channels=list(data.get("channels") or []),
-            render=render,
-            rate_limit=dict(data.get("rate_limit") or {}),
-        )
+    for path in _enabled_yaml_files(root / "pipes"):
+        pipe = parse_pipe(path)
+        loaded[pipe.name] = pipe
     return loaded
 
 
 def _load_channels(root: Path) -> dict[str, Channel]:
     loaded: dict[str, Channel] = {}
-    for path in sorted((root / "channels").glob("*.yaml")):
-        data = _read_yaml(path)
-        name = path.stem
-        kind = data.get("kind")
-        if kind not in {"push", "email"}:
-            raise ValueError(f"{path}: unsupported channel kind={kind!r}")
-        if kind == "email":
-            to = _required_str(data, "to", path)
-        else:
-            to = None
-        loaded[name] = Channel(
-            name=name,
-            kind=str(kind),
-            command=_required_str(data, "command", path),
-            to=to,
-        )
+    for path in _enabled_yaml_files(root / "channels"):
+        channel = parse_channel(path)
+        loaded[channel.name] = channel
     return loaded
 
 
