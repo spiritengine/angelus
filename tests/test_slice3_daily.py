@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -16,7 +16,7 @@ from angelus.pipes import PipeDrain
 from angelus.storage import Catalog, init_db
 
 
-def _daily_pipe() -> Pipe:
+def _daily_pipe(inputs: list[str] | None = None) -> Pipe:
     return Pipe(
         name="daily",
         cadence="0 8 * * *",
@@ -28,7 +28,13 @@ def _daily_pipe() -> Pipe:
                 {"kind": "structured", "template": "rate-limit-callout"},
                 {"kind": "structured", "template": "incident-status"},
             ],
-            "body": {"kind": "llm", "mantle": "chronicler"},
+            "body": {
+                "kind": "llm",
+                "mantle": "chronicler",
+                "inputs": inputs
+                if inputs is not None
+                else ["findings_since_last_drain", "open_incidents"],
+            },
         },
     )
 
@@ -43,7 +49,7 @@ def _now_pipe() -> Pipe:
         rate_limit={
             "per_channel": "6/hr",
             "per_source": "4/hr",
-            "overflow": "defer_to_daily",
+            "overflow": "daily",
         },
     )
 
@@ -90,7 +96,8 @@ def _write_lodging(root: Path) -> None:
         "render:\n"
         "  preamble:\n"
         "    - kind: structured\n      template: rate-limit-callout\n"
-        "  body:\n    kind: llm\n    mantle: chronicler\n",
+        "  body:\n    kind: llm\n    mantle: chronicler\n"
+        "    inputs:\n      - findings_since_last_drain\n      - open_incidents\n",
         encoding="utf-8",
     )
     (root / "channels").mkdir()
@@ -285,13 +292,15 @@ def test_digest_partial_channel_failure_does_not_resend_success_channel(
     )
     push_messages: list[str] = []
     email_attempts = 0
+    email_subjects: list[str] = []
 
     async def fake_push(_channel, message: str, _workdir: Path) -> None:
         push_messages.append(message)
 
-    async def fake_email(_channel, _subject: str, _body: str, _workdir: Path) -> None:
+    async def fake_email(_channel, subject: str, _body: str, _workdir: Path) -> None:
         nonlocal email_attempts
         email_attempts += 1
+        email_subjects.append(subject)
         raise RuntimeError("email broke")
 
     async def fake_llm(self, _structured):
@@ -312,6 +321,25 @@ def test_digest_partial_channel_failure_does_not_resend_success_channel(
             (finding_id,),
         ).fetchone()
         first_drain_at = catalog.last_pipe_drain_at("daily")
+        failed_dispatches = list(
+            connection.execute(
+                """
+                SELECT channel, status, last_error
+                FROM dispatches
+                WHERE pipe = 'daily' AND status = 'failed'
+                ORDER BY id
+                """
+            )
+        )
+        internal = connection.execute(
+            """
+            SELECT type, entity FROM findings
+            WHERE source = 'internal/dispatch'
+            """
+        ).fetchone()
+        channel_health_rows = list(
+            connection.execute("SELECT channel FROM channel_health")
+        )
         asyncio.run(drain.drain_once())
         sent_dispatches = list(
             connection.execute(
@@ -327,12 +355,20 @@ def test_digest_partial_channel_failure_does_not_resend_success_channel(
         connection.close()
 
     assert first_queue["status"] == "dispatched"
-    assert first_queue["attempts"] == 1
-    assert first_queue["next_attempt_at"] is not None
+    assert first_queue["attempts"] == 0
+    assert first_queue["next_attempt_at"] is None
     assert first_drain_at is not None
     assert len(push_messages) == 1
     assert email_attempts == 1
+    assert [row["channel"] for row in failed_dispatches] == ["email"]
+    assert failed_dispatches[0]["last_error"] == "email broke"
+    assert internal["type"] == "channel_unhealthy"
+    assert internal["entity"] == "email"
+    assert channel_health_rows == []
     assert [row["channel"] for row in sent_dispatches] == ["push"]
+    assert email_subjects
+    today_utc = datetime.now(UTC).date().isoformat()
+    assert email_subjects[0] == f"Angelus daily digest {today_utc} UTC"
 
 
 def test_suppressed_overflow_stays_out_of_llm_inputs(tmp_path, monkeypatch) -> None:
@@ -358,7 +394,7 @@ def test_suppressed_overflow_stays_out_of_llm_inputs(tmp_path, monkeypatch) -> N
         },
         {"now", "daily"},
     )
-    catalog.suppress_pipe_item_to_daily(finding_id, "now")
+    catalog.suppress_pipe_item_to(finding_id, "now", "daily")
     seen_inputs: list[dict] = []
 
     async def fake_push(_channel, _message: str, _workdir: Path) -> None:
@@ -428,8 +464,8 @@ def test_llm_nonzero_fallback_dispatches_and_emits_internal_finding(
     assert queued["status"] == "pending"
 
 
-def test_empty_day_channel_failure_warns_without_phantom_dispatch(
-    tmp_path, monkeypatch, caplog
+def test_empty_day_channel_failure_records_dispatch_and_emits_internal(
+    tmp_path, monkeypatch
 ) -> None:
     connection = init_db(tmp_path / "angelus.sqlite3")
     catalog = Catalog(connection, tmp_path)
@@ -466,22 +502,33 @@ def test_empty_day_channel_failure_warns_without_phantom_dispatch(
     monkeypatch.setattr(PipeDrain, "_render_llm_body", fake_llm)
 
     try:
-        with caplog.at_level("WARNING"):
-            asyncio.run(drain.drain_once())
+        asyncio.run(drain.drain_once())
         dispatches = list(
             connection.execute(
                 """
-                SELECT finding_ids, status
+                SELECT channel, finding_ids, status, last_error
                 FROM dispatches
                 WHERE pipe = 'daily'
                 """
             )
         )
+        internal = connection.execute(
+            "SELECT type, entity FROM findings WHERE source = 'internal/dispatch'"
+        ).fetchone()
+        channel_health_rows = list(
+            connection.execute("SELECT channel FROM channel_health")
+        )
     finally:
         connection.close()
 
-    assert dispatches == []
-    assert "channel unhealthy escalation is deferred until a non-empty drain" in caplog.text
+    assert len(dispatches) == 1
+    assert dispatches[0]["channel"] == "email"
+    assert dispatches[0]["status"] == "failed"
+    assert dispatches[0]["finding_ids"] == "[]"
+    assert dispatches[0]["last_error"] == "email broke"
+    assert internal["type"] == "channel_unhealthy"
+    assert internal["entity"] == "email"
+    assert channel_health_rows == []
 
 
 def test_llm_timeout_kills_subprocess_and_falls_back(tmp_path, monkeypatch) -> None:
@@ -545,13 +592,15 @@ def test_pipe_state_updates_and_scopes_next_drain(tmp_path, monkeypatch) -> None
         tmp_path,
         {"now", "daily"},
     )
-    structured_counts: list[int] = []
+    closure_counts: list[int] = []
+    finding_counts: list[int] = []
 
     async def fake_push(_channel, _message: str, _workdir: Path) -> None:
         return None
 
     async def fake_llm(self, structured):
-        structured_counts.append(len(structured["findings_since_last_drain"]))
+        closure_counts.append(len(structured["recent_closures"]))
+        finding_counts.append(len(structured["findings_since_last_drain"]))
         return "This is the chronicler body.", None
 
     monkeypatch.setattr(pipe_runner, "send_push", fake_push)
@@ -578,7 +627,8 @@ def test_pipe_state_updates_and_scopes_next_drain(tmp_path, monkeypatch) -> None
     finally:
         connection.close()
 
-    assert structured_counts == [1, 0]
+    assert closure_counts == [1, 0]
+    assert finding_counts == [0, 0]
     assert second_state is not None
     assert second_state >= first_state
 
@@ -635,34 +685,64 @@ def test_daily_drain_processes_all_pending_items(tmp_path, monkeypatch) -> None:
     assert dispatched["n"] == 25
 
 
-def test_email_channel_invokes_patbot_with_subject_and_stdin(tmp_path, monkeypatch) -> None:
+def test_email_channel_invokes_patbot_with_subject_and_stdin(tmp_path) -> None:
+    capture_args = tmp_path / "args.txt"
+    capture_stdin = tmp_path / "stdin.txt"
+    script = tmp_path / "fake-patbot-email"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        f"open({str(capture_args)!r}, 'w').write('\\n'.join(sys.argv))\n"
+        f"open({str(capture_stdin)!r}, 'wb').write(sys.stdin.buffer.read())\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
     channel = Channel(
         name="email",
         kind="email",
-        command="/home/user/projects/patbot-email/patbot-email",
+        command=str(script),
         to="person@example.com",
     )
-    calls: list[tuple[list[str], bytes]] = []
-
-    def fake_run(args, input, check, stdout, stderr):
-        calls.append((args, input))
-        return subprocess.CompletedProcess(args, 0, stdout=b"", stderr=b"")
-
-    monkeypatch.setattr(email_module.subprocess, "run", fake_run)
 
     asyncio.run(email_module.send_email(channel, "Angelus daily 2026-05-14", "body", tmp_path))
 
-    assert calls == [
-        (
-            [
-                "/home/user/projects/patbot-email/patbot-email",
-                "send",
-                "person@example.com",
-                "Angelus daily 2026-05-14",
-            ],
-            b"body",
-        )
+    assert capture_args.read_text(encoding="utf-8").split("\n") == [
+        str(script),
+        "send",
+        "person@example.com",
+        "Angelus daily 2026-05-14",
     ]
+    assert capture_stdin.read_bytes() == b"body"
+
+
+def test_email_channel_kills_subprocess_on_timeout(tmp_path) -> None:
+    pid_file = tmp_path / "patbot.pid"
+    script = tmp_path / "hang-patbot-email"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, time\n"
+        f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+        "time.sleep(999)\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    channel = Channel(
+        name="email",
+        kind="email",
+        command=str(script),
+        to="person@example.com",
+    )
+
+    with pytest.raises(RuntimeError, match=r"email timed out after 0\.2s"):
+        asyncio.run(
+            email_module.send_email(
+                channel, "subject", "body", tmp_path, timeout_seconds=0.2
+            )
+        )
+
+    pid = int(pid_file.read_text(encoding="utf-8"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
 
 
 def test_email_channel_loaded_from_repo_lodging() -> None:
@@ -693,4 +773,199 @@ def test_channel_command_is_required(tmp_path) -> None:
     (tmp_path / "channels" / "push.yaml").write_text("kind: push\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="non-empty string command"):
+        load_lodging(tmp_path)
+
+
+def test_digest_body_inputs_filter_chronicler_payload(tmp_path, monkeypatch) -> None:
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    _write_templates(tmp_path)
+    drain = PipeDrain(
+        catalog,
+        _daily_pipe(inputs=["findings_since_last_drain"]),
+        {"push": Channel(name="push", kind="push", command="notify-pat")},
+        tmp_path,
+        {"now", "daily"},
+    )
+    captured: dict[str, object] = {}
+
+    real_create = pipe_runner.asyncio.create_subprocess_exec
+
+    async def capture_create(*args, **kwargs):
+        for idx, token in enumerate(args):
+            if token == "--message" and idx + 1 < len(args):
+                captured["message"] = args[idx + 1]
+        return await real_create(
+            "sh", "-c", "echo 'chronicler output text here.'", **kwargs
+        )
+
+    async def fake_push(_channel, _message: str, _workdir: Path) -> None:
+        return None
+
+    monkeypatch.setattr(pipe_runner, "send_push", fake_push)
+    monkeypatch.setattr(
+        pipe_runner.asyncio, "create_subprocess_exec", capture_create
+    )
+
+    catalog.write_finding(
+        None,
+        {
+            "source": "scheduled/test",
+            "type": "down",
+            "entity": "site",
+            "severity": "high",
+            "target_pipes": ["daily"],
+        },
+        {"daily"},
+    )
+    try:
+        asyncio.run(drain.drain_once())
+    finally:
+        connection.close()
+
+    import json as _json
+
+    payload_json = captured["message"].split("\n\n", 1)[1]
+    payload = _json.loads(payload_json)
+    assert list(payload.keys()) == ["findings_since_last_drain"]
+    assert "open_incidents" not in payload
+    assert "suppressed_findings" not in payload
+    assert "recent_closures" not in payload
+
+
+def test_digest_body_inputs_unknown_name_rejected(tmp_path) -> None:
+    _write_lodging(tmp_path)
+    (tmp_path / "pipes" / "daily.yaml").write_text(
+        "cadence: '0 8 * * *'\nchannels: [push]\n"
+        "render:\n"
+        "  preamble:\n"
+        "    - kind: structured\n      template: rate-limit-callout\n"
+        "  body:\n    kind: llm\n    mantle: chronicler\n"
+        "    inputs:\n      - bogus_name\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="unknown name 'bogus_name'"):
+        load_lodging(tmp_path)
+
+
+def test_clearance_dedup_excludes_clearance_from_findings(tmp_path, monkeypatch) -> None:
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    _write_templates(tmp_path)
+    drain = PipeDrain(
+        catalog,
+        _daily_pipe(
+            inputs=["findings_since_last_drain", "recent_closures", "open_incidents"]
+        ),
+        {"push": Channel(name="push", kind="push", command="notify-pat")},
+        tmp_path,
+        {"now", "daily"},
+    )
+    catalog.write_finding(
+        None,
+        {
+            "source": "scheduled/test",
+            "type": "down",
+            "entity": "site-a",
+            "severity": "high",
+            "target_pipes": ["daily"],
+        },
+        {"daily"},
+    )
+    catalog.write_finding(
+        None,
+        {
+            "source": "scheduled/test",
+            "type": "clearance",
+            "entity": "site-b",
+            "severity": "info",
+            "target_pipes": ["daily"],
+        },
+        {"daily"},
+    )
+    seen: list[dict] = []
+
+    async def fake_push(_channel, _message: str, _workdir: Path) -> None:
+        return None
+
+    async def fake_llm(self, structured):
+        seen.append(structured)
+        return "This is the chronicler body.", None
+
+    monkeypatch.setattr(pipe_runner, "send_push", fake_push)
+    monkeypatch.setattr(PipeDrain, "_render_llm_body", fake_llm)
+
+    try:
+        asyncio.run(drain.drain_once())
+    finally:
+        connection.close()
+
+    findings = seen[0]["findings_since_last_drain"]
+    closures = seen[0]["recent_closures"]
+    assert [item["entity"] for item in findings] == ["site-a"]
+    assert [item["type"] for item in findings] == ["down"]
+    assert [item["entity"] for item in closures] == ["site-b"]
+
+
+def test_overflow_defer_to_prefix_is_rejected(tmp_path) -> None:
+    _write_lodging(tmp_path)
+    (tmp_path / "pipes" / "now.yaml").write_text(
+        "cadence: immediate\nchannels: [push]\n"
+        "render:\n  kind: dumb-alert\n  template: '{type}:{entity}:{body}'\n"
+        "rate_limit:\n"
+        "  per_channel: 6/hr\n  per_source: 4/hr\n  overflow: defer_to_daily\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError, match="rate_limit.overflow references unknown pipe 'defer_to_daily'"
+    ):
+        load_lodging(tmp_path)
+
+
+def test_overflow_unknown_pipe_is_rejected(tmp_path) -> None:
+    _write_lodging(tmp_path)
+    (tmp_path / "pipes" / "now.yaml").write_text(
+        "cadence: immediate\nchannels: [push]\n"
+        "render:\n  kind: dumb-alert\n  template: '{type}:{entity}:{body}'\n"
+        "rate_limit:\n"
+        "  per_channel: 6/hr\n  per_source: 4/hr\n  overflow: nonexistent\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError, match="rate_limit.overflow references unknown pipe 'nonexistent'"
+    ):
+        load_lodging(tmp_path)
+
+
+def test_overflow_bare_pipe_name_loads_cleanly(tmp_path) -> None:
+    _write_lodging(tmp_path)
+    (tmp_path / "pipes" / "now.yaml").write_text(
+        "cadence: immediate\nchannels: [push]\n"
+        "render:\n  kind: dumb-alert\n  template: '{type}:{entity}:{body}'\n"
+        "rate_limit:\n"
+        "  per_channel: 6/hr\n  per_source: 4/hr\n  overflow: daily\n",
+        encoding="utf-8",
+    )
+
+    lodging = load_lodging(tmp_path)
+
+    assert lodging.pipes["now"].rate_limit["overflow"] == "daily"
+
+
+def test_digest_body_kind_must_be_llm(tmp_path) -> None:
+    _write_lodging(tmp_path)
+    (tmp_path / "pipes" / "daily.yaml").write_text(
+        "cadence: '0 8 * * *'\nchannels: [push]\n"
+        "render:\n"
+        "  preamble:\n"
+        "    - kind: structured\n      template: rate-limit-callout\n"
+        "  body:\n    kind: handlebars\n    mantle: chronicler\n"
+        "    inputs:\n      - findings_since_last_drain\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="body.kind must be 'llm'"):
         load_lodging(tmp_path)

@@ -5,13 +5,20 @@ from __future__ import annotations
 import asyncio
 import os
 import shlex
-import subprocess
 from pathlib import Path
 
 from angelus.lodging import Channel
 
+DEFAULT_TIMEOUT_SECONDS = 30.0
 
-async def send_email(channel: Channel, subject: str, body: str, workdir: Path) -> None:
+
+async def send_email(
+    channel: Channel,
+    subject: str,
+    body: str,
+    workdir: Path,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+) -> None:
     to_address = _resolve_to(channel.to)
     if os.environ.get("ANGELUS_DRY_RUN") == "1":
         with (workdir / "dispatches.log").open("a", encoding="utf-8") as handle:
@@ -19,16 +26,25 @@ async def send_email(channel: Channel, subject: str, body: str, workdir: Path) -
         return
 
     argv = shlex.split(channel.command) + ["send", to_address, subject]
-    result = await asyncio.to_thread(
-        subprocess.run,
-        argv,
-        input=body.encode("utf-8"),
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+    process = await asyncio.create_subprocess_exec(
+        *argv,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
     )
-    if result.returncode != 0:
-        error = result.stderr.decode("utf-8", errors="replace").strip()
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(body.encode("utf-8")),
+            timeout=timeout_seconds,
+        )
+    except asyncio.TimeoutError as exc:
+        process.kill()
+        await process.wait()
+        raise RuntimeError(
+            f"{channel.name} timed out after {timeout_seconds:g}s"
+        ) from exc
+    if process.returncode != 0:
+        error = stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(f"{channel.name} failed: {error}")
 
 

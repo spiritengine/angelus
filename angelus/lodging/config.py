@@ -8,6 +8,13 @@ from typing import Any
 
 import yaml
 
+SUPPORTED_DIGEST_INPUTS = (
+    "findings_since_last_drain",
+    "open_incidents",
+    "suppressed_findings",
+    "recent_closures",
+)
+
 
 @dataclass(frozen=True)
 class ScheduledSource:
@@ -68,6 +75,12 @@ def load_lodging(root: Path) -> Lodging:
         for channel in pipe.channels:
             if channel not in channels:
                 raise ValueError(f"pipe {pipe.name} references missing channel {channel}")
+        overflow = pipe.rate_limit.get("overflow")
+        if overflow is not None and overflow not in pipes:
+            raise ValueError(
+                f"pipe {pipe.name} rate_limit.overflow references unknown pipe "
+                f"{overflow!r}; expected one of {sorted(pipes)}"
+            )
 
     return Lodging(sources=sources, triagers=triagers, pipes=pipes, channels=channels)
 
@@ -127,6 +140,7 @@ def _load_pipes(root: Path) -> dict[str, Pipe]:
                     raise ValueError(f"{path}: expected preamble blocks to be mappings")
                 if "source" in block:
                     raise ValueError(f"{path}: preamble blocks do not accept source")
+            _validate_digest_body(render["body"], path)
             render_kind = "digest"
             template = None
         else:
@@ -183,6 +197,33 @@ def _required_str(data: dict[str, Any], key: str, path: Path) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{path}: expected non-empty string {key}")
     return value
+
+
+def _validate_digest_body(body: dict[str, Any], path: Path) -> None:
+    kind = body.get("kind")
+    if kind != "llm":
+        raise ValueError(
+            f"{path}: body.kind must be 'llm' (got {kind!r})"
+        )
+    inputs = body.get("inputs")
+    if not isinstance(inputs, list) or not inputs:
+        raise ValueError(
+            f"{path}: body.inputs must be a non-empty list of input names"
+        )
+    seen: set[str] = set()
+    for name in inputs:
+        if not isinstance(name, str):
+            raise ValueError(
+                f"{path}: body.inputs entries must be strings (got {name!r})"
+            )
+        if name not in SUPPORTED_DIGEST_INPUTS:
+            raise ValueError(
+                f"{path}: body.inputs has unknown name {name!r}; "
+                f"supported: {', '.join(SUPPORTED_DIGEST_INPUTS)}"
+            )
+        if name in seen:
+            raise ValueError(f"{path}: body.inputs has duplicate name {name!r}")
+        seen.add(name)
 
 
 def _optional_timeout(data: dict[str, Any], path: Path, default: float) -> float:

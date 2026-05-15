@@ -363,7 +363,9 @@ class Catalog:
         ).fetchone()
         return int(row["n"])
 
-    def suppress_pipe_item_to_daily(self, finding_id: int, pipe: str) -> None:
+    def suppress_pipe_item_to(
+        self, finding_id: int, source_pipe: str, target_pipe: str
+    ) -> None:
         now = utcnow()
         self.connection.execute(
             """
@@ -371,14 +373,14 @@ class Catalog:
             SET status = 'suppressed', updated_at = ?
             WHERE finding_id = ? AND pipe = ?
             """,
-            (now, finding_id, pipe),
+            (now, finding_id, source_pipe),
         )
         self.connection.execute(
             """
             INSERT OR IGNORE INTO pipe_queues (finding_id, pipe, status)
-            VALUES (?, 'daily', 'pending')
+            VALUES (?, ?, 'pending')
             """,
-            (finding_id,),
+            (finding_id, target_pipe),
         )
         self.connection.commit()
 
@@ -418,15 +420,28 @@ class Catalog:
         )
         return [self._finding_dict(row) for row in rows]
 
-    def findings_for_pipe_since(self, pipe: str, since: str | None) -> list[dict[str, Any]]:
-        clause = "AND f.created_at > ?" if since else ""
-        params: tuple[Any, ...] = (pipe, since) if since else (pipe,)
+    def findings_for_pipe_since(
+        self,
+        pipe: str,
+        since: str | None,
+        exclude_types: tuple[str, ...] = (),
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = [pipe]
+        if since:
+            clauses.append("AND f.created_at > ?")
+            params.append(since)
+        if exclude_types:
+            placeholders = ",".join("?" for _ in exclude_types)
+            clauses.append(f"AND f.type NOT IN ({placeholders})")
+            params.extend(exclude_types)
+        extra = " ".join(clauses)
         rows = self.connection.execute(
             f"""
             SELECT f.*, pq.created_at AS queued_at
             FROM pipe_queues pq
             JOIN findings f ON f.id = pq.finding_id
-            WHERE pq.pipe = ? AND f.status = 'ready' {clause}
+            WHERE pq.pipe = ? AND f.status = 'ready' {extra}
               AND NOT EXISTS (
                 SELECT 1
                 FROM pipe_queues suppressed
@@ -435,7 +450,7 @@ class Catalog:
               )
             ORDER BY f.created_at, f.id
             """,
-            params,
+            tuple(params),
         )
         return [self._finding_dict(row) for row in rows]
 

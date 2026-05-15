@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -16,7 +15,6 @@ from angelus.lodging import Channel, Pipe
 from angelus.storage import Catalog, utcnow
 
 LLM_FALLBACK_FOOTER = "LLM digest body unavailable — see structured data above."
-LOGGER = logging.getLogger(__name__)
 
 
 class PipeDrain:
@@ -46,7 +44,11 @@ class PipeDrain:
                 finding_id = int(row["id"])
                 message = self._render(row)
                 if self._over_rate_limit(row):
-                    self.catalog.suppress_pipe_item_to_daily(finding_id, self.pipe.name)
+                    self.catalog.suppress_pipe_item_to(
+                        finding_id,
+                        self.pipe.name,
+                        self.pipe.rate_limit["overflow"],
+                    )
                     continue
                 for channel_name in self.pipe.channels:
                     if self.catalog.is_channel_unhealthy(channel_name):
@@ -113,39 +115,31 @@ class PipeDrain:
                 self.known_pipes,
             )
         message = "\n\n".join(part for part in (preamble, body) if part)
-        subject = f"Angelus daily {datetime.now().astimezone().date().isoformat()}"
+        subject = (
+            f"Angelus daily digest {datetime.now(UTC).date().isoformat()} UTC"
+        )
 
         any_channel_succeeded = False
         for channel_name in self.pipe.channels:
-            if self.catalog.is_channel_unhealthy(channel_name):
-                continue
             channel = self.channels[channel_name]
             try:
                 await self._send_channel(channel, message, subject)
             except Exception as exc:
-                if not finding_ids:
-                    LOGGER.warning(
-                        "digest channel %s failed with no pending findings; "
-                        "channel unhealthy escalation is deferred until a non-empty drain: %s",
-                        channel.name,
-                        exc,
-                    )
-                    continue
-                for finding_id in finding_ids:
-                    exhausted = self.catalog.record_pipe_send_failure(
-                        self.pipe.name,
-                        channel.name,
-                        finding_id,
-                        str(exc),
-                    )
-                    if exhausted:
-                        self.catalog.write_internal_finding(
-                            "internal/dispatch",
-                            "channel_unhealthy",
-                            channel.name,
-                            str(exc),
-                            self.known_pipes,
-                        )
+                self.catalog.record_dispatch(
+                    self.pipe.name,
+                    channel.name,
+                    finding_ids,
+                    "failed",
+                    error=str(exc),
+                    mark_queue=False,
+                )
+                self.catalog.write_internal_finding(
+                    "internal/dispatch",
+                    "channel_unhealthy",
+                    channel.name,
+                    str(exc),
+                    self.known_pipes,
+                )
             else:
                 any_channel_succeeded = True
                 self.catalog.record_dispatch(
@@ -171,7 +165,7 @@ class PipeDrain:
         open_incidents = self.catalog.open_incidents()
         return {
             "findings_since_last_drain": self.catalog.findings_for_pipe_since(
-                self.pipe.name, last_drain_at
+                self.pipe.name, last_drain_at, exclude_types=("clearance",)
             ),
             "suppressed_findings": self.catalog.suppressed_findings_since(last_drain_at),
             "open_incidents": open_incidents,
@@ -200,10 +194,8 @@ class PipeDrain:
         mantle = body_config.get("mantle")
         if not mantle:
             return None, "daily digest body missing mantle"
-        inputs = {
-            "findings_since_last_drain": structured["findings_since_last_drain"],
-            "open_incidents": structured["open_incidents"],
-        }
+        input_names = body_config.get("inputs") or []
+        inputs = {name: structured[name] for name in input_names}
         prompt = (
             "Render a concise Angelus daily digest body from the structured inputs. "
             "Do not omit urgent operational facts.\n\n"
