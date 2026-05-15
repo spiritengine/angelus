@@ -127,9 +127,12 @@ class Catalog:
         self, observation_id: int, triager_name: str
     ) -> None:
         """Delete a 'processing' observation_triage row when its triager
-        was hot-removed before the scheduled task acquired the semaphore.
-        Bounded to status='processing' so a legit concurrent transition
-        to 'success'/'failed' is not clobbered."""
+        was hot-removed mid-flight. Called from either None-check site:
+        before the semaphore is acquired (triager removed between
+        mark_triage_processing and task start), or after the per-triager
+        lock is acquired (triager removed while a sibling task held the
+        lock). Bounded to status='processing' so a legit concurrent
+        transition to 'success'/'failed' is not clobbered."""
         self.connection.execute(
             """
             DELETE FROM observation_triage
