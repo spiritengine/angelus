@@ -38,6 +38,10 @@ class AngelusDaemon:
         self.triager_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self.stop_event = asyncio.Event()
         self.tasks: list[asyncio.Task[None]] = []
+        # Tracked separately from self.tasks so apply_lodging can cancel a
+        # specific pipe's loop on cadence change without disturbing others.
+        # Tasks remain in self.tasks too — shutdown still drains via gather().
+        self._pipe_loop_tasks: dict[str, asyncio.Task[None]] = {}
         self.pipe_drains: dict[str, PipeDrain] = {
             name: PipeDrain(
                 self.catalog, pipe, self.lodging.channels, root, set(self.lodging.pipes)
@@ -71,9 +75,7 @@ class AngelusDaemon:
             for pipe_name, pipe in self.lodging.pipes.items():
                 if pipe.cadence != "immediate":
                     continue
-                self.tasks.append(
-                    asyncio.create_task(self._pipe_loop(pipe_name), name=f"pipe-{pipe_name}")
-                )
+                self._spawn_pipe_loop(pipe_name)
             self.reloader.start()
             reloader_started = True
             await self.stop_event.wait()
@@ -142,7 +144,7 @@ class AngelusDaemon:
         except JobLookupError:
             pass
 
-    def apply_lodging(self, new_lodging: Lodging) -> None:
+    async def apply_lodging(self, new_lodging: Lodging) -> None:
         """Atomically swap in a new Lodging snapshot. Adjusts scheduler jobs
         for source/pipe add/remove/cadence-change, swaps Pipe objects on
         existing PipeDrain instances, and re-points every drain at the new
@@ -166,7 +168,9 @@ class AngelusDaemon:
         new_pipes = new_lodging.pipes
         new_known = set(new_pipes)
         for name in set(old_pipes) - set(new_pipes):
-            if old_pipes[name].cadence != "immediate":
+            if old_pipes[name].cadence == "immediate":
+                await self._cancel_pipe_loop(name)
+            else:
                 self._remove_job(f"pipe:{name}")
             self.pipe_drains.pop(name, None)
             LOGGER.info("unregistered pipe %s", name)
@@ -176,19 +180,14 @@ class AngelusDaemon:
             drain = self.pipe_drains[name]
             drain.pipe = new_pipe
             if old_pipe.cadence != new_pipe.cadence:
-                if old_pipe.cadence != "immediate":
+                if old_pipe.cadence == "immediate":
+                    await self._cancel_pipe_loop(name)
+                else:
                     self._remove_job(f"pipe:{name}")
-                if new_pipe.cadence != "immediate":
+                if new_pipe.cadence == "immediate":
+                    self._spawn_pipe_loop(name)
+                else:
                     self._add_pipe_job(name, new_pipe.cadence)
-                if (
-                    old_pipe.cadence != "immediate"
-                    and new_pipe.cadence == "immediate"
-                ):
-                    self.tasks.append(
-                        asyncio.create_task(
-                            self._pipe_loop(name), name=f"pipe-{name}"
-                        )
-                    )
         for name in set(new_pipes) - set(old_pipes):
             new_pipe = new_pipes[name]
             self.pipe_drains[name] = PipeDrain(
@@ -199,17 +198,28 @@ class AngelusDaemon:
                 new_known,
             )
             if new_pipe.cadence == "immediate":
-                self.tasks.append(
-                    asyncio.create_task(
-                        self._pipe_loop(name), name=f"pipe-{name}"
-                    )
-                )
+                self._spawn_pipe_loop(name)
             else:
                 self._add_pipe_job(name, new_pipe.cadence)
 
         for drain in self.pipe_drains.values():
             drain.channels = new_lodging.channels
             drain.known_pipes = new_known
+
+    def _spawn_pipe_loop(self, pipe_name: str) -> None:
+        task = asyncio.create_task(self._pipe_loop(pipe_name), name=f"pipe-{pipe_name}")
+        self.tasks.append(task)
+        self._pipe_loop_tasks[pipe_name] = task
+
+    async def _cancel_pipe_loop(self, pipe_name: str) -> None:
+        task = self._pipe_loop_tasks.pop(pipe_name, None)
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
 
     async def _fire_source(self, source_ref: str) -> None:
         source = self.lodging.sources.get(source_ref)

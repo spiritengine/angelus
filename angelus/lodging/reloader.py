@@ -48,12 +48,7 @@ WATCHED_DIRS = (
     "triagers",
     "pipes",
     "channels",
-    "dependencies",
-    "render-templates",
 )
-
-# Subdirectories under root containing dataclass-backed lodging YAML.
-LODGING_KINDS: tuple[str, ...] = ("source", "triager", "pipe", "channel")
 
 
 @dataclass
@@ -183,6 +178,10 @@ class _QueueingHandler(FileSystemEventHandler):
 
 
 class LodgingReloader:
+    # Runtime lodging failures emit internal/lodging findings to the `now` pipe.
+    # Startup failures crash the daemon — at startup the catalog and now-pipe
+    # don't exist yet, so finding emission isn't possible. This asymmetry is
+    # deliberate.
     def __init__(
         self,
         daemon: AngelusDaemon,
@@ -195,7 +194,6 @@ class LodgingReloader:
         self.debounce_seconds = debounce_seconds
         self.poll_interval_seconds = poll_interval_seconds
         self.event_queue: queue.Queue[str] = queue.Queue()
-        self._first_seen: dict[Path, float] = {}
         self._last_seen: dict[Path, float] = {}
         # Files that parsed but failed cross-ref, or that failed to parse.
         # Keyed by canonical yaml path; value is the rendered error message.
@@ -209,6 +207,8 @@ class LodgingReloader:
             return
         handler = _QueueingHandler(self.event_queue)
         observer = Observer()
+        # Dirs are scheduled once at startup. A dir created later won't be watched
+        # until daemon restart. Slice 5c will register dependencies/ at lodge-time.
         for subdir in WATCHED_DIRS:
             target = self.root / subdir
             if target.exists():
@@ -257,7 +257,6 @@ class LodgingReloader:
             except queue.Empty:
                 break
             path = Path(raw)
-            self._first_seen.setdefault(path, moment)
             self._last_seen[path] = moment
 
         ready: list[Path] = []
@@ -265,7 +264,6 @@ class LodgingReloader:
             if moment - last >= self.debounce_seconds:
                 ready.append(path)
         for path in ready:
-            self._first_seen.pop(path, None)
             self._last_seen.pop(path, None)
             await self._handle_path(path)
 
@@ -322,7 +320,7 @@ class LodgingReloader:
             return
 
         self.rejected.pop(identified.yaml_path, None)
-        self.daemon.apply_lodging(prospective)
+        await self.daemon.apply_lodging(prospective)
         LOGGER.info(
             "lodging reload: %s %s -> applied",
             identified.kind,
@@ -340,7 +338,7 @@ class LodgingReloader:
             self._reject_cross_ref(identified.yaml_path, "; ".join(errors))
             return
         self.rejected.pop(identified.yaml_path, None)
-        self.daemon.apply_lodging(prospective)
+        await self.daemon.apply_lodging(prospective)
         LOGGER.info(
             "lodging reload: %s %s -> removed (%s)",
             identified.kind,

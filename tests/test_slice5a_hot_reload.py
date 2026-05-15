@@ -76,6 +76,8 @@ def test_pipe_channel_list_change_swaps_into_live_lodging(tmp_path) -> None:
     daemon, reloader = _make_daemon(tmp_path)
     try:
         assert daemon.lodging.pipes["now"].channels == ["push"]
+        drain_before = daemon.pipe_drains["now"]
+        lock_before = drain_before.lock
         (tmp_path / "pipes" / "now.yaml").write_text(
             "cadence: immediate\nchannels: [push, log]\n"
             "render:\n  kind: dumb-alert\n  template: '{type}:{entity}:{body}'\n",
@@ -85,7 +87,10 @@ def test_pipe_channel_list_change_swaps_into_live_lodging(tmp_path) -> None:
         asyncio.run(reloader.process_pending_events())
         assert daemon.lodging.pipes["now"].channels == ["push", "log"]
         # PipeDrain reference points at the same object whose .pipe is replaced.
-        assert daemon.pipe_drains["now"].pipe.channels == ["push", "log"]
+        drain_after = daemon.pipe_drains["now"]
+        assert drain_before is drain_after
+        assert drain_before.lock is lock_before
+        assert drain_after.pipe.channels == ["push", "log"]
     finally:
         daemon.connection.close()
 
@@ -207,9 +212,9 @@ def test_per_file_debounce_collapses_rapid_writes(tmp_path) -> None:
     apply_calls: list[None] = []
     real_apply = daemon.apply_lodging
 
-    def counting_apply(new_lodging) -> None:
+    async def counting_apply(new_lodging) -> None:
         apply_calls.append(None)
-        real_apply(new_lodging)
+        await real_apply(new_lodging)
 
     daemon.apply_lodging = counting_apply  # type: ignore[method-assign]
     try:
@@ -270,8 +275,15 @@ def test_previously_rejected_pipe_loads_when_channel_appears(tmp_path) -> None:
 
 
 def test_mid_drain_reload_uses_old_config_until_drain_completes(tmp_path) -> None:
-    """The drain captures pipe + channels at the start; a swap mid-drain must
-    not redirect the in-flight call to the new channel list."""
+    """A swap mid-drain must not redirect the in-flight call to the new
+    channel list or the new channels dict.
+
+    The drain pauses after sending to the first of two channels. The swap
+    replaces drain.pipe with one that drops the second channel and replaces
+    drain.channels with a dict that no longer contains it. A snapshotting
+    drain finishes by sending to the second channel using the captured
+    snapshot. A non-snapshotting drain that re-reads self.channels per
+    iteration would raise KeyError on the missing channel."""
     connection = init_db(tmp_path / "angelus.sqlite3")
     catalog = Catalog(connection, tmp_path)
     pipe_v1 = Pipe(
@@ -279,18 +291,20 @@ def test_mid_drain_reload_uses_old_config_until_drain_completes(tmp_path) -> Non
         cadence="immediate",
         render_kind="dumb-alert",
         template="{type}:{entity}:{body}",
-        channels=["push"],
+        channels=["push_a", "push_b"],
     )
     pipe_v2 = Pipe(
         name="now",
         cadence="immediate",
         render_kind="dumb-alert",
         template="{type}:{entity}:{body}",
-        channels=["push", "log"],
+        channels=["push_a"],
     )
-    push = Channel(name="push", kind="push", command="notify-pat")
-    log = Channel(name="log", kind="push", command="notify-pat")
-    drain = PipeDrain(catalog, pipe_v1, {"push": push}, tmp_path, {"now"})
+    push_a = Channel(name="push_a", kind="push", command="notify-pat")
+    push_b = Channel(name="push_b", kind="push", command="notify-pat")
+    drain = PipeDrain(
+        catalog, pipe_v1, {"push_a": push_a, "push_b": push_b}, tmp_path, {"now"}
+    )
     catalog.write_finding(
         None,
         {
@@ -303,17 +317,15 @@ def test_mid_drain_reload_uses_old_config_until_drain_completes(tmp_path) -> Non
         {"now"},
     )
 
-    sent_first: list[str] = []
-    sent_second: list[str] = []
-    swap_done = asyncio.Event()
+    sent: list[str] = []
     started = asyncio.Event()
-    in_flight: dict[str, list[str]] = {"current": sent_first}
+    swap_done = asyncio.Event()
 
     async def fake_push(channel, _message, _workdir, **_kwargs) -> None:
-        in_flight["current"].append(channel.name)
-        if not started.is_set():
+        sent.append(channel.name)
+        if channel.name == "push_a" and not started.is_set():
             started.set()
-            # Yield so the swap task can mutate drain.pipe / drain.channels.
+            # Yield so the swap can land before push_b is dispatched.
             await swap_done.wait()
 
     async def driver() -> None:
@@ -322,29 +334,78 @@ def test_mid_drain_reload_uses_old_config_until_drain_completes(tmp_path) -> Non
         with patch.object(pipe_runner, "send_push", fake_push):
             drain_task = asyncio.create_task(drain.drain_once())
             await started.wait()
+            # Swap to a Pipe that drops push_b AND a channels dict that
+            # doesn't contain push_b. Snapshotting drain still sends via the
+            # captured references; non-snapshotting drain that re-reads
+            # self.channels would raise KeyError on push_b.
             drain.pipe = pipe_v2
-            drain.channels = {"push": push, "log": log}
+            drain.channels = {"push_a": push_a}
             swap_done.set()
             await drain_task
-
-            in_flight["current"] = sent_second
-            await drain.drain_once()
 
     try:
         asyncio.run(driver())
     finally:
         connection.close()
 
-    assert sent_first == ["push"], (
-        f"in-flight drain saw mid-flight channel swap: {sent_first}"
+    assert sent == ["push_a", "push_b"], (
+        f"in-flight drain did not snapshot pipe/channels: sent={sent}"
     )
-    # After the swap completes, the next drain should pick up the new list.
-    # Both push and log will be attempted on the second drain since the
-    # finding queue is now dispatched; a simple way to verify the snapshot
-    # logic is to check that the second call's seen channels include both.
-    # If the queue is empty on the second call we won't see anything; that's
-    # also acceptable evidence that the first drain dispatched correctly.
-    assert sent_second == [] or "log" in sent_second
+
+
+def test_immediate_to_cron_cancels_pipe_loop(tmp_path) -> None:
+    """A pipe transitioning from cadence=immediate to a cron cadence must
+    cancel its _pipe_loop task. Otherwise the old loop keeps draining at 1s
+    intervals indefinitely, silently ignoring the configured cadence."""
+    _write_lodging(tmp_path)
+    daemon, reloader = _make_daemon(tmp_path)
+
+    drain_calls: list[None] = []
+
+    async def counting_drain() -> None:
+        drain_calls.append(None)
+
+    daemon.pipe_drains["now"].drain_once = counting_drain  # type: ignore[method-assign]
+
+    async def driver() -> None:
+        daemon.scheduler.start(paused=True)
+        try:
+            daemon._spawn_pipe_loop("now")
+            task = daemon._pipe_loop_tasks["now"]
+            # Let the loop run at least one drain.
+            for _ in range(20):
+                if drain_calls:
+                    break
+                await asyncio.sleep(0.05)
+            assert drain_calls, "loop never ran a drain"
+
+            (tmp_path / "pipes" / "now.yaml").write_text(
+                "cadence: '0 8 * * *'\nchannels: [push]\n"
+                "render:\n  kind: dumb-alert\n  template: '{type}:{entity}:{body}'\n",
+                encoding="utf-8",
+            )
+            _enqueue(reloader, tmp_path / "pipes" / "now.yaml")
+            await reloader.process_pending_events()
+
+            assert daemon.lodging.pipes["now"].cadence == "0 8 * * *"
+            assert "now" not in daemon._pipe_loop_tasks
+            assert task.done()
+            assert daemon.scheduler.get_job("pipe:now") is not None
+
+            calls_after_cancel = len(drain_calls)
+            # Give the loop ample time to fire again if it weren't cancelled.
+            await asyncio.sleep(0.2)
+            assert len(drain_calls) == calls_after_cancel, (
+                f"loop kept draining after cancel: {len(drain_calls) - calls_after_cancel} "
+                f"extra calls"
+            )
+        finally:
+            daemon.scheduler.shutdown(wait=False)
+
+    try:
+        asyncio.run(driver())
+    finally:
+        daemon.connection.close()
 
 
 def test_observer_thread_picks_up_change_within_2s(tmp_path) -> None:
