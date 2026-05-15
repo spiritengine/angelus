@@ -33,7 +33,7 @@ async def send_email(
         stderr=asyncio.subprocess.PIPE,
     )
     try:
-        stdout, stderr = await asyncio.wait_for(
+        _, stderr = await asyncio.wait_for(
             process.communicate(body.encode("utf-8")),
             timeout=timeout_seconds,
         )
