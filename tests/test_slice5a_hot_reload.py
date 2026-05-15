@@ -494,6 +494,67 @@ def test_observer_thread_picks_up_change_within_2s(tmp_path) -> None:
     asyncio.run(driver())
 
 
+def test_triager_hot_removed_mid_flight_clears_processing_row(
+    tmp_path, caplog
+) -> None:
+    """If a triager is hot-removed between mark_triage_processing and the
+    scheduled task acquiring the semaphore, the orphaned 'processing' row
+    must be deleted so a later re-add can pick the observation up fresh."""
+    _write_lodging(tmp_path)
+    daemon = AngelusDaemon(tmp_path)
+    try:
+        observation_id = daemon.catalog.write_observation(
+            "scheduled/watch",
+            {"type": "ok"},
+            {"source": "scheduled/watch"},
+        )
+        daemon.catalog.mark_triage_processing(observation_id, "noop")
+
+        # Confirm the row is in 'processing' before the simulated race.
+        before = daemon.connection.execute(
+            "SELECT status FROM observation_triage WHERE observation_id = ? "
+            "AND triager_name = ?",
+            (observation_id, "noop"),
+        ).fetchone()
+        assert before is not None and before["status"] == "processing"
+
+        # Simulate the hot-remove that lands between mark_triage_processing
+        # and the scheduled _triage_under_semaphore task starting.
+        del daemon.lodging.triagers["noop"]
+
+        row = {"id": observation_id}
+        with caplog.at_level("INFO", logger="angelus.daemon"):
+            asyncio.run(daemon._triage_under_semaphore(row, "noop"))
+
+        after = daemon.connection.execute(
+            "SELECT 1 FROM observation_triage WHERE observation_id = ? "
+            "AND triager_name = ?",
+            (observation_id, "noop"),
+        ).fetchone()
+        assert after is None, "orphaned processing row was not cleared"
+
+        # Observation falls back into ready_observations_for once the
+        # triager is re-added.
+        from angelus.lodging import Triager
+
+        daemon.lodging.triagers["noop"] = Triager(
+            name="noop",
+            source_ref="scheduled/watch",
+            handler_path=Path("triagers/handlers/noop.py"),
+        )
+        ready = daemon.catalog.ready_observations_for("noop", "scheduled/watch")
+        assert [r["id"] for r in ready] == [observation_id]
+
+        assert any(
+            "removed mid-flight" in record.message
+            and "noop" in record.message
+            and str(observation_id) in record.message
+            for record in caplog.records
+        ), f"expected hot-remove log; got {[r.message for r in caplog.records]}"
+    finally:
+        daemon.connection.close()
+
+
 def test_push_channel_kills_subprocess_on_timeout(tmp_path) -> None:
     pid_file = tmp_path / "notify.pid"
     script = tmp_path / "hang-notify"

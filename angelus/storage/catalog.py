@@ -123,6 +123,22 @@ class Catalog:
         )
         self.connection.commit()
 
+    def clear_triage_processing(
+        self, observation_id: int, triager_name: str
+    ) -> None:
+        """Delete a 'processing' observation_triage row when its triager
+        was hot-removed before the scheduled task acquired the semaphore.
+        Bounded to status='processing' so a legit concurrent transition
+        to 'success'/'failed' is not clobbered."""
+        self.connection.execute(
+            """
+            DELETE FROM observation_triage
+            WHERE observation_id = ? AND triager_name = ? AND status = 'processing'
+            """,
+            (observation_id, triager_name),
+        )
+        self.connection.commit()
+
     def mark_triage_success(self, observation_id: int, triager_name: str) -> None:
         self.connection.execute(
             """

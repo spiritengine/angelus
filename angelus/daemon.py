@@ -284,7 +284,19 @@ class AngelusDaemon:
         async with self.triage_semaphore:
             triager = self.lodging.triagers.get(triager_name)
             if triager is None:
-                # Triager removed between scheduling and execution.
+                # Triager hot-removed between mark_triage_processing and now.
+                # The 'processing' row would otherwise orphan: ready_observations_for
+                # excludes it, and recover_writing_rows doesn't touch
+                # observation_triage. Delete so a later re-add of the same
+                # triager can pick the observation up fresh; no attempt
+                # consumed since the triager never ran.
+                observation_id = int(row["id"])
+                self.catalog.clear_triage_processing(observation_id, triager_name)
+                LOGGER.info(
+                    "triager %s removed mid-flight; cleared processing row for observation %d",
+                    triager_name,
+                    observation_id,
+                )
                 return
             lock_key = (triager.name, triager.source_ref)
             lock = self.triager_locks.setdefault(lock_key, asyncio.Lock())
