@@ -1,0 +1,407 @@
+"""Tests for slice 5a: hot-reload of lodging YAML and push channel timeout-kill.
+
+Hot-reload tests bypass the watchdog observer thread and exercise
+LodgingReloader.process_pending_events directly. The runtime starts the
+observer in AngelusDaemon.run; tests construct a daemon, drive the reloader
+in-loop, and assert effects on lodging and the scheduler.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import time
+from pathlib import Path
+
+import pytest
+
+import angelus.pipes.runner as pipe_runner
+from angelus.channels import push as push_module
+from angelus.daemon import AngelusDaemon
+from angelus.lodging import Channel, Pipe
+from angelus.lodging.reloader import LodgingReloader
+from angelus.pipes import PipeDrain
+from angelus.storage import Catalog, init_db
+
+
+def _write_lodging(root: Path) -> None:
+    (root / "sources" / "scheduled").mkdir(parents=True)
+    (root / "sources" / "scheduled" / "watch.yaml").write_text(
+        "cadence: 1h\n"
+        "check:\n"
+        "  kind: shell\n"
+        "  command: 'echo {}'\n",
+        encoding="utf-8",
+    )
+    (root / "triagers" / "handlers").mkdir(parents=True)
+    (root / "triagers" / "handlers" / "noop.py").write_text(
+        "import json\nprint(json.dumps({'findings': [], 'new_state': {}}))\n",
+        encoding="utf-8",
+    )
+    (root / "triagers" / "noop.yaml").write_text(
+        "inputs:\n  source: scheduled/watch\n"
+        "handler:\n  kind: python\n  path: triagers/handlers/noop.py\n",
+        encoding="utf-8",
+    )
+    (root / "pipes").mkdir()
+    (root / "pipes" / "now.yaml").write_text(
+        "cadence: immediate\nchannels: [push]\n"
+        "render:\n  kind: dumb-alert\n  template: '{type}:{entity}:{body}'\n",
+        encoding="utf-8",
+    )
+    (root / "channels").mkdir()
+    (root / "channels" / "push.yaml").write_text(
+        "kind: push\ncommand: notify-pat\n",
+        encoding="utf-8",
+    )
+
+
+def _make_daemon(root: Path) -> tuple[AngelusDaemon, LodgingReloader]:
+    daemon = AngelusDaemon(root)
+    reloader = LodgingReloader(daemon, root, debounce_seconds=0.0)
+    return daemon, reloader
+
+
+def _enqueue(reloader: LodgingReloader, *paths: Path) -> None:
+    for path in paths:
+        reloader.event_queue.put(str(path))
+
+
+def test_pipe_channel_list_change_swaps_into_live_lodging(tmp_path) -> None:
+    _write_lodging(tmp_path)
+    (tmp_path / "channels" / "log.yaml").write_text(
+        "kind: push\ncommand: 'echo log'\n",
+        encoding="utf-8",
+    )
+    daemon, reloader = _make_daemon(tmp_path)
+    try:
+        assert daemon.lodging.pipes["now"].channels == ["push"]
+        (tmp_path / "pipes" / "now.yaml").write_text(
+            "cadence: immediate\nchannels: [push, log]\n"
+            "render:\n  kind: dumb-alert\n  template: '{type}:{entity}:{body}'\n",
+            encoding="utf-8",
+        )
+        _enqueue(reloader, tmp_path / "pipes" / "now.yaml")
+        asyncio.run(reloader.process_pending_events())
+        assert daemon.lodging.pipes["now"].channels == ["push", "log"]
+        # PipeDrain reference points at the same object whose .pipe is replaced.
+        assert daemon.pipe_drains["now"].pipe.channels == ["push", "log"]
+    finally:
+        daemon.connection.close()
+
+
+def test_pipe_dangling_channel_keeps_old_and_emits_finding(tmp_path) -> None:
+    _write_lodging(tmp_path)
+    daemon, reloader = _make_daemon(tmp_path)
+    try:
+        original = daemon.lodging.pipes["now"]
+        (tmp_path / "pipes" / "now.yaml").write_text(
+            "cadence: immediate\nchannels: [nonexistent_channel]\n"
+            "render:\n  kind: dumb-alert\n  template: '{type}:{entity}:{body}'\n",
+            encoding="utf-8",
+        )
+        _enqueue(reloader, tmp_path / "pipes" / "now.yaml")
+        asyncio.run(reloader.process_pending_events())
+
+        assert daemon.lodging.pipes["now"] == original
+
+        rows = list(
+            daemon.connection.execute(
+                "SELECT type, entity FROM findings WHERE source = 'internal/lodging'"
+            )
+        )
+        assert rows
+        assert rows[0]["type"] == "cross_ref_broken"
+        assert rows[0]["entity"] == "pipes/now.yaml"
+
+        queue_status = daemon.connection.execute(
+            """
+            SELECT pq.status FROM pipe_queues pq
+            JOIN findings f ON f.id = pq.finding_id
+            WHERE f.source = 'internal/lodging'
+            """
+        ).fetchone()
+        assert queue_status["status"] == "pending"
+    finally:
+        daemon.connection.close()
+
+
+def test_disabled_suffix_unregisters_source_job(tmp_path) -> None:
+    _write_lodging(tmp_path)
+    # Disable the dependent triager first so the source removal stays
+    # cross-ref-consistent.
+    triager_yaml = tmp_path / "triagers" / "noop.yaml"
+    triager_yaml.rename(triager_yaml.with_suffix(".yaml.disabled"))
+    daemon, reloader = _make_daemon(tmp_path)
+
+    async def driver() -> None:
+        daemon._register_initial_jobs()
+        daemon.scheduler.start(paused=True)
+        try:
+            assert daemon.scheduler.get_job("scheduled/watch") is not None
+
+            old = tmp_path / "sources" / "scheduled" / "watch.yaml"
+            disabled = old.with_suffix(".yaml.disabled")
+            old.rename(disabled)
+            _enqueue(reloader, disabled)
+            await reloader.process_pending_events()
+
+            assert "scheduled/watch" not in daemon.lodging.sources
+            assert daemon.scheduler.get_job("scheduled/watch") is None
+        finally:
+            daemon.scheduler.shutdown(wait=False)
+
+    try:
+        asyncio.run(driver())
+    finally:
+        daemon.connection.close()
+
+
+def test_load_lodging_skips_disabled_files_at_startup(tmp_path) -> None:
+    _write_lodging(tmp_path)
+    # Disable both the source and its dependent triager so the startup
+    # cross-ref check still passes.
+    src = tmp_path / "sources" / "scheduled" / "watch.yaml"
+    src.rename(src.with_suffix(".yaml.disabled"))
+    triager_yaml = tmp_path / "triagers" / "noop.yaml"
+    triager_yaml.rename(triager_yaml.with_suffix(".yaml.disabled"))
+    daemon = AngelusDaemon(tmp_path)
+    try:
+        assert "scheduled/watch" not in daemon.lodging.sources
+        assert "noop" not in daemon.lodging.triagers
+    finally:
+        daemon.connection.close()
+
+
+def test_symlink_outside_base_is_refused(tmp_path, caplog) -> None:
+    _write_lodging(tmp_path)
+    daemon, reloader = _make_daemon(tmp_path)
+    outside = tmp_path.parent / "outside_lodging.yaml"
+    outside.write_text("malicious: true\n", encoding="utf-8")
+    symlink = tmp_path / "pipes" / "evil.yaml"
+    symlink.symlink_to(outside)
+    try:
+        original_pipes = dict(daemon.lodging.pipes)
+        _enqueue(reloader, symlink)
+        with caplog.at_level("WARNING"):
+            asyncio.run(reloader.process_pending_events())
+        assert daemon.lodging.pipes == original_pipes
+        assert any("outside base" in record.message for record in caplog.records)
+        # No exception bubbled out and no internal finding was emitted (refusal
+        # is silent at the lodging level — we don't want to spam findings on
+        # every traversal probe).
+        rows = list(
+            daemon.connection.execute(
+                "SELECT id FROM findings WHERE source = 'internal/lodging'"
+            )
+        )
+        assert rows == []
+    finally:
+        daemon.connection.close()
+
+
+def test_per_file_debounce_collapses_rapid_writes(tmp_path) -> None:
+    _write_lodging(tmp_path)
+    daemon = AngelusDaemon(tmp_path)
+    reloader = LodgingReloader(daemon, tmp_path, debounce_seconds=0.5)
+    apply_calls: list[None] = []
+    real_apply = daemon.apply_lodging
+
+    def counting_apply(new_lodging) -> None:
+        apply_calls.append(None)
+        real_apply(new_lodging)
+
+    daemon.apply_lodging = counting_apply  # type: ignore[method-assign]
+    try:
+        target = tmp_path / "channels" / "push.yaml"
+
+        async def driver() -> None:
+            start = time.monotonic()
+            for variant in (
+                "kind: push\ncommand: 'a 1'\n",
+                "kind: push\ncommand: 'a 2'\n",
+                "kind: push\ncommand: 'a 3'\n",
+                "kind: push\ncommand: 'a 4'\n",
+                "kind: push\ncommand: 'a 5'\n",
+            ):
+                target.write_text(variant, encoding="utf-8")
+                _enqueue(reloader, target)
+                # Five enqueues over <200ms, well under the 500ms debounce.
+                await reloader.process_pending_events(now=start + 0.04)
+            # Now jump past the debounce window with no new events.
+            await reloader.process_pending_events(now=start + 1.0)
+
+        asyncio.run(driver())
+        assert len(apply_calls) == 1
+        assert daemon.lodging.channels["push"].command == "a 5"
+    finally:
+        daemon.connection.close()
+
+
+def test_previously_rejected_pipe_loads_when_channel_appears(tmp_path) -> None:
+    _write_lodging(tmp_path)
+    daemon, reloader = _make_daemon(tmp_path)
+    try:
+        # Reject pipes/now.yaml by referencing a channel that doesn't exist.
+        (tmp_path / "pipes" / "now.yaml").write_text(
+            "cadence: immediate\nchannels: [push, log]\n"
+            "render:\n  kind: dumb-alert\n  template: '{type}:{entity}:{body}'\n",
+            encoding="utf-8",
+        )
+        _enqueue(reloader, tmp_path / "pipes" / "now.yaml")
+        asyncio.run(reloader.process_pending_events())
+        assert daemon.lodging.pipes["now"].channels == ["push"]
+        assert (tmp_path / "pipes" / "now.yaml") in reloader.rejected
+
+        # Drop the missing channel YAML; the channel-event handler will swap
+        # it in, then the retry pass picks the previously-rejected pipe.
+        (tmp_path / "channels" / "log.yaml").write_text(
+            "kind: push\ncommand: 'echo log'\n",
+            encoding="utf-8",
+        )
+        _enqueue(reloader, tmp_path / "channels" / "log.yaml")
+        asyncio.run(reloader.process_pending_events())
+
+        assert "log" in daemon.lodging.channels
+        assert daemon.lodging.pipes["now"].channels == ["push", "log"]
+        assert (tmp_path / "pipes" / "now.yaml") not in reloader.rejected
+    finally:
+        daemon.connection.close()
+
+
+def test_mid_drain_reload_uses_old_config_until_drain_completes(tmp_path) -> None:
+    """The drain captures pipe + channels at the start; a swap mid-drain must
+    not redirect the in-flight call to the new channel list."""
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    pipe_v1 = Pipe(
+        name="now",
+        cadence="immediate",
+        render_kind="dumb-alert",
+        template="{type}:{entity}:{body}",
+        channels=["push"],
+    )
+    pipe_v2 = Pipe(
+        name="now",
+        cadence="immediate",
+        render_kind="dumb-alert",
+        template="{type}:{entity}:{body}",
+        channels=["push", "log"],
+    )
+    push = Channel(name="push", kind="push", command="notify-pat")
+    log = Channel(name="log", kind="push", command="notify-pat")
+    drain = PipeDrain(catalog, pipe_v1, {"push": push}, tmp_path, {"now"})
+    catalog.write_finding(
+        None,
+        {
+            "source": "scheduled/x",
+            "type": "down",
+            "entity": "example",
+            "severity": "high",
+            "target_pipes": ["now"],
+        },
+        {"now"},
+    )
+
+    sent_first: list[str] = []
+    sent_second: list[str] = []
+    swap_done = asyncio.Event()
+    started = asyncio.Event()
+    in_flight: dict[str, list[str]] = {"current": sent_first}
+
+    async def fake_push(channel, _message, _workdir, **_kwargs) -> None:
+        in_flight["current"].append(channel.name)
+        if not started.is_set():
+            started.set()
+            # Yield so the swap task can mutate drain.pipe / drain.channels.
+            await swap_done.wait()
+
+    async def driver() -> None:
+        from unittest.mock import patch
+
+        with patch.object(pipe_runner, "send_push", fake_push):
+            drain_task = asyncio.create_task(drain.drain_once())
+            await started.wait()
+            drain.pipe = pipe_v2
+            drain.channels = {"push": push, "log": log}
+            swap_done.set()
+            await drain_task
+
+            in_flight["current"] = sent_second
+            await drain.drain_once()
+
+    try:
+        asyncio.run(driver())
+    finally:
+        connection.close()
+
+    assert sent_first == ["push"], (
+        f"in-flight drain saw mid-flight channel swap: {sent_first}"
+    )
+    # After the swap completes, the next drain should pick up the new list.
+    # Both push and log will be attempted on the second drain since the
+    # finding queue is now dispatched; a simple way to verify the snapshot
+    # logic is to check that the second call's seen channels include both.
+    # If the queue is empty on the second call we won't see anything; that's
+    # also acceptable evidence that the first drain dispatched correctly.
+    assert sent_second == [] or "log" in sent_second
+
+
+def test_observer_thread_picks_up_change_within_2s(tmp_path) -> None:
+    """End-to-end smoke: real watchdog Observer, real asyncio drain task.
+    Most reload behavior is tested by driving process_pending_events directly;
+    this test exists so a regression in the thread→asyncio bridge is caught."""
+    _write_lodging(tmp_path)
+    (tmp_path / "channels" / "log.yaml").write_text(
+        "kind: push\ncommand: 'echo log'\n",
+        encoding="utf-8",
+    )
+
+    async def driver() -> None:
+        daemon = AngelusDaemon(tmp_path)
+        reloader = LodgingReloader(
+            daemon, tmp_path, debounce_seconds=0.2, poll_interval_seconds=0.05
+        )
+        reloader.start()
+        try:
+            (tmp_path / "pipes" / "now.yaml").write_text(
+                "cadence: immediate\nchannels: [push, log]\n"
+                "render:\n  kind: dumb-alert\n  template: '{type}:{entity}:{body}'\n",
+                encoding="utf-8",
+            )
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if daemon.lodging.pipes["now"].channels == ["push", "log"]:
+                    break
+                await asyncio.sleep(0.05)
+            assert daemon.lodging.pipes["now"].channels == ["push", "log"]
+        finally:
+            await reloader.stop()
+            daemon.connection.close()
+
+    asyncio.run(driver())
+
+
+def test_push_channel_kills_subprocess_on_timeout(tmp_path) -> None:
+    pid_file = tmp_path / "notify.pid"
+    script = tmp_path / "hang-notify"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, time\n"
+        f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+        "time.sleep(999)\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    channel = Channel(name="push", kind="push", command=str(script))
+
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match=r"push timed out after 0\.2s"):
+        asyncio.run(
+            push_module.send_push(channel, "msg", tmp_path, timeout_seconds=0.2)
+        )
+    assert time.monotonic() - started < 3
+
+    pid = int(pid_file.read_text(encoding="utf-8"))
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)

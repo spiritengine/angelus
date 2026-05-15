@@ -8,11 +8,13 @@ import os
 import signal
 from pathlib import Path
 
+from apscheduler.jobstores.base import JobLookupError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from angelus.lodging import Lodging, ScheduledSource, load_lodging
+from angelus.lodging.reloader import LodgingReloader
 from angelus.pipes import PipeDrain
 from angelus.sources import run_shell_source
 from angelus.storage import Catalog, init_db
@@ -36,15 +38,17 @@ class AngelusDaemon:
         self.triager_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self.stop_event = asyncio.Event()
         self.tasks: list[asyncio.Task[None]] = []
-        self.pipe_drains = {
+        self.pipe_drains: dict[str, PipeDrain] = {
             name: PipeDrain(
                 self.catalog, pipe, self.lodging.channels, root, set(self.lodging.pipes)
             )
             for name, pipe in self.lodging.pipes.items()
         }
+        self.reloader = LodgingReloader(self, root)
 
     async def run(self) -> None:
         scheduler_started = False
+        reloader_started = False
         try:
             self.pid_file.write_text(str(os.getpid()), encoding="utf-8")
             LOGGER.info(
@@ -59,7 +63,7 @@ class AngelusDaemon:
             LOGGER.info("startup recovery: %d ready, %d failed", recovered, failed)
             # Channels stay unhealthy only until daemon restart (slice 2 scope).
             self.catalog.clear_channel_health()
-            self._register_sources()
+            self._register_initial_jobs()
             self.scheduler.start()
             scheduler_started = True
             LOGGER.info("scheduler started with %d jobs", len(self.scheduler.get_jobs()))
@@ -70,9 +74,13 @@ class AngelusDaemon:
                 self.tasks.append(
                     asyncio.create_task(self._pipe_loop(pipe_name), name=f"pipe-{pipe_name}")
                 )
+            self.reloader.start()
+            reloader_started = True
             await self.stop_event.wait()
             LOGGER.info("shutdown requested")
         finally:
+            if reloader_started:
+                await self.reloader.stop()
             if scheduler_started:
                 self.scheduler.shutdown(wait=True)
             if self.tasks:
@@ -91,36 +99,123 @@ class AngelusDaemon:
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, self.request_stop)
 
-    def _register_sources(self) -> None:
+    def _register_initial_jobs(self) -> None:
         for source in self.lodging.sources.values():
-            trigger = _make_trigger(source.cadence)
-            self.scheduler.add_job(
-                self._fire_source,
-                trigger,
-                args=[source],
-                id=source.source_ref,
-                max_instances=1,
-                coalesce=True,
-            )
-            LOGGER.info(
-                "registered scheduled source %s on %s",
-                source.source_ref,
-                source.cadence,
-            )
+            self._add_source_job(source)
         for pipe in self.lodging.pipes.values():
             if pipe.cadence == "immediate":
                 continue
-            trigger = _make_trigger(pipe.cadence)
-            self.scheduler.add_job(
-                self.pipe_drains[pipe.name].drain_once,
-                trigger,
-                id=f"pipe:{pipe.name}",
-                max_instances=1,
-                coalesce=True,
-            )
-            LOGGER.info("registered pipe %s on %s", pipe.name, pipe.cadence)
+            self._add_pipe_job(pipe.name, pipe.cadence)
 
-    async def _fire_source(self, source: ScheduledSource) -> None:
+    def _add_source_job(self, source: ScheduledSource) -> None:
+        trigger = _make_trigger(source.cadence)
+        self.scheduler.add_job(
+            self._fire_source,
+            trigger,
+            args=[source.source_ref],
+            id=source.source_ref,
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
+        )
+        LOGGER.info(
+            "registered scheduled source %s on %s",
+            source.source_ref,
+            source.cadence,
+        )
+
+    def _add_pipe_job(self, pipe_name: str, cadence: str) -> None:
+        trigger = _make_trigger(cadence)
+        self.scheduler.add_job(
+            self.pipe_drains[pipe_name].drain_once,
+            trigger,
+            id=f"pipe:{pipe_name}",
+            max_instances=1,
+            coalesce=True,
+            replace_existing=True,
+        )
+        LOGGER.info("registered pipe %s on %s", pipe_name, cadence)
+
+    def _remove_job(self, job_id: str) -> None:
+        try:
+            self.scheduler.remove_job(job_id)
+        except JobLookupError:
+            pass
+
+    def apply_lodging(self, new_lodging: Lodging) -> None:
+        """Atomically swap in a new Lodging snapshot. Adjusts scheduler jobs
+        for source/pipe add/remove/cadence-change, swaps Pipe objects on
+        existing PipeDrain instances, and re-points every drain at the new
+        channels and known_pipes."""
+        old = self.lodging
+        self.lodging = new_lodging
+
+        old_sources = old.sources
+        new_sources = new_lodging.sources
+        for ref in set(old_sources) - set(new_sources):
+            self._remove_job(ref)
+            LOGGER.info("unregistered scheduled source %s", ref)
+        for ref in set(new_sources) & set(old_sources):
+            if old_sources[ref].cadence != new_sources[ref].cadence:
+                self._remove_job(ref)
+                self._add_source_job(new_sources[ref])
+        for ref in set(new_sources) - set(old_sources):
+            self._add_source_job(new_sources[ref])
+
+        old_pipes = old.pipes
+        new_pipes = new_lodging.pipes
+        new_known = set(new_pipes)
+        for name in set(old_pipes) - set(new_pipes):
+            if old_pipes[name].cadence != "immediate":
+                self._remove_job(f"pipe:{name}")
+            self.pipe_drains.pop(name, None)
+            LOGGER.info("unregistered pipe %s", name)
+        for name in set(new_pipes) & set(old_pipes):
+            new_pipe = new_pipes[name]
+            old_pipe = old_pipes[name]
+            drain = self.pipe_drains[name]
+            drain.pipe = new_pipe
+            if old_pipe.cadence != new_pipe.cadence:
+                if old_pipe.cadence != "immediate":
+                    self._remove_job(f"pipe:{name}")
+                if new_pipe.cadence != "immediate":
+                    self._add_pipe_job(name, new_pipe.cadence)
+                if (
+                    old_pipe.cadence != "immediate"
+                    and new_pipe.cadence == "immediate"
+                ):
+                    self.tasks.append(
+                        asyncio.create_task(
+                            self._pipe_loop(name), name=f"pipe-{name}"
+                        )
+                    )
+        for name in set(new_pipes) - set(old_pipes):
+            new_pipe = new_pipes[name]
+            self.pipe_drains[name] = PipeDrain(
+                self.catalog,
+                new_pipe,
+                new_lodging.channels,
+                self.root,
+                new_known,
+            )
+            if new_pipe.cadence == "immediate":
+                self.tasks.append(
+                    asyncio.create_task(
+                        self._pipe_loop(name), name=f"pipe-{name}"
+                    )
+                )
+            else:
+                self._add_pipe_job(name, new_pipe.cadence)
+
+        for drain in self.pipe_drains.values():
+            drain.channels = new_lodging.channels
+            drain.known_pipes = new_known
+
+    async def _fire_source(self, source_ref: str) -> None:
+        source = self.lodging.sources.get(source_ref)
+        if source is None:
+            LOGGER.info("scheduled source %s vanished before fire", source_ref)
+            return
         async with self.scheduler_semaphore:
             ok, payload = await run_shell_source(source)
             outcome = "ok" if ok else "check_failed"
@@ -176,14 +271,19 @@ class AngelusDaemon:
 
     async def _triage_under_semaphore(self, row, triager_name: str) -> None:
         async with self.triage_semaphore:
-            triager = self.lodging.triagers[triager_name]
+            triager = self.lodging.triagers.get(triager_name)
+            if triager is None:
+                # Triager removed between scheduling and execution.
+                return
             lock_key = (triager.name, triager.source_ref)
             lock = self.triager_locks.setdefault(lock_key, asyncio.Lock())
             async with lock:
                 await self._run_triager(row, triager_name)
 
     async def _run_triager(self, row, triager_name: str) -> None:
-        triager = self.lodging.triagers[triager_name]
+        triager = self.lodging.triagers.get(triager_name)
+        if triager is None:
+            return
         observation_id = int(row["id"])
         try:
             observation = self.catalog.read_body(row["body_ref"])
@@ -215,8 +315,10 @@ class AngelusDaemon:
                 )
 
     async def _pipe_loop(self, pipe_name: str) -> None:
-        drain = self.pipe_drains[pipe_name]
         while not self.stop_event.is_set():
+            drain = self.pipe_drains.get(pipe_name)
+            if drain is None:
+                return
             await drain.drain_once()
             await asyncio.sleep(1)
 

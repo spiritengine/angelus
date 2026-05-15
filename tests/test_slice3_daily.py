@@ -121,7 +121,7 @@ def test_cron_cadence_and_daemon_register_daily_drain(tmp_path) -> None:
 
     daemon = AngelusDaemon(tmp_path)
     try:
-        daemon._register_sources()
+        daemon._register_initial_jobs()
         job = daemon.scheduler.get_job("pipe:daily")
         assert job is not None
         assert isinstance(job.trigger, CronTrigger)
@@ -235,7 +235,7 @@ def test_two_zone_render_dispatches_preamble_then_llm_body(tmp_path, monkeypatch
     async def fake_push(_channel, message: str, _workdir: Path) -> None:
         sent.append(message)
 
-    async def fake_llm(self, _structured):
+    async def fake_llm(self, _pipe, _structured):
         return "This is the chronicler body.", None
 
     monkeypatch.setattr(pipe_runner, "send_push", fake_push)
@@ -303,7 +303,7 @@ def test_digest_partial_channel_failure_does_not_resend_success_channel(
         email_subjects.append(subject)
         raise RuntimeError("email broke")
 
-    async def fake_llm(self, _structured):
+    async def fake_llm(self, _pipe, _structured):
         return "This is the chronicler body.", None
 
     monkeypatch.setattr(pipe_runner, "send_push", fake_push)
@@ -400,7 +400,7 @@ def test_suppressed_overflow_stays_out_of_llm_inputs(tmp_path, monkeypatch) -> N
     async def fake_push(_channel, _message: str, _workdir: Path) -> None:
         return None
 
-    async def fake_llm(self, structured):
+    async def fake_llm(self, _pipe, structured):
         seen_inputs.append(structured)
         return "This is the chronicler body.", None
 
@@ -495,7 +495,7 @@ def test_empty_day_channel_failure_records_dispatch_and_emits_internal(
     async def fake_email(_channel, _subject: str, _body: str, _workdir: Path) -> None:
         raise RuntimeError("email broke")
 
-    async def fake_llm(self, _structured):
+    async def fake_llm(self, _pipe, _structured):
         return "This is the chronicler body.", None
 
     monkeypatch.setattr(pipe_runner, "send_email", fake_email)
@@ -598,7 +598,7 @@ def test_pipe_state_updates_and_scopes_next_drain(tmp_path, monkeypatch) -> None
     async def fake_push(_channel, _message: str, _workdir: Path) -> None:
         return None
 
-    async def fake_llm(self, structured):
+    async def fake_llm(self, _pipe, structured):
         closure_counts.append(len(structured["recent_closures"]))
         finding_counts.append(len(structured["findings_since_last_drain"]))
         return "This is the chronicler body.", None
@@ -649,7 +649,7 @@ def test_daily_drain_processes_all_pending_items(tmp_path, monkeypatch) -> None:
     async def fake_push(_channel, _message: str, _workdir: Path) -> None:
         return None
 
-    async def fake_llm(self, structured):
+    async def fake_llm(self, _pipe, structured):
         llm_inputs.append(structured)
         return "This is the chronicler body.", None
 
@@ -889,7 +889,7 @@ def test_clearance_dedup_excludes_clearance_from_findings(tmp_path, monkeypatch)
     async def fake_push(_channel, _message: str, _workdir: Path) -> None:
         return None
 
-    async def fake_llm(self, structured):
+    async def fake_llm(self, _pipe, structured):
         seen.append(structured)
         return "This is the chronicler body.", None
 

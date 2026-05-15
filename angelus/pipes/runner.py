@@ -27,6 +27,9 @@ class PipeDrain:
         known_pipes: set[str],
     ) -> None:
         self.catalog = catalog
+        # `pipe`, `channels`, and `known_pipes` are mutable across hot-reloads.
+        # Each `drain_once` snapshots them under the lock so an in-flight drain
+        # always completes with a consistent view.
         self.pipe = pipe
         self.channels = channels
         self.workdir = workdir
@@ -35,57 +38,67 @@ class PipeDrain:
 
     async def drain_once(self) -> None:
         async with self.lock:
-            if self.pipe.render_kind == "digest":
-                await self._drain_digest()
+            pipe = self.pipe
+            channels = self.channels
+            known_pipes = self.known_pipes
+            if pipe.render_kind == "digest":
+                await self._drain_digest(pipe, channels, known_pipes)
                 return
+            await self._drain_immediate(pipe, channels, known_pipes)
 
-            rows = self.catalog.pending_pipe_items(self.pipe.name)
-            for row in rows:
-                finding_id = int(row["id"])
-                message = self._render(row)
-                if self._over_rate_limit(row):
-                    self.catalog.suppress_pipe_item_to(
-                        finding_id,
-                        self.pipe.name,
-                        self.pipe.rate_limit["overflow"],
-                    )
+    async def _drain_immediate(
+        self,
+        pipe: Pipe,
+        channels: dict[str, Channel],
+        known_pipes: set[str],
+    ) -> None:
+        rows = self.catalog.pending_pipe_items(pipe.name)
+        for row in rows:
+            finding_id = int(row["id"])
+            message = self._render(pipe, row)
+            if self._over_rate_limit(pipe, row):
+                self.catalog.suppress_pipe_item_to(
+                    finding_id,
+                    pipe.name,
+                    pipe.rate_limit["overflow"],
+                )
+                continue
+            for channel_name in pipe.channels:
+                if self.catalog.is_channel_unhealthy(channel_name):
                     continue
-                for channel_name in self.pipe.channels:
-                    if self.catalog.is_channel_unhealthy(channel_name):
-                        continue
-                    channel = self.channels[channel_name]
-                    try:
-                        await send_push(channel, message, self.workdir)
-                    except Exception as exc:
-                        exhausted = self.catalog.record_pipe_send_failure(
-                            self.pipe.name,
+                channel = channels[channel_name]
+                try:
+                    await send_push(channel, message, self.workdir)
+                except Exception as exc:
+                    exhausted = self.catalog.record_pipe_send_failure(
+                        pipe.name,
+                        channel.name,
+                        finding_id,
+                        str(exc),
+                    )
+                    if exhausted:
+                        self.catalog.write_internal_finding(
+                            "internal/dispatch",
+                            "channel_unhealthy",
                             channel.name,
-                            finding_id,
                             str(exc),
+                            known_pipes,
                         )
-                        if exhausted:
-                            self.catalog.write_internal_finding(
-                                "internal/dispatch",
-                                "channel_unhealthy",
-                                channel.name,
-                                str(exc),
-                                self.known_pipes,
-                            )
-                    else:
-                        self.catalog.record_dispatch(
-                            self.pipe.name,
-                            channel.name,
-                            [finding_id],
-                            "sent",
-                            source=row["source"],
-                        )
+                else:
+                    self.catalog.record_dispatch(
+                        pipe.name,
+                        channel.name,
+                        [finding_id],
+                        "sent",
+                        source=row["source"],
+                    )
 
-    def _render(self, row) -> str:
+    def _render(self, pipe: Pipe, row) -> str:
         body = self.catalog.read_body(row["body_ref"])
         target_pipes = json.loads(row["target_pipes"])
-        if self.pipe.template is None:
-            raise RuntimeError(f"pipe {self.pipe.name} has no dumb-alert template")
-        return self.pipe.template.format(
+        if pipe.template is None:
+            raise RuntimeError(f"pipe {pipe.name} has no dumb-alert template")
+        return pipe.template.format(
             source=row["source"],
             type=row["type"],
             entity=row["entity"],
@@ -95,24 +108,29 @@ class PipeDrain:
             target_pipes=",".join(target_pipes),
         )
 
-    async def _drain_digest(self) -> None:
+    async def _drain_digest(
+        self,
+        pipe: Pipe,
+        channels: dict[str, Channel],
+        known_pipes: set[str],
+    ) -> None:
         drained_at = utcnow()
-        last_drain_at = self.catalog.last_pipe_drain_at(self.pipe.name)
-        pending_rows = self.catalog.pending_pipe_items(self.pipe.name, limit=None)
+        last_drain_at = self.catalog.last_pipe_drain_at(pipe.name)
+        pending_rows = self.catalog.pending_pipe_items(pipe.name, limit=None)
         finding_ids = [int(row["id"]) for row in pending_rows]
-        structured = self._structured_inputs(last_drain_at)
+        structured = self._structured_inputs(pipe, last_drain_at)
         if not pending_rows and _is_same_utc_day(last_drain_at, drained_at):
             return
-        preamble = self._render_preamble(structured)
-        body, llm_error = await self._render_llm_body(structured)
+        preamble = self._render_preamble(pipe, structured)
+        body, llm_error = await self._render_llm_body(pipe, structured)
         if llm_error is not None:
             body = LLM_FALLBACK_FOOTER
             self.catalog.write_internal_finding(
                 "internal/render",
                 "llm_render_failed",
-                self.pipe.name,
+                pipe.name,
                 llm_error,
-                self.known_pipes,
+                known_pipes,
             )
         message = "\n\n".join(part for part in (preamble, body) if part)
         subject = (
@@ -120,13 +138,13 @@ class PipeDrain:
         )
 
         any_channel_succeeded = False
-        for channel_name in self.pipe.channels:
-            channel = self.channels[channel_name]
+        for channel_name in pipe.channels:
+            channel = channels[channel_name]
             try:
                 await self._send_channel(channel, message, subject)
             except Exception as exc:
                 self.catalog.record_dispatch(
-                    self.pipe.name,
+                    pipe.name,
                     channel.name,
                     finding_ids,
                     "failed",
@@ -138,20 +156,20 @@ class PipeDrain:
                     "channel_unhealthy",
                     channel.name,
                     str(exc),
-                    self.known_pipes,
+                    known_pipes,
                 )
             else:
                 any_channel_succeeded = True
                 self.catalog.record_dispatch(
-                    self.pipe.name,
+                    pipe.name,
                     channel.name,
                     finding_ids,
                     "sent",
                     mark_queue=False,
                 )
         if any_channel_succeeded:
-            self.catalog.mark_pipe_items_dispatched(self.pipe.name, finding_ids)
-            self.catalog.mark_pipe_drained(self.pipe.name, drained_at)
+            self.catalog.mark_pipe_items_dispatched(pipe.name, finding_ids)
+            self.catalog.mark_pipe_drained(pipe.name, drained_at)
 
     async def _send_channel(self, channel: Channel, message: str, subject: str) -> None:
         if channel.kind == "push":
@@ -161,18 +179,18 @@ class PipeDrain:
         else:
             raise RuntimeError(f"unsupported channel kind: {channel.kind}")
 
-    def _structured_inputs(self, last_drain_at: str | None) -> dict[str, Any]:
+    def _structured_inputs(self, pipe: Pipe, last_drain_at: str | None) -> dict[str, Any]:
         open_incidents = self.catalog.open_incidents()
         return {
             "findings_since_last_drain": self.catalog.findings_for_pipe_since(
-                self.pipe.name, last_drain_at, exclude_types=("clearance",)
+                pipe.name, last_drain_at, exclude_types=("clearance",)
             ),
             "suppressed_findings": self.catalog.suppressed_findings_since(last_drain_at),
             "open_incidents": open_incidents,
             "recent_closures": self.catalog.clearance_findings_since(last_drain_at),
         }
 
-    def _render_preamble(self, structured: dict[str, Any]) -> str:
+    def _render_preamble(self, pipe: Pipe, structured: dict[str, Any]) -> str:
         environment = Environment(
             loader=FileSystemLoader(self.workdir / "render-templates"),
             autoescape=select_autoescape(enabled_extensions=()),
@@ -180,7 +198,7 @@ class PipeDrain:
             lstrip_blocks=True,
         )
         rendered: list[str] = []
-        for block in self.pipe.render.get("preamble", []):
+        for block in pipe.render.get("preamble", []):
             if block.get("kind") != "structured":
                 continue
             template = environment.get_template(f"{block['template']}.j2")
@@ -188,9 +206,9 @@ class PipeDrain:
         return "\n\n".join(part for part in rendered if part)
 
     async def _render_llm_body(
-        self, structured: dict[str, Any]
+        self, pipe: Pipe, structured: dict[str, Any]
     ) -> tuple[str | None, str | None]:
-        body_config = self.pipe.render.get("body") or {}
+        body_config = pipe.render.get("body") or {}
         mantle = body_config.get("mantle")
         if not mantle:
             return None, "daily digest body missing mantle"
@@ -228,21 +246,21 @@ class PipeDrain:
             return None, "chronicler output was empty or too short"
         return output, None
 
-    def _over_rate_limit(self, row) -> bool:
-        if not self.pipe.rate_limit:
+    def _over_rate_limit(self, pipe: Pipe, row) -> bool:
+        if not pipe.rate_limit:
             return False
         since = (datetime.now(UTC) - timedelta(hours=1)).isoformat(
             timespec="milliseconds"
         ).replace("+00:00", "Z")
-        per_source = _parse_hourly_limit(self.pipe.rate_limit.get("per_source"))
+        per_source = _parse_hourly_limit(pipe.rate_limit.get("per_source"))
         if per_source is not None:
             source_count = self.catalog.sent_dispatch_count_for_source(row["source"], since)
             if source_count >= per_source:
                 return True
-        per_channel = _parse_hourly_limit(self.pipe.rate_limit.get("per_channel"))
+        per_channel = _parse_hourly_limit(pipe.rate_limit.get("per_channel"))
         if per_channel is None:
             return False
-        for channel_name in self.pipe.channels:
+        for channel_name in pipe.channels:
             channel_count = self.catalog.sent_dispatch_count_for_channel(
                 channel_name, since
             )
