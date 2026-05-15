@@ -555,6 +555,57 @@ def test_triager_hot_removed_mid_flight_clears_processing_row(
         daemon.connection.close()
 
 
+def test_triager_hot_removed_while_lock_held_clears_processing_row(
+    tmp_path, caplog
+) -> None:
+    """Second None-check: when sibling tasks queue on the per-triager lock
+    and the triager is hot-removed while task 1 runs, the queued tasks each
+    reach _run_triager after acquiring the lock and must clean up the same
+    orphaned 'processing' row that the pre-lock check covers."""
+    _write_lodging(tmp_path)
+    daemon = AngelusDaemon(tmp_path)
+    try:
+        observation_id = daemon.catalog.write_observation(
+            "scheduled/watch",
+            {"type": "ok"},
+            {"source": "scheduled/watch"},
+        )
+        daemon.catalog.mark_triage_processing(observation_id, "noop")
+
+        before = daemon.connection.execute(
+            "SELECT status FROM observation_triage WHERE observation_id = ? "
+            "AND triager_name = ?",
+            (observation_id, "noop"),
+        ).fetchone()
+        assert before is not None and before["status"] == "processing"
+
+        # Simulate the case where a sibling task held the per-triager lock
+        # long enough for apply_lodging to remove the triager. _run_triager
+        # is invoked after the (now-released) lock is acquired; the triager
+        # is gone, but the 'processing' row still exists.
+        del daemon.lodging.triagers["noop"]
+
+        row = {"id": observation_id}
+        with caplog.at_level("INFO", logger="angelus.daemon"):
+            asyncio.run(daemon._run_triager(row, "noop"))
+
+        after = daemon.connection.execute(
+            "SELECT 1 FROM observation_triage WHERE observation_id = ? "
+            "AND triager_name = ?",
+            (observation_id, "noop"),
+        ).fetchone()
+        assert after is None, "orphaned processing row was not cleared"
+
+        assert any(
+            "removed mid-flight" in record.message
+            and "noop" in record.message
+            and str(observation_id) in record.message
+            for record in caplog.records
+        ), f"expected hot-remove log; got {[r.message for r in caplog.records]}"
+    finally:
+        daemon.connection.close()
+
+
 def test_push_channel_kills_subprocess_on_timeout(tmp_path) -> None:
     pid_file = tmp_path / "notify.pid"
     script = tmp_path / "hang-notify"

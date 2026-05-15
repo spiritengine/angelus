@@ -290,22 +290,29 @@ class AngelusDaemon:
                 # observation_triage. Delete so a later re-add of the same
                 # triager can pick the observation up fresh; no attempt
                 # consumed since the triager never ran.
-                observation_id = int(row["id"])
-                self.catalog.clear_triage_processing(observation_id, triager_name)
-                LOGGER.info(
-                    "triager %s removed mid-flight; cleared processing row for observation %d",
-                    triager_name,
-                    observation_id,
-                )
+                self._clear_triage_for_removed_triager(int(row["id"]), triager_name)
                 return
             lock_key = (triager.name, triager.source_ref)
             lock = self.triager_locks.setdefault(lock_key, asyncio.Lock())
             async with lock:
                 await self._run_triager(row, triager_name)
 
+    def _clear_triage_for_removed_triager(
+        self, observation_id: int, triager_name: str
+    ) -> None:
+        self.catalog.clear_triage_processing(observation_id, triager_name)
+        LOGGER.info(
+            "triager %s removed mid-flight; cleared processing row for observation %d",
+            triager_name,
+            observation_id,
+        )
+
     async def _run_triager(self, row, triager_name: str) -> None:
         triager = self.lodging.triagers.get(triager_name)
         if triager is None:
+            # Triager hot-removed while a sibling task held the per-triager
+            # lock; same orphan risk as the pre-lock check above.
+            self._clear_triage_for_removed_triager(int(row["id"]), triager_name)
             return
         observation_id = int(row["id"])
         try:
