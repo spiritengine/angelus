@@ -38,9 +38,10 @@ class AngelusDaemon:
         self.triager_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self.stop_event = asyncio.Event()
         self.tasks: list[asyncio.Task[None]] = []
-        # Tracked separately from self.tasks so apply_lodging can cancel a
-        # specific pipe's loop on cadence change without disturbing others.
-        # Tasks remain in self.tasks too — shutdown still drains via gather().
+        # Sole tracking site for per-pipe immediate-cadence loop tasks. Kept
+        # separate from self.tasks so apply_lodging can cancel one pipe's loop
+        # on cadence change without disturbing others, and so cancelled tasks
+        # don't accumulate in self.tasks across pipe churn.
         self._pipe_loop_tasks: dict[str, asyncio.Task[None]] = {}
         self.pipe_drains: dict[str, PipeDrain] = {
             name: PipeDrain(
@@ -85,8 +86,9 @@ class AngelusDaemon:
                 await self.reloader.stop()
             if scheduler_started:
                 self.scheduler.shutdown(wait=True)
-            if self.tasks:
-                await asyncio.gather(*self.tasks, return_exceptions=True)
+            pending = [*self.tasks, *self._pipe_loop_tasks.values()]
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
             try:
                 self.pid_file.unlink(missing_ok=True)
             except OSError:
@@ -208,7 +210,6 @@ class AngelusDaemon:
 
     def _spawn_pipe_loop(self, pipe_name: str) -> None:
         task = asyncio.create_task(self._pipe_loop(pipe_name), name=f"pipe-{pipe_name}")
-        self.tasks.append(task)
         self._pipe_loop_tasks[pipe_name] = task
 
     async def _cancel_pipe_loop(self, pipe_name: str) -> None:

@@ -26,11 +26,7 @@ from watchdog.observers import Observer
 
 from .config import (
     DISABLED_SUFFIX,
-    Channel,
     Lodging,
-    Pipe,
-    ScheduledSource,
-    Triager,
     parse_channel,
     parse_pipe,
     parse_source,

@@ -408,6 +408,41 @@ def test_immediate_to_cron_cancels_pipe_loop(tmp_path) -> None:
         daemon.connection.close()
 
 
+def test_pipe_loop_cancel_does_not_leak_into_tasks_list(tmp_path) -> None:
+    """A pipe loop task that gets cancelled (via cadence change or pipe
+    removal) must not linger as a dead reference in self.tasks. Otherwise a
+    long-running daemon that sees pipe churn accumulates cancelled tasks
+    unboundedly."""
+    _write_lodging(tmp_path)
+    daemon, reloader = _make_daemon(tmp_path)
+
+    async def driver() -> None:
+        daemon.scheduler.start(paused=True)
+        try:
+            tasks_baseline = list(daemon.tasks)
+            daemon._spawn_pipe_loop("now")
+            task = daemon._pipe_loop_tasks["now"]
+
+            (tmp_path / "pipes" / "now.yaml").write_text(
+                "cadence: '0 8 * * *'\nchannels: [push]\n"
+                "render:\n  kind: dumb-alert\n  template: '{type}:{entity}:{body}'\n",
+                encoding="utf-8",
+            )
+            _enqueue(reloader, tmp_path / "pipes" / "now.yaml")
+            await reloader.process_pending_events()
+
+            assert task.done()
+            assert task not in daemon.tasks
+            assert daemon.tasks == tasks_baseline
+        finally:
+            daemon.scheduler.shutdown(wait=False)
+
+    try:
+        asyncio.run(driver())
+    finally:
+        daemon.connection.close()
+
+
 def test_observer_thread_picks_up_change_within_2s(tmp_path) -> None:
     """End-to-end smoke: real watchdog Observer, real asyncio drain task.
     Most reload behavior is tested by driving process_pending_events directly;
