@@ -19,7 +19,7 @@ import angelus.pipes.runner as pipe_runner
 from angelus.channels import push as push_module
 from angelus.daemon import AngelusDaemon
 from angelus.lodging import Channel, Pipe
-from angelus.lodging.reloader import LodgingReloader
+from angelus.lodging.reloader import LodgingReloader, _identify
 from angelus.pipes import PipeDrain
 from angelus.storage import Catalog, init_db
 
@@ -176,6 +176,22 @@ def test_load_lodging_skips_disabled_files_at_startup(tmp_path) -> None:
         assert "noop" not in daemon.lodging.triagers
     finally:
         daemon.connection.close()
+
+
+def test_nested_source_path_is_not_identified(tmp_path) -> None:
+    """Reloader must match _load_sources, which globs sources/scheduled/*.yaml
+    non-recursively. A file under sources/scheduled/<subdir>/ would be loaded
+    by the reloader but lost on daemon restart, and two such files sharing
+    a stem would silently overwrite each other under the same key."""
+    flat = tmp_path / "sources" / "scheduled" / "foo.yaml"
+    nested = tmp_path / "sources" / "scheduled" / "sub" / "foo.yaml"
+
+    flat_id = _identify(tmp_path, flat)
+    assert flat_id is not None
+    assert flat_id.kind == "source"
+    assert flat_id.key == "scheduled/foo"
+
+    assert _identify(tmp_path, nested) is None
 
 
 def test_symlink_outside_base_is_refused(tmp_path, caplog) -> None:

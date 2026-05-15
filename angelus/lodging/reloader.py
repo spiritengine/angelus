@@ -71,7 +71,7 @@ def _identify(root: Path, path: Path) -> _Identified | None:
     stem = name[: -len(".yaml")]
     yaml_path = path.parent / name
 
-    if len(parts) >= 3 and parts[0] == "sources" and parts[1] == "scheduled":
+    if len(parts) == 3 and parts[0] == "sources" and parts[1] == "scheduled":
         return _Identified("source", f"scheduled/{stem}", yaml_path)
     if len(parts) == 2 and parts[0] == "triagers":
         return _Identified("triager", stem, yaml_path)
