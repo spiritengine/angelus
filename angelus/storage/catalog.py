@@ -127,19 +127,24 @@ class Catalog:
         self, observation_id: int, triager_name: str
     ) -> None:
         """Delete a 'processing' observation_triage row when its triager
-        no longer needs the row to exist -- a hot-remove or a shutdown-
-        cancel both reach this. Bounded to status='processing' so a legit
-        concurrent transition to 'success'/'failed' is not clobbered.
+        no longer needs the row to exist. Reached on two intents:
 
-        Callers (in angelus/daemon.py): the two triager-hot-removed
-        None-check sites in _triage_under_semaphore / _triage_loop (each
-        delegated through _clear_triage_for_removed_triager), and the
-        outer CancelledError arm in _triage_under_semaphore that fires
-        when _triage_loop's shutdown-finally cancels in-flight tasks.
-        Caller names are listed by intent (hot-remove / shutdown-cancel),
-        not enumerated by function -- a per-function list rots the
-        moment a new caller adopts the helper (the same trap class that
-        bit _kill_and_reap's docstring across the M1 fell)."""
+        - Hot-remove: a triager disappears from lodging after
+          mark_triage_processing has written the row but before the
+          triage runs. The observation must remain eligible for a later
+          re-added triager; deleting the row lets ready_observations_for
+          surface it again.
+        - Shutdown-cancel: _triage_loop cancels its in-flight tasks on
+          shutdown; the cancelled task never reaches mark_triage_success
+          or mark_triage_failed and would otherwise leave a stuck
+          'processing' row that recover_writing_rows does not heal.
+
+        Bounded to status='processing' so a concurrent transition to
+        'success'/'failed' that legitimately occurred BEFORE the
+        cancellation arrived is not clobbered. Caller function names
+        are deliberately not enumerated here -- they rot the moment
+        new callers adopt the helper, and the intents above survive
+        renames."""
         self.connection.execute(
             """
             DELETE FROM observation_triage
