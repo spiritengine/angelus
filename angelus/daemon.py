@@ -62,6 +62,10 @@ class AngelusDaemon:
             {
                 "health": self._op_health,
                 "incident_list": self._op_incident_list,
+                "mute": self._op_mute,
+                "incident_close": self._op_incident_close,
+                "replay": self._op_replay,
+                "reprocess": self._op_reprocess,
             },
         )
 
@@ -175,6 +179,54 @@ class AngelusDaemon:
             "open": self.catalog.open_incidents(),
             "recently_closed": self.catalog.recently_closed_incidents(days=7),
         }
+
+    # The four write ops below run inside the daemon -- the single sqlite
+    # writer. Each handler is synchronous in body: it validates args and
+    # makes exactly one synchronous, self-committing catalog call. There is
+    # deliberately no `await` between the catalog write and its commit, so
+    # shutdown-cancellation can only land at the socket boundary, never with
+    # a write transaction open (the 5b-1 cancel-safety property, preserved).
+    # A ValueError raised here is caught by ControlServer._dispatch and
+    # returned as {"ok": false, "error": ...}; it never crashes the daemon.
+
+    async def _op_mute(self, args: dict) -> dict:
+        dedup_key = args.get("dedup_key")
+        duration = args.get("duration")
+        comment = args.get("comment")
+        if not isinstance(dedup_key, str) or not dedup_key:
+            raise ValueError("mute requires a non-empty dedup_key")
+        if not isinstance(duration, str) or not duration:
+            raise ValueError("mute requires a duration")
+        if comment is not None and not isinstance(comment, str):
+            raise ValueError("mute comment must be a string")
+        seconds = _mute_duration_seconds(duration)
+        expires_at = self.catalog.add_mute(dedup_key, seconds, comment)
+        return {"dedup_key": dedup_key, "expires_at": expires_at}
+
+    async def _op_incident_close(self, args: dict) -> dict:
+        incident_id = args.get("id")
+        comment = args.get("comment")
+        if not isinstance(incident_id, int) or isinstance(incident_id, bool):
+            raise ValueError("incident close requires an integer id")
+        if comment is not None and not isinstance(comment, str):
+            raise ValueError("incident close comment must be a string")
+        outcome = self.catalog.close_incident(incident_id, comment)
+        return {"id": incident_id, "outcome": outcome}
+
+    async def _op_replay(self, args: dict) -> dict:
+        finding_id = args.get("finding_id")
+        if not isinstance(finding_id, int) or isinstance(finding_id, bool):
+            raise ValueError("replay requires an integer finding_id")
+        return self.catalog.replay_finding(
+            finding_id, set(self.lodging.pipes)
+        )
+
+    async def _op_reprocess(self, args: dict) -> dict:
+        source = args.get("source")
+        if not isinstance(source, str) or not source:
+            raise ValueError("reprocess requires a non-empty source")
+        count = self.catalog.reprocess_source(source)
+        return {"source": source, "observations": count}
 
     def _install_signal_handlers(self) -> None:
         loop = asyncio.get_running_loop()
@@ -459,6 +511,44 @@ def _cadence_seconds(cadence: str) -> int:
             return magnitude * _CADENCE_UNITS[suffix]
     raise ValueError(
         f"invalid cadence {cadence!r}: expected unit suffix (s, m, h)"
+    )
+
+
+# Deliberately separate from _CADENCE_UNITS / _cadence_seconds. Mute
+# durations are an operator-facing alert-silencing grammar with a 'd'
+# (days) unit; scheduling cadence is a different domain with no 'd'.
+# Entangling the two parsers would couple unrelated concerns, so this is
+# its own grammar with its own units.
+_MUTE_DURATION_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def _mute_duration_seconds(duration: str) -> int:
+    """Parse a mute duration like '90s', '30m', '4h', '2d'.
+
+    A unit suffix (s/m/h/d) is required: a bare integer is rejected so
+    `mute <key> 30` cannot silently mean 30 of some unit (the same
+    silent-units footgun the cadence parser refuses). Non-positive
+    magnitudes are rejected too.
+    """
+    text = duration.strip().lower()
+    for suffix, scale in _MUTE_DURATION_UNITS.items():
+        if text.endswith(suffix) and len(text) > len(suffix):
+            value = text[: -len(suffix)].strip()
+            try:
+                magnitude = int(value)
+            except ValueError:
+                raise ValueError(
+                    f"invalid mute duration {duration!r}: "
+                    "expected <int><unit> (s, m, h, d)"
+                ) from None
+            if magnitude <= 0:
+                raise ValueError(
+                    f"invalid mute duration {duration!r}: must be positive"
+                )
+            return magnitude * scale
+    raise ValueError(
+        f"invalid mute duration {duration!r}: expected a unit suffix "
+        "(s, m, h, d), e.g. '30m'"
     )
 
 

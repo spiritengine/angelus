@@ -63,6 +63,41 @@ class PipeDrain:
                     pipe.rate_limit["overflow"],
                 )
                 continue
+            if self.catalog.is_muted(row["dedup_key"]):
+                # Mute silences the immediate/now alert path only. Record
+                # a 'muted' dispatch so the decision stays auditable
+                # (slice-3 issue-20260514-wh1k: every dispatch decision
+                # leaves a row), then mark this pipe item handled exactly
+                # as the success path does (pipe_queues -> 'dispatched')
+                # so it does not reappear in pending_pipe_items on the
+                # next drain. We do NOT mark it 'suppressed': suppressed
+                # is the rate-limit-overflow state the daily digest reads;
+                # a muted finding must not surface there.
+                #
+                # Incident lifecycle is untouched here by construction,
+                # not by added code: _upsert_incident runs at
+                # write_finding time, BEFORE any dispatch, so suppressing
+                # dispatch cannot affect an incident's open/close state.
+                #
+                # Scope: _drain_immediate only. _drain_digest is
+                # deliberately NOT mute-checked -- the daily digest is the
+                # consolidation/audit surface and must stay complete. A
+                # finding targeting `now` has its own pipe_queues row;
+                # marking that row does not touch a separate `daily` row,
+                # so the digest is unaffected by construction. Filtering
+                # the digest too would also risk the cross-zone dedup trap
+                # that bit slice 3.
+                self.catalog.record_dispatch(
+                    pipe.name,
+                    "(muted)",
+                    [finding_id],
+                    "muted",
+                    source=row["source"],
+                )
+                self.catalog.mark_pipe_items_dispatched(
+                    pipe.name, [finding_id]
+                )
+                continue
             for channel_name in pipe.channels:
                 if self.catalog.is_channel_unhealthy(channel_name):
                     continue
