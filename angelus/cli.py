@@ -45,8 +45,12 @@ def _socket_path(root: Path) -> Path:
 def _request(root: Path, op: str, args: dict[str, Any]) -> dict[str, Any] | None:
     """Send one op over the control socket and return the parsed response.
 
-    Returns None if the socket is absent or the connection is refused -- the
-    signal for callers to fall back to read-only sqlite.
+    Returns None if the socket is absent, the connection is refused, or the
+    daemon does not return a well-formed JSON line (e.g. killed mid-write,
+    leaving a truncated or empty buffer) -- the signal for callers to fall
+    back to read-only sqlite. The contract is: any failure to get a complete,
+    parseable response is "daemon unreachable", which is exit-0 success with
+    the sqlite fallback, never a CLI traceback.
     """
     sock_path = _socket_path(root)
     if not sock_path.exists():
@@ -66,7 +70,12 @@ def _request(root: Path, op: str, args: dict[str, Any]) -> dict[str, Any] | None
         return None
     if not buffer:
         return None
-    return json.loads(buffer.decode("utf-8"))
+    try:
+        return json.loads(buffer.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        # Truncated/garbled buffer: daemon died mid-write. Treat exactly like
+        # connection-refused -- fall through to the read-only sqlite path.
+        return None
 
 
 def _ro_connect(db_path: Path) -> sqlite3.Connection | None:

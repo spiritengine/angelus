@@ -11,7 +11,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import socket as socketlib
 import sqlite3
+import stat
+import threading
 from pathlib import Path
 
 import pytest
@@ -290,3 +294,201 @@ def test_socket_removed_on_shutdown(tmp_path) -> None:
                 await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(driver())
+
+
+# --- trust boundary: owner-only socket + state dir -----------------------
+
+
+def test_socket_and_state_dir_are_owner_only(tmp_path) -> None:
+    _write_lodging(tmp_path)
+
+    async def driver() -> None:
+        daemon = AngelusDaemon(tmp_path)
+        await daemon.control.start()
+        try:
+            sock_mode = stat.S_IMODE(os.stat(daemon.socket_path).st_mode)
+            dir_mode = stat.S_IMODE(os.stat(tmp_path / "state").st_mode)
+        finally:
+            await daemon.control.stop()
+            daemon.connection.close()
+
+        # No group/other bits on either: owner read/write only on the socket,
+        # owner rwx only on the directory it lives in.
+        assert sock_mode == 0o600, oct(sock_mode)
+        assert dir_mode == 0o700, oct(dir_mode)
+
+    asyncio.run(driver())
+
+
+# --- read deadline + stalled-client shutdown -----------------------------
+
+
+def test_stalled_client_gets_timeout_and_server_survives(tmp_path) -> None:
+    _write_lodging(tmp_path)
+
+    async def driver() -> None:
+        daemon = AngelusDaemon(tmp_path)
+        daemon.control._read_timeout = 0.2
+        await daemon.control.start()
+        try:
+            # Connect, send nothing, leave it open: server must answer with a
+            # structured timeout rather than block on readuntil forever.
+            reader, writer = await asyncio.open_unix_connection(
+                str(daemon.socket_path)
+            )
+            try:
+                line = await asyncio.wait_for(reader.readline(), timeout=2.0)
+            finally:
+                writer.close()
+                await asyncio.gather(writer.wait_closed(), return_exceptions=True)
+            assert json.loads(line.decode()) == {
+                "ok": False,
+                "error": "request timed out",
+            }
+            # A fresh client still works -> the stalled one did not wedge it.
+            good = await _ask(daemon.socket_path, {"op": "health"})
+            assert good["ok"] is True
+        finally:
+            await daemon.control.stop()
+            daemon.connection.close()
+
+    asyncio.run(driver())
+
+
+def test_stalled_client_does_not_wedge_daemon_shutdown(tmp_path) -> None:
+    _write_lodging(tmp_path)
+
+    async def driver() -> None:
+        daemon = AngelusDaemon(tmp_path)
+        task = asyncio.create_task(daemon.run())
+        try:
+            for _ in range(60):
+                if daemon.socket_path.exists():
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                raise AssertionError("control socket never bound")
+
+            # Open a connection and never send a newline; keep it open across
+            # the whole shutdown. Against the un-fixed code stop() blocks in
+            # wait_closed() on this handler and run() never finishes.
+            reader, writer = await asyncio.open_unix_connection(
+                str(daemon.socket_path)
+            )
+            try:
+                assert daemon.pid_file.exists()
+                # No sleep before request_stop: this deliberately also covers
+                # the accept race (handler not yet spawned/tracked). Bound is
+                # generous enough for the wait_closed cap on that path; the
+                # un-fixed code hangs unboundedly here.
+                daemon.request_stop()
+                await asyncio.wait_for(task, timeout=15.0)
+                assert not daemon.socket_path.exists()
+                assert not daemon.pid_file.exists()
+            finally:
+                writer.close()
+                await asyncio.gather(writer.wait_closed(), return_exceptions=True)
+        finally:
+            if not task.done():
+                daemon.request_stop()
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(driver())
+
+
+def test_connection_closed_mid_request_server_survives(tmp_path) -> None:
+    _write_lodging(tmp_path)
+
+    async def driver() -> None:
+        daemon = AngelusDaemon(tmp_path)
+        await daemon.control.start()
+        try:
+            # Connect and close before sending a newline. The handler must
+            # exit cleanly (IncompleteReadError) without leaking or crashing.
+            reader, writer = await asyncio.open_unix_connection(
+                str(daemon.socket_path)
+            )
+            writer.close()
+            await asyncio.gather(writer.wait_closed(), return_exceptions=True)
+            await asyncio.sleep(0.05)
+            assert not daemon.control._handlers, "handler task leaked"
+            good = await _ask(daemon.socket_path, {"op": "health"})
+            assert good["ok"] is True
+        finally:
+            await daemon.control.stop()
+            daemon.connection.close()
+
+    asyncio.run(driver())
+
+
+@pytest.mark.parametrize(
+    "raw,expected_error",
+    [
+        (b"[]\n", "expected a JSON object"),
+        (b"42\n", "expected a JSON object"),
+        (b'{"args": {}}\n', "missing or invalid op"),
+        (b'{"op": "health", "args": []}\n', "args must be an object"),
+    ],
+)
+def test_bad_payload_shape_structured_error(tmp_path, raw, expected_error) -> None:
+    _write_lodging(tmp_path)
+
+    async def driver() -> None:
+        daemon = AngelusDaemon(tmp_path)
+        await daemon.control.start()
+        try:
+            bad = await _ask(daemon.socket_path, None, raw=raw)
+            assert bad["ok"] is False
+            assert expected_error in bad["error"]
+            # Server survives the bad client.
+            good = await _ask(daemon.socket_path, {"op": "health"})
+            assert good["ok"] is True
+        finally:
+            await daemon.control.stop()
+            daemon.connection.close()
+
+    asyncio.run(driver())
+
+
+# --- CLI fallback when daemon returns a truncated response ---------------
+
+
+def test_cli_falls_back_on_truncated_socket_response(tmp_path) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+    connection = init_db(state / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    catalog.write_observation(
+        "scheduled/watch", {"url": "x"}, {"source": "scheduled/watch"}
+    )
+    connection.close()
+
+    sock_path = state / "angelus.sock"
+    listener = socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_STREAM)
+    listener.bind(str(sock_path))
+    listener.listen(1)
+    listener.settimeout(5.0)
+
+    def serve_truncated() -> None:
+        # Accept, then close after a partial (un-terminated, un-parseable)
+        # JSON line: this is a daemon killed mid-write.
+        conn, _ = listener.accept()
+        try:
+            conn.recv(4096)
+            conn.sendall(b'{"ok": tr')
+        finally:
+            conn.close()
+
+    server_thread = threading.Thread(target=serve_truncated, daemon=True)
+    server_thread.start()
+    try:
+        result = CliRunner().invoke(main, ["health", "--root", str(tmp_path)])
+    finally:
+        server_thread.join(timeout=5.0)
+        listener.close()
+
+    assert result.exit_code == 0, result.output
+    assert result.exception is None, result.exception
+    assert "daemon: not running" in result.output
+    assert "observations pending triage: 1" in result.output

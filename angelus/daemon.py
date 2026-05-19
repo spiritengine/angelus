@@ -29,6 +29,11 @@ class AngelusDaemon:
         self.root = root
         state_dir = root / "state"
         state_dir.mkdir(parents=True, exist_ok=True)
+        # Owner-only. mkdir's mode is masked by umask and only applies on
+        # creation; chmod unconditionally so an existing 0755 dir is tightened
+        # too. The owner-only control socket lives here -- a world-traversable
+        # parent dir is the other half of that exposure (issue-20260519-cd8z).
+        state_dir.chmod(0o700)
         self.pid_file = state_dir / "angelus.pid"
         self.socket_path = state_dir / "angelus.sock"
         self.connection = init_db(state_dir / "angelus.sqlite3")
