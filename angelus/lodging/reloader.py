@@ -28,6 +28,7 @@ from .config import (
     DISABLED_SUFFIX,
     Lodging,
     parse_channel,
+    parse_dependency,
     parse_pipe,
     parse_source,
     parse_triager,
@@ -44,6 +45,7 @@ WATCHED_DIRS = (
     "triagers",
     "pipes",
     "channels",
+    "dependencies",
 )
 
 
@@ -51,7 +53,7 @@ WATCHED_DIRS = (
 class _Identified:
     """Result of mapping a filesystem path to a lodging entry."""
 
-    kind: str  # "source" | "triager" | "pipe" | "channel"
+    kind: str  # "source" | "triager" | "pipe" | "channel" | "dependency"
     key: str  # canonical key in the matching Lodging dict
     yaml_path: Path  # path with .disabled stripped
 
@@ -79,6 +81,11 @@ def _identify(root: Path, path: Path) -> _Identified | None:
         return _Identified("pipe", stem, yaml_path)
     if len(parts) == 2 and parts[0] == "channels":
         return _Identified("channel", stem, yaml_path)
+    # dependencies/ is FLAT (dependencies/<name>.yaml, depth 2) like
+    # channels/ -- NOT depth 3 like sources/scheduled/. The dependency
+    # key is the filename stem (parse_dependency enforces name == stem).
+    if len(parts) == 2 and parts[0] == "dependencies":
+        return _Identified("dependency", stem, yaml_path)
     return None
 
 
@@ -99,6 +106,8 @@ def _parse(kind: str, root: Path, path: Path) -> Any:
         return parse_pipe(path)
     if kind == "channel":
         return parse_channel(path)
+    if kind == "dependency":
+        return parse_dependency(path)
     raise ValueError(f"unknown lodging kind {kind!r}")
 
 
@@ -120,6 +129,10 @@ def _swap(lodging: Lodging, kind: str, key: str, item: Any) -> Lodging:
         channels = dict(lodging.channels)
         channels[key] = item
         return replace(lodging, channels=channels)
+    if kind == "dependency":
+        dependencies = dict(lodging.dependencies)
+        dependencies[key] = item
+        return replace(lodging, dependencies=dependencies)
     raise ValueError(f"unknown lodging kind {kind!r}")
 
 
@@ -140,6 +153,10 @@ def _without(lodging: Lodging, kind: str, key: str) -> Lodging:
         channels = dict(lodging.channels)
         channels.pop(key, None)
         return replace(lodging, channels=channels)
+    if kind == "dependency":
+        dependencies = dict(lodging.dependencies)
+        dependencies.pop(key, None)
+        return replace(lodging, dependencies=dependencies)
     raise ValueError(f"unknown lodging kind {kind!r}")
 
 
@@ -152,6 +169,8 @@ def _existing(lodging: Lodging, kind: str, key: str) -> Any:
         return lodging.pipes.get(key)
     if kind == "channel":
         return lodging.channels.get(key)
+    if kind == "dependency":
+        return lodging.dependencies.get(key)
     raise ValueError(f"unknown lodging kind {kind!r}")
 
 
@@ -203,8 +222,18 @@ class LodgingReloader:
             return
         handler = _QueueingHandler(self.event_queue)
         observer = Observer()
-        # Dirs are scheduled once at startup. A dir created later won't be watched
-        # until daemon restart. Slice 5c will register dependencies/ at lodge-time.
+        # The observer schedules a dir once, here at startup; a dir created
+        # afterwards is not watched until the next daemon restart (the 5a
+        # scheduled-once limitation, unchanged for the other lodging dirs,
+        # which exist in any real deployment). dependencies/ is the one dir
+        # the spec expects to be absent initially, so rather than inherit
+        # that limitation for it we ensure it exists before scheduling --
+        # the dir is system-owned lodging, the same way sources/ etc. are,
+        # and creating it empty is benign (_enabled_yaml_files yields []).
+        # That makes the absent-at-startup and created-later cases both
+        # behave: the observer watches a real (possibly empty) dir from
+        # the start and sees the first dependencies/<name>.yaml dropped in.
+        (self.root / "dependencies").mkdir(parents=True, exist_ok=True)
         for subdir in WATCHED_DIRS:
             target = self.root / subdir
             if target.exists():

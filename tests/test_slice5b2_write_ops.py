@@ -560,11 +560,14 @@ def test_reprocess_op_rebudgets_triage_and_idempotent(tmp_path) -> None:
 
 
 def test_daemon_down_write_commands_exit_nonzero_no_write(tmp_path) -> None:
-    """All four write commands (mute add / incident close / replay /
-    reprocess) require the daemon: with no socket each exits non-zero
-    with a clear message and the db is left untouched (no read-only
-    fallback writer). Structurally they share _require_daemon, but the
-    contract names all four, so all four are exercised."""
+    """Every write command (mute add / incident close / replay /
+    reprocess / dep-record) requires the daemon: with no socket each
+    exits non-zero with a clear message and the db is left untouched (no
+    read-only fallback writer). Structurally they share _require_daemon,
+    but the contract names each one, so each is exercised -- and the
+    db-unchanged assertion covers all of them (5b-2's fell flagged a
+    2-of-N coverage gap twice; dep_record gets full coverage from the
+    start, with an explicit no-dep_health-row check)."""
     state = tmp_path / "state"
     state.mkdir()
     connection = init_db(state / "angelus.sqlite3")
@@ -593,6 +596,10 @@ def test_daemon_down_write_commands_exit_nonzero_no_write(tmp_path) -> None:
         ),
         (["replay", str(finding_id)], "replay requires the daemon"),
         (["reprocess", "scheduled/down"], "reprocess requires the daemon"),
+        (
+            ["dep-record", "mill-wheel", "unhealthy"],
+            "dep-record requires the daemon",
+        ),
     ]
     for argv, message in cases:
         result = runner.invoke(main, [*argv, "--root", str(tmp_path)])
@@ -623,6 +630,12 @@ def test_daemon_down_write_commands_exit_nonzero_no_write(tmp_path) -> None:
         # The seeded observation had exactly one triage row; reprocess
         # being refused (daemon down) must not have deleted it.
         assert triage_rows == 1
+        # dep-record refused (daemon down) must not have written a
+        # dep_health row -- the probe has no sqlite fallback either.
+        dep_rows = check.execute(
+            "SELECT COUNT(*) AS n FROM dep_health"
+        ).fetchone()["n"]
+        assert dep_rows == 0
     finally:
         check.close()
 
@@ -641,6 +654,7 @@ def test_write_handlers_hold_no_await_across_the_write() -> None:
         AngelusDaemon._op_incident_close,
         AngelusDaemon._op_replay,
         AngelusDaemon._op_reprocess,
+        AngelusDaemon._op_dep_record,
     ]
     for handler in handlers:
         body = inspect.getsource(handler)
@@ -654,6 +668,7 @@ def test_write_handlers_hold_no_await_across_the_write() -> None:
         Catalog.replay_finding,
         Catalog.reprocess_source,
         Catalog.is_muted,
+        Catalog.record_dep_health,
     ):
         src = inspect.getsource(method)
         assert "await " not in src, method.__name__
