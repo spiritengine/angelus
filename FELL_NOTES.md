@@ -571,3 +571,54 @@ the worktree, observed failure, restored:
 Each axis is necessary; removing any one alone leaves a real
 production bug. After restore, 127 passed in 28.34s, stable across
 three consecutive full-suite runs.
+
+## Rounds 6, 7, 8 — docstring-rot cascade and structural fix
+
+Round-6 readonly fell of round-5's diff filed three findings, all in
+the same docstring-rot trap class round-5 was supposed to be fixing:
+the round-5 diff itself introduced three new instances. ak0d (a
+daemon.py comment still referencing a CancelledError arm round-5 had
+deleted), 76a6 (a test comment naming the wrong function), 440d
+(catalog.py docstring listing an incomplete set of None-check sites
+via function name).
+
+Round-6 fix patched the three sites textually. Round-7 readonly fell
+then found two MORE instances in round-6's own diff: 4vta (catalog.py
+docstring listed `_triage_under_semaphore / _triage_loop` for the two
+None-check sites but the second one is actually in `_run_triager`;
+the same docstring explicitly argued against per-function enumeration
+and then enumerated two functions in the next paragraph, getting one
+wrong), and zb5z (a daemon.py comment inverted the call relationship,
+saying "in _triage_loop's caller" when mark_triage_processing actually
+runs inside _triage_loop's body).
+
+The lesson the cascade made unavoidable: patching individual function
+names indefinitely will not converge — every fix introduces a new
+name to rot. Round-7 fix STRUCTURALLY removed the function-name
+enumeration from `clear_triage_processing`'s docstring (which the
+docstring itself argued for) and replaced it with a by-intent listing
+(hot-remove / shutdown-cancel) that survives renames. The
+daemon.py:498 comment was rewritten to describe placement by program
+structure (synchronous body of _triage_loop just before create_task)
+rather than caller relationships.
+
+Round-8 readonly fell of the round-7 diff returned CLEAN: the two
+intents cover every actual call site (verified by grep), the
+mark_triage_processing placement is accurate, no new rot introduced.
+The cycle converged at round 8 with 127 tests passing.
+
+### The trap class summarized
+
+Across this fell the same docstring-rot pattern fired six times
+(`93p7`, `df5h`, `n59k`, `c0yu`, `ak0d` + `76a6` + `440d`, `4vta` +
+`zb5z`). Each time it presented as "the docstring is slightly out of
+date with the code in the same commit." Each time the local patch
+introduced a new instance. The structural fix is to AVOID FUNCTION
+NAMES in any helper-callable docstring — list by intent or
+architectural area, never by caller function. A name list is a
+write-once liability: the first refactor that renames or relocates a
+caller breaks it, and every fell that patches it textually risks
+adding another stale name without retiring the previous one.
+
+For future slice/cross-slice fells: when filing a docstring-rot
+finding, the fix MUST remove the enumeration, not patch it.
