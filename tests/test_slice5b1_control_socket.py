@@ -492,3 +492,63 @@ def test_cli_falls_back_on_truncated_socket_response(tmp_path) -> None:
     assert result.exception is None, result.exception
     assert "daemon: not running" in result.output
     assert "observations pending triage: 1" in result.output
+
+
+def test_cli_falls_back_on_oversized_unterminated_response(tmp_path) -> None:
+    # A daemon that streams forever without a newline must not make the CLI
+    # buffer without bound. Against an uncapped read loop this hangs
+    # indefinitely (recv keeps returning data so the inactivity timeout never
+    # fires); the client-side response cap turns it into a clean fallback.
+    state = tmp_path / "state"
+    state.mkdir()
+    connection = init_db(state / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    catalog.write_observation(
+        "scheduled/watch", {"url": "x"}, {"source": "scheduled/watch"}
+    )
+    connection.close()
+
+    sock_path = state / "angelus.sock"
+    listener = socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_STREAM)
+    listener.bind(str(sock_path))
+    listener.listen(1)
+    listener.settimeout(5.0)
+    stop = threading.Event()
+
+    def serve_flood() -> None:
+        conn, _ = listener.accept()
+        try:
+            conn.recv(4096)
+            blob = b"x" * 65536  # no newline, ever
+            while not stop.is_set():
+                try:
+                    conn.sendall(blob)
+                except OSError:
+                    break
+        finally:
+            conn.close()
+
+    server_thread = threading.Thread(target=serve_flood, daemon=True)
+    server_thread.start()
+
+    result_box: dict[str, object] = {}
+
+    def run_cli() -> None:
+        result_box["result"] = CliRunner().invoke(
+            main, ["health", "--root", str(tmp_path)]
+        )
+
+    cli_thread = threading.Thread(target=run_cli, daemon=True)
+    cli_thread.start()
+    cli_thread.join(timeout=15.0)
+    completed = not cli_thread.is_alive()
+    stop.set()
+    server_thread.join(timeout=5.0)
+    listener.close()
+
+    assert completed, "CLI did not return: response read is unbounded"
+    result = result_box["result"]
+    assert result.exit_code == 0, result.output
+    assert result.exception is None, result.exception
+    assert "daemon: not running" in result.output
+    assert "observations pending triage: 1" in result.output

@@ -37,6 +37,13 @@ _ROOT_OPTION = click.option(
 
 _SOCKET_TIMEOUT = 5.0
 
+# Cap the response we will buffer from the daemon. The daemon caps inbound
+# requests at control.MAX_REQUEST_BYTES; this is the symmetric client-side
+# bound so a buggy or compromised daemon cannot make the CLI buffer without
+# limit. Generous relative to any legitimate health/incident-list response;
+# exceeding it is treated as a garbled response (fall back to read-only sqlite).
+_MAX_RESPONSE_BYTES = 1024 * 1024
+
 
 def _socket_path(root: Path) -> Path:
     return root / "state" / "angelus.sock"
@@ -66,6 +73,10 @@ def _request(root: Path, op: str, args: dict[str, Any]) -> dict[str, Any] | None
                 if not chunk:
                     break
                 buffer += chunk
+                if len(buffer) > _MAX_RESPONSE_BYTES:
+                    # Oversized/never-terminated response: treat as garbled,
+                    # same as a daemon that died mid-write.
+                    return None
     except (ConnectionError, FileNotFoundError, OSError):
         return None
     if not buffer:
