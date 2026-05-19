@@ -122,20 +122,24 @@ async def _kill_and_reap(process: asyncio.subprocess.Process) -> None:
     Invoked on the timeout AND CancelledError paths of every subprocess
     site angelus runs -- source-fire and dep-check probes here in sources/,
     push and email channel sends in channels/, the digest LLM body render
-    in pipes/, and the python triager subprocess in triage/. Cancellation sources differ by site: daemon shutdown
-    cancels APScheduler-submitted source-fire and pipe-digest tasks
-    (AsyncIOExecutor.shutdown just .cancel()s pending futures), the
-    channel-send sites are cancelled when their drain task is cancelled,
-    and the cron-fired dep-check probe (a CLI process invoked from
+    in pipes/, and the python triager subprocess in triage/. Cancellation
+    sources differ by site: daemon shutdown cancels APScheduler-submitted
+    source-fire and pipe-digest tasks (AsyncIOExecutor.shutdown just
+    .cancel()s pending futures); the channel-send sites are cancelled
+    when their drain task is cancelled; the triager subprocess is
+    cancelled by AngelusDaemon._triage_loop's finally block, which
+    explicitly cancels its in-flight tasks on shutdown (no APScheduler
+    canceller exists for the plain asyncio triage loop); and the
+    cron-fired dep-check probe (a CLI process invoked from
     angelus/cli.py, not the daemon) takes its cancel from operator
     interrupt -- in every case, without reaping on cancel the child and
     its process group would survive their parent, the same orphan a
     non-reaped timeout produces. Caller names are deliberately listed by
-    area (sources / channels / pipes), not enumerated -- new subprocess
-    sites should adopt this helper rather than grow yet another shape,
-    and a per-name list rots the moment they do (the prior
-    "run_shell_source / run_dep_check" enumeration was already wrong by
-    the time the integration fell ran).
+    area (sources / channels / pipes / triage), not enumerated -- new
+    subprocess sites should adopt this helper rather than grow yet
+    another shape, and a per-name list rots the moment they do (the
+    prior "run_shell_source / run_dep_check" enumeration was already
+    wrong by the time the integration fell ran).
 
     Why the group and not just the shell: asyncio resolves
     `process.wait()` only when the subprocess transport is fully done --

@@ -496,3 +496,78 @@ dep-check probe, push channel, email channel, digest LLM render, and
 python triager. The cancel-before-gather pattern is documented inline
 in `_triage_loop`. The `_kill_and_reap` docstring's area enumeration
 matches the code.
+
+## Round 5 — round-4 fix introduced a triage-state regression (issue-20260519-l3bc + c0yu)
+
+Round-5 readonly fell rediscovered the round-4 change and found two
+findings, both real:
+
+### issue-20260519-l3bc — orphan observation_triage 'processing' rows
+
+The round-4 cancel-before-gather in `_triage_loop` made shutdown fast
+(good) but the cancelled triager tasks never reached `mark_triage_success`
+or `mark_triage_failed` (live inside `_run_triager`'s `except Exception`,
+which intentionally does not catch CancelledError). The
+`mark_triage_processing` row written at `daemon.py:463` therefore stays
+at 'processing' forever; `recover_writing_rows` does not touch
+`observation_triage`; `ready_observations_for` excludes 'processing'
+rows. Net: the observation is permanently stuck after a daemon restart.
+
+Round-5 fell located this regression by reading the propagation path
+through the semaphore -> per-triager lock -> `_run_triager` and noticing
+that `mark_triage_processing` runs in the CALLER (`_triage_loop`) before
+the task is even started.
+
+### Fix (in `_triage_under_semaphore`, not `_run_triager`)
+
+First attempt was an `except asyncio.CancelledError` arm inside
+`_run_triager` calling `clear_triage_processing`. The round-5
+discriminating-test extension (row-state assertion on
+`observation_triage`) immediately exposed that it covers only ONE of
+the three cancellation landing points: cancellation can land at the
+`async with self.triage_semaphore` await, at the `async with lock`
+await, or inside `_run_triager`. Tasks cancelled while queued behind
+the per-triager lock never enter `_run_triager`, so the inner arm
+never fires for them and the assertion failed on observation 2.
+
+Moved the handling up one level to `_triage_under_semaphore`'s outer
+`except asyncio.CancelledError`, which by `async with` semantics
+catches cancellation at all three points uniformly. `clear_triage_processing`
+is bounded to `status='processing'` so a transition to
+'success'/'failed' (which can only have happened inside `_run_triager`
+BEFORE its own cancel arrived) is not clobbered. The inner arm in
+`_run_triager` was redundant (any cancel in there propagates out
+through the outer `async with` and hits the outer arm) — removed per
+the "defensive-but-unreachable" trap class.
+
+### issue-20260519-c0yu — round-3 docstring rot at the helper site
+
+`_kill_and_reap`'s docstring coverage list grew to four areas (added
+triage/) but the downstream cancellation-source enumeration still had
+three patterns for four sites, and the meta-parenthetical still said
+"(sources / channels / pipes)" — three of four areas. Same class as
+93p7 / df5h / n59k. Fixed: extended the cancellation-source paragraph
+to include the triage cancellation source (the explicit
+`_triage_loop` finally-cancel) and updated the meta-parenthetical to
+"(sources / channels / pipes / triage)".
+
+### Three-axis discrimination on `test_full_daemon_shutdown_reaps_python_triager_subprocess`
+
+Extended the existing test with a row-state assertion on
+`observation_triage` after shutdown-cancel. Verified each inversion in
+the worktree, observed failure, restored:
+
+1. Invert `_triage_loop`'s cancel-before-gather (gather-only) -> the
+   `await asyncio.wait_for(task, timeout=15.0)` fires TimeoutError
+   first. Shutdown hangs.
+2. Invert `run_python_triager`'s CancelledError arm -> the sleep
+   grandchild survives shutdown; the post-driver `_alive` poll fails
+   the assertion.
+3. Invert `_triage_under_semaphore`'s CancelledError arm
+   (`clear_triage_processing` call removed) -> 2 'processing' rows
+   orphaned in `observation_triage` after shutdown-cancel; the
+   row-state assertion fails.
+
+Each axis is necessary; removing any one alone leaves a real
+production bug. After restore, 127 passed in 28.34s, stable across
+three consecutive full-suite runs.

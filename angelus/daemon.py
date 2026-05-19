@@ -490,21 +490,38 @@ class AngelusDaemon:
                 LOGGER.error("triage task crashed", exc_info=exc)
 
     async def _triage_under_semaphore(self, row, triager_name: str) -> None:
-        async with self.triage_semaphore:
-            triager = self.lodging.triagers.get(triager_name)
-            if triager is None:
-                # Triager hot-removed between mark_triage_processing and now.
-                # The 'processing' row would otherwise orphan: ready_observations_for
-                # excludes it, and recover_writing_rows doesn't touch
-                # observation_triage. Delete so a later re-add of the same
-                # triager can pick the observation up fresh; no attempt
-                # consumed since the triager never ran.
-                self._clear_triage_for_removed_triager(int(row["id"]), triager_name)
-                return
-            lock_key = (triager.name, triager.source_ref)
-            lock = self.triager_locks.setdefault(lock_key, asyncio.Lock())
-            async with lock:
-                await self._run_triager(row, triager_name)
+        observation_id = int(row["id"])
+        # Cancellation by _triage_loop's shutdown-finally can land at any
+        # await in this method: queueing on the semaphore, queueing on
+        # the per-triager lock, or inside _run_triager itself. In every
+        # one of those cases mark_triage_processing has already written
+        # the row, so we must clear it on the way out -- recover_writing_rows
+        # does not touch observation_triage and ready_observations_for
+        # excludes 'processing' rows, so an unrecovered row would orphan
+        # the observation across daemon restarts. clear_triage_processing
+        # is bounded to status='processing', so a transition that
+        # legitimately landed at 'success'/'failed' (which can only have
+        # happened inside _run_triager BEFORE its own cancel arm fired)
+        # is not clobbered. _run_triager's CancelledError arm still does
+        # the clear itself for the mid-flight case so the log line there
+        # stays accurate, but if a cancel arrives during semaphore/lock
+        # acquisition this outer arm is the only thing that runs.
+        try:
+            async with self.triage_semaphore:
+                triager = self.lodging.triagers.get(triager_name)
+                if triager is None:
+                    # Triager hot-removed between mark_triage_processing and now.
+                    # Same orphan risk as the cancel arm above; the helper
+                    # logs and delegates to catalog.clear_triage_processing.
+                    self._clear_triage_for_removed_triager(observation_id, triager_name)
+                    return
+                lock_key = (triager.name, triager.source_ref)
+                lock = self.triager_locks.setdefault(lock_key, asyncio.Lock())
+                async with lock:
+                    await self._run_triager(row, triager_name)
+        except asyncio.CancelledError:
+            self.catalog.clear_triage_processing(observation_id, triager_name)
+            raise
 
     def _clear_triage_for_removed_triager(
         self, observation_id: int, triager_name: str
