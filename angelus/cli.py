@@ -1,11 +1,18 @@
 """Command-line entry point for Angelus.
 
 Read commands talk to the running daemon over its control socket
-(state/angelus.sock). If the daemon is down or unreachable, health and
-incident-list fall back to reading sqlite in true read-only mode
-(file:...?mode=ro) -- the CLI can never write the database, preserving the
-single-writer invariant. "The daemon is down" is a successful health report,
-not a CLI error: the fallback path exits 0.
+(state/angelus.sock). If the daemon is down or unreachable, health,
+incident-list and mute-list fall back to reading sqlite in true read-only
+mode (file:...?mode=ro) -- the CLI can never write the database, preserving
+the single-writer invariant. "The daemon is down" is a successful health
+report, not a CLI error: the fallback path exits 0.
+
+Write commands (mute add / incident close / replay / reprocess) are the
+inverse:
+they MUST go through the daemon (the single sqlite writer) and have NO
+sqlite fallback -- a fallback would reintroduce a second writer. A
+missing/refused/garbled socket is a hard, non-zero exit with a clear
+message.
 
 Output is operator-facing and read aloud by a screen reader: plain text, one
 item per line, "label: value" and simple indented lists. No tables, columns,
@@ -126,6 +133,31 @@ def _pid_status(pid_file: Path) -> tuple[str, int | None]:
     return "not reachable", pid
 
 
+def _require_daemon(
+    root: Path, op: str, args: dict[str, Any], command: str
+) -> dict[str, Any]:
+    """Send a write op that REQUIRES the daemon and return its result.
+
+    The inverse of the health/incident-list read path: write commands
+    have NO read-only sqlite fallback -- a fallback would make the CLI a
+    second sqlite writer and break the single-writer invariant. So a
+    missing/refused/garbled socket (any _request -> None) is a hard,
+    non-zero exit with a clear message, and a structured {"ok": false}
+    from the daemon is surfaced verbatim and also exits non-zero.
+    """
+    response = _request(root, op, args)
+    if response is None:
+        click.echo(
+            f"angelus daemon is not running; {command} requires the daemon",
+            err=True,
+        )
+        raise SystemExit(1)
+    if not response.get("ok"):
+        click.echo(f"error: {response.get('error')}", err=True)
+        raise SystemExit(1)
+    return response["result"]
+
+
 @click.group()
 def main() -> None:
     """Angelus scheduling and escalation spine."""
@@ -171,6 +203,120 @@ def incident_list(root: Path) -> None:
         _render_incidents(response["result"])
         return
     _render_incidents_fallback(root)
+
+
+@incident.command("close")
+@click.argument("incident_id", type=int)
+@click.option("--comment", default=None, help="Closure note.")
+@_ROOT_OPTION
+def incident_close(incident_id: int, comment: str | None, root: Path) -> None:
+    """Explicitly close an incident (requires the daemon)."""
+    root = root.resolve()
+    result = _require_daemon(
+        root,
+        "incident_close",
+        {"id": incident_id, "comment": comment},
+        "incident close",
+    )
+    outcome = result["outcome"]
+    if outcome == "closed":
+        click.echo(f"incident {incident_id} closed")
+    elif outcome == "already_closed":
+        # Desired end state already reached -> exit 0 (idempotent).
+        click.echo(f"incident {incident_id} was already closed")
+    else:
+        click.echo(f"no incident with id {incident_id}", err=True)
+        raise SystemExit(1)
+
+
+@main.group()
+def mute() -> None:
+    """Mute findings, or list active mutes."""
+
+
+@mute.command("add")
+@click.argument("dedup_key")
+@click.argument("duration")
+@click.option("--comment", default=None, help="Why this is muted.")
+@_ROOT_OPTION
+def mute_add(
+    dedup_key: str, duration: str, comment: str | None, root: Path
+) -> None:
+    """Mute findings with DEDUP_KEY for DURATION (e.g. 30m, 4h, 2d).
+
+    Requires the daemon. DURATION is <int><unit> with unit s/m/h/d; a
+    bare integer is rejected.
+    """
+    root = root.resolve()
+    result = _require_daemon(
+        root,
+        "mute",
+        {"dedup_key": dedup_key, "duration": duration, "comment": comment},
+        "mute add",
+    )
+    click.echo(f"muted {result['dedup_key']} until {result['expires_at']}")
+
+
+@mute.command("list")
+@_ROOT_OPTION
+def mute_list(root: Path) -> None:
+    """List active mutes (read-only; the daemon is optional).
+
+    Symmetric with `incident list`: goes through the control socket
+    but falls back to a read-only sqlite read when the daemon is down,
+    since listing in-effect mutes is safe without the writer.
+    """
+    root = root.resolve()
+    response = _request(root, "mute_list", {})
+    if response is not None:
+        if not response.get("ok"):
+            click.echo(f"error: {response.get('error')}", err=True)
+            raise SystemExit(1)
+        _render_mutes(response["result"])
+        return
+    _render_mutes_fallback(root)
+
+
+@main.command()
+@click.argument("finding_id", type=int)
+@_ROOT_OPTION
+def replay(finding_id: int, root: Path) -> None:
+    """Re-dispatch a finding to its target pipes (requires the daemon)."""
+    root = root.resolve()
+    result = _require_daemon(
+        root, "replay", {"finding_id": finding_id}, "replay"
+    )
+    outcome = result["outcome"]
+    if outcome == "requeued":
+        click.echo(
+            f"finding {finding_id} re-queued to {','.join(result['pipes'])}"
+        )
+    elif outcome == "already_queued":
+        # Already queued for every target pipe -> exit 0 (idempotent).
+        click.echo(f"finding {finding_id} already queued, no action")
+    else:
+        click.echo(f"no finding with id {finding_id}", err=True)
+        raise SystemExit(1)
+
+
+@main.command()
+@click.argument("source")
+@_ROOT_OPTION
+def reprocess(source: str, root: Path) -> None:
+    """Re-run triage for a source's observations (requires the daemon)."""
+    root = root.resolve()
+    result = _require_daemon(
+        root, "reprocess", {"source": source}, "reprocess"
+    )
+    count = result["observations"]
+    if count:
+        click.echo(
+            f"reprocess: {count} observations from {source} "
+            "will be re-triaged"
+        )
+    else:
+        # Empty is a valid end state, not an error -> exit 0.
+        click.echo(f"reprocess: no observations found for source {source}")
 
 
 def _render_health(result: dict[str, Any]) -> None:
@@ -263,5 +409,32 @@ def _render_incidents_fallback(root: Path) -> None:
                 "recently_closed": catalog.recently_closed_incidents(days=7),
             }
         )
+    finally:
+        connection.close()
+
+
+def _render_mutes(result: dict[str, Any]) -> None:
+    click.echo("active mutes:")
+    active = result["active"]
+    if not active:
+        click.echo("  none")
+    for m in active:
+        comment = m["comment"] if m["comment"] else "(none)"
+        click.echo(
+            f"  {m['dedup_key']}  expires {m['expires_at']}  comment: {comment}"
+        )
+
+
+def _render_mutes_fallback(root: Path) -> None:
+    status, _pid = _pid_status(root / "state" / "angelus.pid")
+    connection = _ro_connect(root / "state" / "angelus.sqlite3")
+    if connection is None:
+        click.echo(f"daemon: {status}")
+        click.echo("sqlite: unavailable")
+        return
+    click.echo(f"daemon: {status} (reading sqlite read-only)")
+    try:
+        catalog = Catalog(connection, root)
+        _render_mutes({"active": catalog.active_mutes()})
     finally:
         connection.close()

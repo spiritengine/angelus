@@ -732,3 +732,208 @@ class Catalog:
             """,
             (now, finding_id, now, source, entity),
         )
+
+    # --- slice 5b-2 control-socket write ops -----------------------------
+    #
+    # Every method below is synchronous and self-committing, like the rest
+    # of this class. The control-socket handlers that call them must not
+    # await between the db write and its commit (cancel-safety contract):
+    # keeping these synchronous is what guarantees that by construction.
+    # Each is idempotent under at-least-once delivery on natural state --
+    # there is no request-id/dedup cache anywhere.
+
+    def add_mute(
+        self, dedup_key: str, duration_seconds: int, comment: str | None
+    ) -> str:
+        """Insert a mute row and return its resolved expires_at.
+
+        A mute is a row, never an upsert. Re-applying the same mute op
+        (at-least-once retry) inserts another overlapping row; "is X
+        muted now?" is EXISTS a row with expires_at > now, so overlapping
+        rows are harmless and a retry leaves the same effective state.
+        The same shape also makes "extend the mute" correct: a later,
+        longer mute is just another row with a farther expires_at.
+        """
+        now_dt = _utcnow_dt()
+        expires_at = _format_time(now_dt + timedelta(seconds=duration_seconds))
+        self.connection.execute(
+            """
+            INSERT INTO mutes (dedup_key, expires_at, created_at, comment)
+            VALUES (?, ?, ?, ?)
+            """,
+            (dedup_key, expires_at, _format_time(now_dt), comment),
+        )
+        self.connection.commit()
+        return expires_at
+
+    def is_muted(self, dedup_key: str) -> bool:
+        """True if an unexpired mute exists for dedup_key. Read-only.
+
+        expires_at and utcnow() are the same fixed-width ISO8601 UTC
+        format (millisecond precision, Z suffix), so the lexicographic
+        `expires_at > ?` comparison is a correct time comparison and an
+        expired mute does not match -- no GC sweeper is needed.
+        """
+        row = self.connection.execute(
+            "SELECT 1 FROM mutes WHERE dedup_key = ? AND expires_at > ? LIMIT 1",
+            (dedup_key, utcnow()),
+        ).fetchone()
+        return row is not None
+
+    def active_mutes(self) -> list[dict[str, Any]]:
+        """Active mutes -- rows whose expires_at is still in the future.
+        Read-only; a plain SELECT, no write.
+
+        Symmetric with is_muted: the same `expires_at > now`
+        lexicographic predicate is the only mechanism, so an expired
+        mute simply does not appear and no GC sweeper is needed. The
+        operator listing mutes wants the ones in effect, so this is
+        active-only by design. Ordered by expires_at ascending --
+        soonest-to-lift first -- with id as a stable tiebreaker for
+        overlapping rows that share an expires_at.
+        """
+        rows = self.connection.execute(
+            """
+            SELECT dedup_key, expires_at, created_at, comment
+            FROM mutes
+            WHERE expires_at > ?
+            ORDER BY expires_at ASC, id ASC
+            """,
+            (utcnow(),),
+        )
+        return [dict(row) for row in rows]
+
+    def close_incident(
+        self, incident_id: int, comment: str | None
+    ) -> str:
+        """Close an open incident. Returns 'closed', 'already_closed', or
+        'not_found'.
+
+        Idempotent: the UPDATE is bounded to status='open', so a second
+        apply matches 0 rows and reports 'already_closed' with no
+        double-effect (the original closed_at/close_comment are untouched).
+        """
+        now = utcnow()
+        cursor = self.connection.execute(
+            """
+            UPDATE incidents
+            SET status = 'closed',
+                closed_at = ?,
+                close_comment = ?,
+                updated_at = ?
+            WHERE id = ? AND status = 'open'
+            """,
+            (now, comment, now, incident_id),
+        )
+        closed = cursor.rowcount == 1
+        self.connection.commit()
+        if closed:
+            return "closed"
+        row = self.connection.execute(
+            "SELECT 1 FROM incidents WHERE id = ?", (incident_id,)
+        ).fetchone()
+        return "already_closed" if row is not None else "not_found"
+
+    def replay_finding(
+        self, finding_id: int, known_pipes: set[str]
+    ) -> dict[str, Any]:
+        """Re-queue a finding to its still-known target pipes so the next
+        drain dispatches it again.
+
+        Returns {"outcome": "requeued"|"already_queued"|"not_found",
+        "finding_id": id, "pipes": [...]}.
+
+        Idempotency guard (mandatory): a (finding, pipe) that is already
+        'pending' is left untouched -- a double replay before any drain
+        therefore does not double-queue. A row in any other state
+        (dispatched/failed/suppressed) is reset to 'pending' so the
+        finding is genuinely re-dispatched; a missing row is inserted.
+        """
+        frow = self.connection.execute(
+            "SELECT target_pipes FROM findings WHERE id = ?", (finding_id,)
+        ).fetchone()
+        if frow is None:
+            return {"outcome": "not_found", "finding_id": finding_id, "pipes": []}
+        try:
+            target_pipes = json.loads(frow["target_pipes"] or "[]")
+        except json.JSONDecodeError:
+            target_pipes = []
+        requeued: list[str] = []
+        for pipe in target_pipes:
+            if pipe not in known_pipes:
+                continue
+            existing = self.connection.execute(
+                "SELECT status FROM pipe_queues WHERE finding_id = ? AND pipe = ?",
+                (finding_id, pipe),
+            ).fetchone()
+            if existing is None:
+                self.connection.execute(
+                    """
+                    INSERT INTO pipe_queues (finding_id, pipe, status)
+                    VALUES (?, ?, 'pending')
+                    """,
+                    (finding_id, pipe),
+                )
+                requeued.append(pipe)
+            elif existing["status"] != "pending":
+                self.connection.execute(
+                    """
+                    UPDATE pipe_queues
+                    SET status = 'pending',
+                        dispatched_at = NULL,
+                        next_attempt_at = NULL,
+                        attempts = 0,
+                        updated_at = ?
+                    WHERE finding_id = ? AND pipe = ? AND status != 'pending'
+                    """,
+                    (utcnow(), finding_id, pipe),
+                )
+                requeued.append(pipe)
+            # else: already 'pending' -> the guard. Skip so a double
+            # replay does not double-queue.
+        self.connection.commit()
+        if requeued:
+            return {
+                "outcome": "requeued",
+                "finding_id": finding_id,
+                "pipes": requeued,
+            }
+        return {
+            "outcome": "already_queued",
+            "finding_id": finding_id,
+            "pipes": [],
+        }
+
+    def reprocess_source(self, source: str) -> int:
+        """Delete observation_triage rows for observations from `source`
+        so the triage loop re-picks those observations
+        (ready_observations_for excludes observations that already have a
+        triage row). Returns the number of distinct observations that
+        will be re-triaged.
+
+        Idempotent: a second apply finds the rows already gone and
+        deletes nothing (0 observations). The DELETE is strictly bounded
+        to the given source via the observations subquery, the same
+        bounded-delete shape clear_triage_processing uses.
+        """
+        row = self.connection.execute(
+            """
+            SELECT COUNT(DISTINCT ot.observation_id) AS n
+            FROM observation_triage ot
+            JOIN observations o ON o.id = ot.observation_id
+            WHERE o.source = ?
+            """,
+            (source,),
+        ).fetchone()
+        count = int(row["n"])
+        self.connection.execute(
+            """
+            DELETE FROM observation_triage
+            WHERE observation_id IN (
+                SELECT id FROM observations WHERE source = ?
+            )
+            """,
+            (source,),
+        )
+        self.connection.commit()
+        return count
