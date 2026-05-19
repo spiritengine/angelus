@@ -35,17 +35,27 @@ class PipeDrain:
         # per-pipe loop's re-entrancy). What actually keeps a drain's view
         # consistent is three properties together: (1) drain_once reads the
         # three fields in consecutive await-free statements, so the event
-        # loop cannot interleave apply_lodging mid-snapshot; (2) apply_lodging
-        # only swaps drain.pipe for a *new* Pipe object on a pipe that is
-        # simultaneously being removed or moved off immediate cadence -- a
-        # pipe whose loop is being torn down, so no fresh drain_once observes
-        # a changed pipe beside stale channels; (3) a reload is single-entry
-        # and cross-ref-validated, so a pipe's channels are always a subset
-        # of the channels dict of the same reload generation. A
-        # mixed-generation snapshot (e.g. unchanged pipe + newer channels)
-        # is therefore still internally consistent and cannot KeyError. The
-        # is_muted check is keyed by the finding's dedup_key, independent of
-        # this snapshot, so reload churn cannot make it incoherent.
+        # loop cannot interleave apply_lodging mid-snapshot; (2) inside
+        # apply_lodging itself drain.pipe is reassigned UNCONDITIONALLY for
+        # every pipe in the old/new intersection (one statement near the
+        # top of the intersection loop, not gated on cadence change or
+        # tear-down), and the bottom for-loop re-points every drain's
+        # channels/known_pipes afterwards; the only `await` points inside a
+        # single apply_lodging invocation are the `await self._cancel_pipe_loop(...)`
+        # calls in remove and cadence-change branches, so in the common
+        # content-only edit case apply_lodging has no awaits at all and a
+        # drain_once cannot interleave any of its mutations -- when other
+        # pipes in the same reload DO trigger a cancel await, a drain_once
+        # on an untouched pipe may snapshot a (new-pipe, old-channels,
+        # old-known_pipes) mix, which is safe by (3); (3) a reload is
+        # single-entry and cross-ref-validated, so any pipe's channels are
+        # a subset of the channels dict of the same reload generation, and
+        # the test test_drain_snapshot_stays_internally_consistent_during_slow_reload
+        # pins this empirically (inverting it by injecting a ghost channel
+        # into new_pipe.channels at the intersection loop fails the subset
+        # assertion). The is_muted check is keyed by the finding's
+        # dedup_key, independent of this snapshot, so reload churn cannot
+        # make it incoherent.
         self.pipe = pipe
         self.channels = channels
         self.workdir = workdir
