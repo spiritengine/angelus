@@ -119,12 +119,18 @@ async def _kill_and_reap(process: asyncio.subprocess.Process) -> None:
     """SIGKILL a timed-out OR cancelled command's whole process group, then
     reap it within a hard ceiling.
 
-    Called from both the timeout and the CancelledError paths of
-    run_shell_source / run_dep_check. Daemon shutdown cancels the
-    APScheduler-submitted source-fire task (AsyncIOExecutor.shutdown just
-    .cancel()s pending futures); without reaping on cancel the check child
-    and its process group would survive the daemon, the same orphan a
-    non-reaped timeout produces.
+    Invoked on the timeout AND CancelledError paths of every daemon-driven
+    subprocess site -- source-fire and dep-check probes here in sources/,
+    push and email channel sends in channels/, and the digest LLM body
+    render in pipes/. Daemon shutdown cancels APScheduler-submitted source
+    and pipe-digest tasks (AsyncIOExecutor.shutdown just .cancel()s pending
+    futures); without reaping on cancel the child and its process group
+    would survive the daemon, the same orphan a non-reaped timeout
+    produces. Caller names are deliberately listed by area (sources /
+    channels / pipes), not enumerated -- new subprocess sites should adopt
+    this helper rather than grow yet another shape, and a per-name list
+    rots the moment they do (the prior "run_shell_source / run_dep_check"
+    enumeration was already wrong by the time the integration fell ran).
 
     Why the group and not just the shell: asyncio resolves
     `process.wait()` only when the subprocess transport is fully done --
