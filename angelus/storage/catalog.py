@@ -486,6 +486,69 @@ class Catalog:
         )
         return [dict(row) for row in rows]
 
+    def latest_source_fires(self) -> dict[str, str | None]:
+        """Most recent fired_at per source, from the source_fires ledger.
+        Read-only; used by the health control op."""
+        rows = self.connection.execute(
+            """
+            SELECT source_name, max(fired_at) AS last_fire_at
+            FROM source_fires
+            GROUP BY source_name
+            """
+        )
+        return {row["source_name"]: row["last_fire_at"] for row in rows}
+
+    def observations_pending_triage_count(self) -> int:
+        """Ready observations with no successful triage yet. Read-only.
+
+        'Pending' counts a ready observation until some triager has a
+        'success' row for it. Observations still retrying ('failed' with a
+        future next_attempt_at) or with no matching triager remain counted --
+        from an operator's view they are still waiting on triage.
+        """
+        row = self.connection.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM observations o
+            WHERE o.status = 'ready'
+              AND NOT EXISTS (
+                SELECT 1 FROM observation_triage ot
+                WHERE ot.observation_id = o.id AND ot.status = 'success'
+              )
+            """
+        ).fetchone()
+        return int(row["n"])
+
+    def findings_pending_dispatch_by_pipe(self) -> dict[str, int]:
+        """Pending pipe_queues rows grouped by pipe. Read-only."""
+        rows = self.connection.execute(
+            """
+            SELECT pipe, COUNT(*) AS n
+            FROM pipe_queues
+            WHERE status = 'pending'
+            GROUP BY pipe
+            """
+        )
+        return {row["pipe"]: int(row["n"]) for row in rows}
+
+    def recently_closed_incidents(self, days: int = 7) -> list[dict[str, Any]]:
+        """Incidents closed within the last `days` days (default 7).
+        Read-only; a plain SELECT, no write."""
+        cutoff = _format_time(_utcnow_dt() - timedelta(days=days))
+        rows = self.connection.execute(
+            """
+            SELECT i.*, f.severity
+            FROM incidents i
+            LEFT JOIN findings f ON f.id = i.latest_finding_id
+            WHERE i.status = 'closed'
+              AND i.closed_at IS NOT NULL
+              AND i.closed_at >= ?
+            ORDER BY i.closed_at DESC, i.id DESC
+            """,
+            (cutoff,),
+        )
+        return [dict(row) for row in rows]
+
     def clearance_findings_since(self, since: str | None) -> list[dict[str, Any]]:
         clause = "AND f.created_at > ?" if since else ""
         params: tuple[Any, ...] = (since,) if since else ()
