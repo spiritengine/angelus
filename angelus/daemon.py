@@ -18,7 +18,7 @@ from angelus.lodging import Lodging, ScheduledSource, load_lodging
 from angelus.lodging.reloader import LodgingReloader
 from angelus.pipes import PipeDrain
 from angelus.sources import run_shell_source
-from angelus.storage import Catalog, init_db
+from angelus.storage import Catalog, init_db, utcnow
 from angelus.triage import run_python_triager
 
 LOGGER = logging.getLogger(__name__)
@@ -67,6 +67,7 @@ class AngelusDaemon:
                 "incident_close": self._op_incident_close,
                 "replay": self._op_replay,
                 "reprocess": self._op_reprocess,
+                "dep_record": self._op_dep_record,
             },
         )
 
@@ -173,6 +174,10 @@ class AngelusDaemon:
             # storage is invented to fill this -- null until a real source
             # exists. Reported in the 5b-1 tender.
             "belfry": None,
+            # dep_health's mandatory reader (slice 5c): every row the
+            # dep_record write op upserts is surfaced here so a written dep
+            # status is never dead config. Read-only SELECT.
+            "deps": self.catalog.all_dep_health(),
         }
 
     async def _op_incident_list(self, _args: dict) -> dict:
@@ -236,6 +241,49 @@ class AngelusDaemon:
             raise ValueError("reprocess requires a non-empty source")
         count = self.catalog.reprocess_source(source)
         return {"source": source, "observations": count}
+
+    async def _op_dep_record(self, args: dict) -> dict:
+        """Record a dependency probe result (slice 5c).
+
+        A WRITE op, same construction as the four 5b-2 ops above: async
+        in signature only, no `await` in the body, so cancellation can
+        only land at the socket boundary and never with a write
+        transaction open. The dep-check cron probe never writes sqlite --
+        it sends this op and the daemon (single writer) does the upsert.
+
+        last_check_at is stamped here with utcnow() (the same ISO8601-UTC
+        format helper the rest of the schema uses): the probe sends the
+        result the instant its check finishes, so record time is the
+        check time, and stamping daemon-side keeps one clock and avoids
+        trusting a format from the unprivileged probe process.
+
+        On status='unhealthy' an internal/dep finding is emitted to `now`
+        AFTER the upsert (still no `await`). Each unhealthy record emits a
+        fresh finding -- repeats are NOT deduped, mirroring the slice-3
+        digest-failure contract: the operator keeps being told a
+        dependency is down until it recovers.
+        """
+        name = args.get("name")
+        status = args.get("status")
+        detail = args.get("detail")
+        if not isinstance(name, str) or not name:
+            raise ValueError("dep_record requires a non-empty name")
+        if status not in ("healthy", "unhealthy"):
+            raise ValueError(
+                "dep_record status must be 'healthy' or 'unhealthy'"
+            )
+        if detail is not None and not isinstance(detail, str):
+            raise ValueError("dep_record detail must be a string")
+        self.catalog.record_dep_health(name, status, utcnow(), detail)
+        if status == "unhealthy":
+            self.catalog.write_internal_finding(
+                "internal/dep",
+                "dependency_unhealthy",
+                name,
+                detail or "",
+                set(self.lodging.pipes),
+            )
+        return {"name": name, "status": status}
 
     def _install_signal_handlers(self) -> None:
         loop = asyncio.get_running_loop()

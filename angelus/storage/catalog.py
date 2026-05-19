@@ -937,3 +937,52 @@ class Catalog:
         )
         self.connection.commit()
         return count
+
+    # --- slice 5c dependency registry ------------------------------------
+    #
+    # Same construction as the 5b-2 write ops above: synchronous and
+    # self-committing, no request-id/dedup cache. Idempotency is the
+    # dep_health primary key + ON CONFLICT upsert -- re-applying the same
+    # dep_record yields the same end state. The _op_dep_record handler must
+    # not await between this write and its commit; keeping this synchronous
+    # is what guarantees that by construction.
+
+    def record_dep_health(
+        self,
+        dependency_name: str,
+        status: str,
+        last_check_at: str,
+        detail: str | None,
+    ) -> None:
+        """Upsert one dep_health row. The dependency_name PK + ON CONFLICT
+        is the entire idempotency mechanism: a retried dep_record overwrites
+        the row with identical values and leaves the same end state."""
+        self.connection.execute(
+            """
+            INSERT INTO dep_health (
+                dependency_name, status, last_check_at, detail, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (dependency_name) DO UPDATE SET
+                status = excluded.status,
+                last_check_at = excluded.last_check_at,
+                detail = excluded.detail,
+                updated_at = excluded.updated_at
+            """,
+            (dependency_name, status, last_check_at, detail, utcnow()),
+        )
+        self.connection.commit()
+
+    def all_dep_health(self) -> list[dict[str, Any]]:
+        """Every dep_health row, name-ordered. Read-only; a plain SELECT.
+
+        This is the mandatory reader for dep_health -- the health op
+        surfaces it so a written dep status is never dead config."""
+        rows = self.connection.execute(
+            """
+            SELECT dependency_name, status, last_check_at, detail, updated_at
+            FROM dep_health
+            ORDER BY dependency_name
+            """
+        )
+        return [dict(row) for row in rows]

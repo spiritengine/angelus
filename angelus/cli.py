@@ -21,6 +21,7 @@ or box-drawing.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import socket
@@ -32,6 +33,8 @@ from typing import Any
 import click
 
 from angelus.daemon import main as daemon_main
+from angelus.lodging.config import _load_dependencies
+from angelus.sources import run_dep_check
 from angelus.storage import Catalog
 
 _ROOT_OPTION = click.option(
@@ -319,6 +322,66 @@ def reprocess(source: str, root: Path) -> None:
         click.echo(f"reprocess: no observations found for source {source}")
 
 
+@main.command("dep-record")
+@click.argument("name")
+@click.argument("status", type=click.Choice(["healthy", "unhealthy"]))
+@click.option("--detail", default=None, help="Probe output or error.")
+@_ROOT_OPTION
+def dep_record(
+    name: str, status: str, detail: str | None, root: Path
+) -> None:
+    """Record a dependency health result (requires the daemon).
+
+    A WRITE: it goes through the daemon (the single sqlite writer) over
+    the control socket, never opens sqlite, and has no read-only
+    fallback. Normally invoked by `dep-check`; exposed directly for
+    testing and manual override.
+    """
+    root = root.resolve()
+    result = _require_daemon(
+        root,
+        "dep_record",
+        {"name": name, "status": status, "detail": detail},
+        "dep-record",
+    )
+    click.echo(f"recorded {result['name']}: {result['status']}")
+
+
+@main.command("dep-check")
+@click.argument("name")
+@_ROOT_OPTION
+def dep_check(name: str, root: Path) -> None:
+    """Run a dependency's check and report it (requires the daemon).
+
+    The cron-run probe. It loads only dependencies/<name>.yaml (not the
+    rest of the lodging -- a dep check must not couple to unrelated
+    lodging or to daemon APScheduler liveness), runs the check command
+    with the shared kill-on-timeout subprocess helper, then sends the
+    result as a dep_record over the control socket. It never opens
+    sqlite; the daemon performs the write. A missing/refused socket is a
+    hard non-zero exit (the cron tick fails loudly; the next tick
+    retries) -- the same daemon-required contract as the other writes.
+    """
+    root = root.resolve()
+    dependencies = _load_dependencies(root)
+    dependency = dependencies.get(name)
+    if dependency is None:
+        click.echo(
+            f"no enabled dependency lodged as {name!r} "
+            f"(looked in {root / 'dependencies'})",
+            err=True,
+        )
+        raise SystemExit(1)
+    status, detail = asyncio.run(run_dep_check(dependency))
+    result = _require_daemon(
+        root,
+        "dep_record",
+        {"name": name, "status": status, "detail": detail},
+        "dep-check",
+    )
+    click.echo(f"{result['name']}: {result['status']} ({detail})")
+
+
 def _render_health(result: dict[str, Any]) -> None:
     daemon_info = result["daemon"]
     click.echo("daemon: running")
@@ -344,6 +407,22 @@ def _render_health(result: dict[str, Any]) -> None:
     click.echo(
         f"last belfry ping: {belfry if belfry is not None else 'not recorded'}"
     )
+    _render_deps(result.get("deps") or [])
+
+
+def _render_deps(deps: list[dict[str, Any]]) -> None:
+    """Plain text, one dependency per line; detail only when unhealthy.
+    Screen-reader friendly: no tables or columns."""
+    click.echo("dependencies:")
+    if not deps:
+        click.echo("  none")
+    for dep in deps:
+        click.echo(
+            f"  {dep['dependency_name']}: {dep['status']} "
+            f"(last check {dep['last_check_at']})"
+        )
+        if dep["status"] == "unhealthy" and dep.get("detail"):
+            click.echo(f"    detail: {dep['detail']}")
 
 
 def _render_health_fallback(root: Path) -> None:
@@ -367,6 +446,9 @@ def _render_health_fallback(root: Path) -> None:
             click.echo("  none")
         for pipe in sorted(pending):
             click.echo(f"  {pipe}: {pending[pipe]}")
+        # dep_health is a plain table read; surface it in the daemon-down
+        # path too (read-only), so dep status is visible without the daemon.
+        _render_deps(catalog.all_dep_health())
     finally:
         connection.close()
     click.echo("(sources and next-fire times need the daemon)")

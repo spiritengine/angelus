@@ -60,11 +60,19 @@ class Channel:
 
 
 @dataclass(frozen=True)
+class Dependency:
+    name: str
+    check: str
+    timeout_seconds: float = 30.0
+
+
+@dataclass(frozen=True)
 class Lodging:
     sources: dict[str, ScheduledSource]
     triagers: dict[str, Triager]
     pipes: dict[str, Pipe]
     channels: dict[str, Channel]
+    dependencies: dict[str, Dependency]
 
 
 def load_lodging(root: Path) -> Lodging:
@@ -73,6 +81,7 @@ def load_lodging(root: Path) -> Lodging:
         triagers=_load_triagers(root),
         pipes=_load_pipes(root),
         channels=_load_channels(root),
+        dependencies=_load_dependencies(root),
     )
     errors = validate_cross_refs(lodging)
     if errors:
@@ -183,6 +192,31 @@ def parse_channel(path: Path) -> Channel:
     )
 
 
+def parse_dependency(path: Path) -> Dependency:
+    """Parse a dependencies/<name>.yaml lodging file.
+
+    One check mechanism by design: `check` is a single shell command,
+    exit 0 = healthy, non-zero = unhealthy. The spec mentions a
+    "tripwire URL"; the deliberate simplification is that a tripwire-URL
+    dependency is just a check command that curls the URL (e.g.
+    `curl -fsS https://hc-ping.com/...`). No polymorphic probe-type
+    framework -- the single check command, run via the same
+    subprocess+kill-on-timeout pattern the sources already use, covers
+    URL pings and local CLIs alike.
+    """
+    data = _read_yaml(path)
+    name = _required_str(data, "name", path)
+    if name != path.stem:
+        raise ValueError(
+            f"{path}: name {name!r} must match filename stem {path.stem!r}"
+        )
+    return Dependency(
+        name=name,
+        check=_required_str(data, "check", path),
+        timeout_seconds=_optional_timeout(data, path, 30.0),
+    )
+
+
 def _enabled_yaml_files(directory: Path) -> list[Path]:
     """Return *.yaml files under directory, skipping any that have a sibling
     .disabled twin (or are themselves named *.yaml.disabled)."""
@@ -225,6 +259,14 @@ def _load_channels(root: Path) -> dict[str, Channel]:
     for path in _enabled_yaml_files(root / "channels"):
         channel = parse_channel(path)
         loaded[channel.name] = channel
+    return loaded
+
+
+def _load_dependencies(root: Path) -> dict[str, Dependency]:
+    loaded: dict[str, Dependency] = {}
+    for path in _enabled_yaml_files(root / "dependencies"):
+        dependency = parse_dependency(path)
+        loaded[dependency.name] = dependency
     return loaded
 
 
