@@ -495,17 +495,17 @@ class AngelusDaemon:
         # await in this method: queueing on the semaphore, queueing on
         # the per-triager lock, or inside _run_triager itself. In every
         # one of those cases mark_triage_processing has already written
-        # the row, so we must clear it on the way out -- recover_writing_rows
-        # does not touch observation_triage and ready_observations_for
-        # excludes 'processing' rows, so an unrecovered row would orphan
-        # the observation across daemon restarts. clear_triage_processing
-        # is bounded to status='processing', so a transition that
-        # legitimately landed at 'success'/'failed' (which can only have
-        # happened inside _run_triager BEFORE its own cancel arm fired)
-        # is not clobbered. _run_triager's CancelledError arm still does
-        # the clear itself for the mid-flight case so the log line there
-        # stays accurate, but if a cancel arrives during semaphore/lock
-        # acquisition this outer arm is the only thing that runs.
+        # the row (in _triage_loop's caller, before the task was created),
+        # so we must clear it on the way out -- recover_writing_rows does
+        # not touch observation_triage and ready_observations_for excludes
+        # 'processing' rows, so an unrecovered row would orphan the
+        # observation across daemon restarts. clear_triage_processing is
+        # bounded to status='processing', so a transition that legitimately
+        # landed at 'success'/'failed' (which can only have happened inside
+        # _run_triager BEFORE the cancellation arrived) is not clobbered.
+        # The outer arm catches all three cancellation landing points
+        # uniformly; an inner arm in _run_triager is unnecessary because
+        # CancelledError propagates out through async with and lands here.
         try:
             async with self.triage_semaphore:
                 triager = self.lodging.triagers.get(triager_name)

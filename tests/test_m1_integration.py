@@ -425,14 +425,14 @@ def test_full_daemon_shutdown_reaps_python_triager_subprocess(
         )
     # observation_triage 'processing' rows must NOT survive a
     # shutdown-cancel. mark_triage_processing ran before the task was
-    # created (daemon.py _triage_loop); without _run_triager's
+    # created (daemon.py _triage_loop); without _triage_under_semaphore's
     # CancelledError arm calling clear_triage_processing, the row would
     # stay 'processing' forever, recover_writing_rows doesn't touch
     # observation_triage, and ready_observations_for excludes
     # 'processing' rows -- so the observation would be permanently stuck
     # after a daemon restart. (Discrimination axis: remove the
-    # CancelledError arm in _run_triager -> this assertion fails because
-    # the row stays at 'processing'.)
+    # CancelledError arm in _triage_under_semaphore -> this assertion
+    # fails because the row stays at 'processing'.)
     import sqlite3
     conn = sqlite3.connect(str(tmp_path / "state" / "angelus.sqlite3"))
     try:

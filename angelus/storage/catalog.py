@@ -127,13 +127,19 @@ class Catalog:
         self, observation_id: int, triager_name: str
     ) -> None:
         """Delete a 'processing' observation_triage row when its triager
-        was hot-removed mid-flight. Called from either None-check site:
-        after the triage semaphore is acquired but before the per-triager
-        lock (triager removed between mark_triage_processing and task
-        start), or after the per-triager lock is acquired (triager
-        removed while a sibling task held the lock). Bounded to
-        status='processing' so a legit concurrent transition to
-        'success'/'failed' is not clobbered."""
+        no longer needs the row to exist -- a hot-remove or a shutdown-
+        cancel both reach this. Bounded to status='processing' so a legit
+        concurrent transition to 'success'/'failed' is not clobbered.
+
+        Callers (in angelus/daemon.py): the two triager-hot-removed
+        None-check sites in _triage_under_semaphore / _triage_loop (each
+        delegated through _clear_triage_for_removed_triager), and the
+        outer CancelledError arm in _triage_under_semaphore that fires
+        when _triage_loop's shutdown-finally cancels in-flight tasks.
+        Caller names are listed by intent (hot-remove / shutdown-cancel),
+        not enumerated by function -- a per-function list rots the
+        moment a new caller adopts the helper (the same trap class that
+        bit _kill_and_reap's docstring across the M1 fell)."""
         self.connection.execute(
             """
             DELETE FROM observation_triage
