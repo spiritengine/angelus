@@ -571,6 +571,15 @@ def test_daemon_down_write_commands_exit_nonzero_no_write(tmp_path) -> None:
     catalog = Catalog(connection, tmp_path)
     incident_id = _open_incident(catalog)
     finding_id = _write_now_finding(catalog, "scheduled/down/example")
+    # A triaged observation for the reprocess target source: reprocess
+    # deletes observation_triage rows for its source, so a refused
+    # reprocess must leave this row intact (mirrors the replay queue-row
+    # assertion below).
+    triaged_oid = catalog.write_observation(
+        "scheduled/down", {"v": 1}, {"source": "scheduled/down"}
+    )
+    catalog.mark_triage_processing(triaged_oid, "noop")
+    catalog.mark_triage_success(triaged_oid, "noop")
     connection.close()
 
     runner = CliRunner()
@@ -607,6 +616,13 @@ def test_daemon_down_write_commands_exit_nonzero_no_write(tmp_path) -> None:
         # _write_now_finding queued exactly one pipe row; replay being
         # refused (daemon down) must not have re-queued or duplicated it.
         assert pending == 1
+        triage_rows = check.execute(
+            "SELECT COUNT(*) AS n FROM observation_triage WHERE observation_id = ?",
+            (triaged_oid,),
+        ).fetchone()["n"]
+        # The seeded observation had exactly one triage row; reprocess
+        # being refused (daemon down) must not have deleted it.
+        assert triage_rows == 1
     finally:
         check.close()
 
