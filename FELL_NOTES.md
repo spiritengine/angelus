@@ -338,3 +338,79 @@ Docs:
 ## Unresolved
 
 None.
+
+## Round 2 — readonly fell findings + fixes
+
+A strict readonly fell against the round-1 diff filed three blocking
+findings. All three addressed in this same shard.
+
+### issue-20260519-e5hr — non-discriminating test removed
+
+Round-1 added `test_dep_record_concurrent_with_dependency_reload_is_consistent`.
+The readonly fell flagged it as sequential masquerading as concurrent:
+`_op_dep_record`'s body has zero awaits (verified in `angelus/daemon.py`;
+the op's own docstring states the property), so `await daemon._op_dep_record(...)`
+runs to completion without yielding to the event loop. A reload task created
+beforehand with `asyncio.create_task` cannot interleave inside `_op_dep_record`.
+
+Decided option (b): no real concurrent window exists inside `_op_dep_record`
+that is worth a separate test. dep_record is structurally one of the
+control ops whose `set(self.lodging.pipes)` read is exactly the lodging
+read Risk 1 exercises via replay. The test is replaced with a comment
+in `tests/test_m1_integration.py` pointing to
+`test_control_op_sees_coherent_lodging_during_slow_reload` and stating
+why the dep-specific test reduced to that one. Test count: 127 → 126.
+
+Discrimination evidence for the comment: not applicable (deletion).
+The pointed-to test (Risk 1) is itself discriminating — round-1 inversion
+already recorded above: moving `self.lodging = new_lodging` after the
+`await _cancel_pipe_loop` makes it fail at `{'extra','now'} != {'now'}`.
+
+### issue-20260519-e6xz — PipeDrain docstring property (2) corrected
+
+Round-1 PipeDrain `__init__` docstring claim (2) stated drain.pipe is
+only swapped on pipes simultaneously being torn down or moved off
+immediate cadence. Reading `apply_lodging`: `drain.pipe = new_pipe`
+runs UNCONDITIONALLY in the intersection loop, not gated on cadence
+change or removal. The actual safety, in the common content-only edit
+case, is that apply_lodging has no awaits at all; in the multi-pipe
+cadence-change case, an `await self._cancel_pipe_loop(...)` for another
+pipe can interleave a drain_once on an untouched drain whose .pipe is
+already new but .channels/.known_pipes are still old. That mixed-
+generation snapshot stays safe by property (3): single-entry +
+cross-ref-validated reload makes any pipe's channels a subset of the
+channels dict of the same reload generation, and the existing
+`test_drain_snapshot_stays_internally_consistent_during_slow_reload`
+pins the cross-generation case empirically. Rewritten the property (2)
+text to state this accurately.
+
+Discrimination evidence: no test change; the existing inversion (ghost
+channel into new_pipe.channels) still fails the subset assertion.
+
+### issue-20260519-93p7 — _kill_and_reap docstring caller list de-rotted
+
+After round-1 the helper was wired into five callers (sources/runner
+twice, channels/push, channels/email, pipes/runner) but the docstring
+still said "Called from … run_shell_source / run_dep_check." Rephrased
+to a durable area-level statement (sources / channels / pipes) with an
+explicit note that the prior name enumeration rotted the moment new
+sites adopted the helper, so new sites should adopt the helper rather
+than grow yet another shape. No code change beyond the docstring.
+
+### Round 2 final pytest
+
+`PYTHONPATH=$PWD python -m pytest` — **126 passed**. (127 → 126 by
+design: the non-discriminating test was removed without a replacement,
+the comment in its place explains why.)
+
+### Original three real bug fixes — still intact
+
+* Risk 2 dep_health prune: `Catalog.delete_dep_health` + apply_lodging
+  prune loop unchanged. Covered by
+  `test_dep_health_pruned_when_dependency_hot_removed`.
+* Risk 3 CancelledError + `_kill_and_reap` at five subprocess sites:
+  unchanged except for the docstring at the helper site itself.
+  Covered by `test_full_daemon_shutdown_is_bounded_and_reaps_source_subprocess`
+  and `test_full_daemon_shutdown_reaps_digest_llm_subprocess`.
+* All three original inversion records (Risk 1, 2, 3, 4) still hold
+  against the post-round-2 code.
