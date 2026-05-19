@@ -14,24 +14,29 @@ _MAX_DEP_DETAIL = 4000
 
 # Hard ceiling on the post-timeout reap. With the whole process group
 # killed the child tree is gone and wait() returns at once; this only
-# guards the pathological case (an unkillable/zombie tree) so a cron
-# probe can never hang forever -- a hung probe is the worst outcome.
+# guards the pathological case (an unkillable/zombie tree) so a timed-out
+# command can never hang the caller forever.
 _REAP_TIMEOUT = 5.0
 
 
 async def run_shell_source(source: ScheduledSource) -> tuple[bool, dict[str, object]]:
+    # start_new_session + the process-group kill on timeout: identical
+    # hardening to run_dep_check, and for the same reason (see
+    # _kill_and_reap). This is the live daemon scheduled-fire path, so a
+    # forking check command that times out would otherwise leak an
+    # orphaned grandchild + its inherited fds on every fire.
     process = await asyncio.create_subprocess_shell(
         source.command,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
     try:
         stdout, stderr = await asyncio.wait_for(
             process.communicate(), timeout=source.timeout_seconds
         )
     except TimeoutError:
-        process.kill()
-        await process.wait()
+        await _kill_and_reap(process)
         return False, {
             "error": f"shell check timed out after {source.timeout_seconds:g}s",
             "timeout_seconds": source.timeout_seconds,
@@ -69,14 +74,8 @@ async def run_dep_check(dependency: Dependency) -> tuple[str, str]:
     result to the daemon over the control socket.
     """
     # start_new_session puts the check in its own process group so a
-    # timeout kill takes the WHOLE tree, not just the shell. dash/sh -c
-    # forks the real command as a child; SIGKILL to the shell alone
-    # orphans that child, which keeps the stdout/stderr pipes open and
-    # makes asyncio's process.wait() block until those pipes drain (i.e.
-    # until the orphan exits on its own -- a full hang for `sleep 30`).
-    # Killing the group avoids that. (run_shell_source still has this
-    # latent hang on its own shell-timeout path; out of scope here,
-    # flagged in the slice-5c tender.)
+    # timeout kills the WHOLE tree, not just the shell (see _kill_and_reap
+    # for why the shell alone is not enough).
     process = await asyncio.create_subprocess_shell(
         dependency.check,
         stdout=asyncio.subprocess.PIPE,
@@ -88,9 +87,7 @@ async def run_dep_check(dependency: Dependency) -> tuple[str, str]:
             process.communicate(), timeout=dependency.timeout_seconds
         )
     except TimeoutError:
-        _kill_process_group(process)
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(process.wait(), _REAP_TIMEOUT)
+        await _kill_and_reap(process)
         return "unhealthy", (
             f"check timed out after {dependency.timeout_seconds:g}s"
         )
@@ -100,6 +97,30 @@ async def run_dep_check(dependency: Dependency) -> tuple[str, str]:
         return "healthy", _trim_detail(out or "ok")
     parts = [p for p in (f"exit {process.returncode}", err or out) if p]
     return "unhealthy", _trim_detail(": ".join(parts))
+
+
+async def _kill_and_reap(process: asyncio.subprocess.Process) -> None:
+    """SIGKILL the timed-out command's whole process group, then reap it
+    within a hard ceiling.
+
+    Why the group and not just the shell: asyncio's child watcher reaps
+    the DIRECT child (the shell) promptly once SIGKILL lands, so
+    process.wait() returns at once -- there is no pipe-drain hang. The
+    defect a plain process.kill() leaves is for a FORKING check command:
+    `sh -c` forks the real work as a grandchild, and SIGKILL to the shell
+    alone orphans that grandchild (it reparents to init) with the
+    stdout/stderr fds it inherited still open -- a leaked process + leaked
+    fds that accumulate every timeout. Killing the whole process group
+    reaps the grandchild too. (A non-forking simple command like
+    `sleep 30` is exec'd by dash directly, so it has no grandchild and
+    neither leaks nor hangs -- which is exactly why it cannot test this.)
+
+    The bounded reap only guards a pathological unkillable/zombie tree so
+    the caller can never hang forever.
+    """
+    _kill_process_group(process)
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(process.wait(), _REAP_TIMEOUT)
 
 
 def _kill_process_group(process: asyncio.subprocess.Process) -> None:

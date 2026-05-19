@@ -29,7 +29,9 @@ other write ops, where those contract tests live.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import os
 import shutil
 import sqlite3
 import time
@@ -37,9 +39,9 @@ from pathlib import Path
 
 from angelus.daemon import AngelusDaemon
 from angelus.lodging import Dependency
-from angelus.lodging.config import _load_dependencies, parse_dependency
+from angelus.lodging.config import ScheduledSource, _load_dependencies, parse_dependency
 from angelus.lodging.reloader import LodgingReloader, _identify
-from angelus.sources import run_dep_check
+from angelus.sources import run_dep_check, run_shell_source
 from angelus.storage import init_db
 from angelus.storage.migrations import DEFAULT_MIGRATIONS_DIR, migrate
 
@@ -380,19 +382,102 @@ def test_run_dep_check_healthy_and_unhealthy() -> None:
     assert "boom" in unhealthy[1]
 
 
-def test_run_dep_check_kills_hung_command_on_timeout() -> None:
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _forking_hang_command(marker: Path) -> str:
+    """A FORKING command: dash stays resident and the real work runs as a
+    backgrounded grandchild whose pid is written to `marker`.
+
+    A forking command is REQUIRED, not incidental. With a non-forking
+    simple command (`sleep 30`) dash execs it directly, so the subprocess
+    pid IS the sleep -- a plain process.kill() on the shell reaps it just
+    as fast and the test would pass with OR without the process-group
+    hardening (non-discriminating). With this forking command an
+    un-hardened kill of the shell alone orphans the grandchild (it
+    survives, reparented to init); only the start_new_session +
+    process-group SIGKILL reaps it. Do not "simplify" this back to a
+    bare `sleep 30`.
+    """
+    return f"sleep 30 & echo $! > {marker}; wait"
+
+
+def _read_grandchild_pid(marker: Path) -> int:
+    for _ in range(200):
+        if marker.exists():
+            text = marker.read_text().strip()
+            if text:
+                return int(text)
+        time.sleep(0.01)
+    raise AssertionError("grandchild never recorded its pid")
+
+
+def _assert_grandchild_reaped(pid: int) -> None:
+    for _ in range(200):
+        if not _pid_alive(pid):
+            return
+        time.sleep(0.01)
+    # Best-effort cleanup so a failing (un-hardened) run does not leak a
+    # 30s sleep for the rest of the suite.
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, 9)
+    raise AssertionError(
+        f"grandchild pid {pid} still alive after timeout kill -- the "
+        "process-group hardening did not reap the orphaned child"
+    )
+
+
+def test_run_dep_check_kills_hung_command_on_timeout(tmp_path) -> None:
+    marker = tmp_path / "grandchild.pid"
     started = time.monotonic()
     status, detail = asyncio.run(
         run_dep_check(
-            Dependency(name="x", check="sleep 30", timeout_seconds=0.3)
+            Dependency(
+                name="x",
+                check=_forking_hang_command(marker),
+                timeout_seconds=0.3,
+            )
         )
     )
     elapsed = time.monotonic() - started
     assert status == "unhealthy"
     assert "timed out" in detail
-    # The hung command was killed, not waited out: returns ~immediately
-    # after the 0.3s timeout, nowhere near the 30s sleep.
+    # Returns ~immediately after the 0.3s timeout, nowhere near 30s.
     assert elapsed < 5
+    # The discriminating assertion: the forking command's grandchild was
+    # actually reaped by the process-group kill, not left orphaned.
+    _assert_grandchild_reaped(_read_grandchild_pid(marker))
+
+
+def test_run_shell_source_kills_hung_command_on_timeout(tmp_path) -> None:
+    # run_shell_source is the LIVE daemon scheduled-fire path; it gets the
+    # same process-group hardening as run_dep_check. Same discriminating
+    # shape: a forking command whose grandchild must be reaped on timeout.
+    marker = tmp_path / "grandchild.pid"
+    started = time.monotonic()
+    ok, payload = asyncio.run(
+        run_shell_source(
+            ScheduledSource(
+                name="watch",
+                source_ref="scheduled/watch",
+                cadence="1h",
+                command=_forking_hang_command(marker),
+                timeout_seconds=0.3,
+            )
+        )
+    )
+    elapsed = time.monotonic() - started
+    assert ok is False
+    assert "timed out" in payload["error"]
+    assert elapsed < 5
+    _assert_grandchild_reaped(_read_grandchild_pid(marker))
 
 
 # --- the lodged checks must NOT send -------------------------------------

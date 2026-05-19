@@ -196,6 +196,17 @@ def test_daemon_down_health_reads_sqlite(tmp_path) -> None:
     connection = init_db(state / "angelus.sqlite3")
     catalog = Catalog(connection, tmp_path)
     catalog.write_observation("scheduled/watch", {"url": "x"}, {"source": "scheduled/watch"})
+    # Slice 5c (Contract D): dep_health is a mandatory reader on the
+    # daemon-DOWN path too -- _render_health_fallback surfaces it over
+    # the read-only sqlite connection. This fails if cli.py's
+    # _render_deps(catalog.all_dep_health()) fallback line is removed.
+    catalog.record_dep_health(
+        "skein", "healthy", "2026-05-19T00:00:00.000Z", "ok"
+    )
+    catalog.record_dep_health(
+        "patbot-email", "unhealthy",
+        "2026-05-19T00:05:00.000Z", "exit 2: auth failed"
+    )
     connection.close()
 
     result = CliRunner().invoke(main, ["health", "--root", str(tmp_path)])
@@ -203,6 +214,9 @@ def test_daemon_down_health_reads_sqlite(tmp_path) -> None:
     assert result.exit_code == 0, result.output
     assert "daemon: not running" in result.output
     assert "observations pending triage: 1" in result.output
+    assert "skein: healthy" in result.output
+    assert "patbot-email: unhealthy" in result.output
+    assert "detail: exit 2: auth failed" in result.output
 
 
 def test_daemon_down_incident_list_reads_sqlite(tmp_path) -> None:
