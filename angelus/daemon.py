@@ -468,6 +468,17 @@ class AngelusDaemon:
                 await asyncio.sleep(0.1 if did_work or in_flight else 1)
         finally:
             if in_flight:
+                # Triager subprocesses (run_python_triager) await
+                # process.communicate() and have no external canceller
+                # (APScheduler cancels source-fire and pipe-digest tasks
+                # but not these). Without cancelling here, a triager
+                # stuck waiting on its subprocess hangs shutdown until
+                # the triager's own timeout_seconds fires. Cancel first,
+                # then gather: each task's CancelledError arm runs
+                # _kill_and_reap on the subprocess (triage/runner.py),
+                # so the subprocess tree is reaped before we return.
+                for task in in_flight:
+                    task.cancel()
                 await asyncio.gather(*in_flight, return_exceptions=True)
                 self._reap_triage_tasks(in_flight)
 

@@ -414,3 +414,85 @@ the comment in its place explains why.)
   and `test_full_daemon_shutdown_reaps_digest_llm_subprocess`.
 * All three original inversion records (Risk 1, 2, 3, 4) still hold
   against the post-round-2 code.
+
+## Round 3 — soft-fell rescue caught (issue-20260519-df5h)
+
+Round-3 readonly fell of the round-2 delta came back CLEAN on e5hr /
+e6xz / 93p7 but enumerated a separate docstring inaccuracy in
+`_kill_and_reap`: the prior round-2 wording said "every daemon-driven
+subprocess site" and listed dep-check among them, but `run_dep_check`
+is invoked from `cli.py` by cron (a CLI process, not the daemon). The
+fell self-talked-down from filing ("below my threshold"). The brief is
+strict that anything worth flagging is a finding and "no middle
+category"; the self-talk-down is the soft-fell pattern Patrick rejects.
+spook-0519 filed `issue-20260519-df5h` and fixed it in `1b426e6`:
+rephrased to "every subprocess site angelus runs" with a per-site
+cancellation-source paragraph (daemon shutdown for source-fire and
+pipe-digest, drain-task cancel for push/email, operator interrupt for
+the cron-fired dep-check probe). No code change, docstring only.
+
+## Round 4 — sixth subprocess site missed (issue-20260519-n59k)
+
+The round-3 docstring broadening from "every daemon-driven" to "every
+subprocess site angelus runs" claimed universal coverage and was
+contradicted by a sixth site round-1 had missed: `run_python_triager`
+in `angelus/triage/runner.py`. It was using naive `process.kill()` +
+`process.wait()` on timeout, had no `start_new_session=True`, no
+`CancelledError` arm, and routed through neither `_kill_and_reap` nor
+`_kill_process_group`. Round-4 fell filed `issue-20260519-n59k`.
+
+Writing the discriminating test surfaced a second, more fundamental
+bug: `_triage_loop`'s finally gathered the in-flight triager tasks
+WITHOUT cancelling them. The existing Risk-3 source-fire and
+digest-LLM tests pass because APScheduler's executor cancels their
+tasks externally on shutdown; the triage loop has no such external
+canceller. A triager stuck in `process.communicate()` hangs daemon
+shutdown indefinitely (the test fails with TimeoutError on
+`await asyncio.wait_for(task, timeout=15.0)`). The CancelledError arm
+in `run_python_triager` never fires because the wrapping task is
+never cancelled.
+
+### Fix (round 4, single logical change across coupled files)
+
+* `angelus/triage/runner.py` `run_python_triager`: imported
+  `_kill_and_reap` from `angelus.sources.runner`; added
+  `start_new_session=True` to `create_subprocess_exec`; replaced the
+  naive timeout kill with `await _kill_and_reap(process)`; added the
+  `except asyncio.CancelledError: await _kill_and_reap(process); raise`
+  arm.
+* `angelus/daemon.py` `_triage_loop`: finally block now cancels every
+  in-flight triager task before gathering, so the CancelledError arm
+  actually fires and the subprocess tree is reaped before shutdown
+  returns.
+* `angelus/sources/runner.py` `_kill_and_reap` docstring: area
+  enumeration extended to include triage/ alongside sources, channels,
+  pipes.
+
+### Discriminating test
+
+`tests/test_m1_integration.py::test_full_daemon_shutdown_reaps_python_triager_subprocess`.
+
+Two-axis discrimination (both inversions performed in the worktree,
+each reverted after observation):
+
+* Invert the cancel-before-gather in `_triage_loop`'s finally
+  (restore the round-1 gather-only shape) -> the test fails at
+  `await asyncio.wait_for(task, timeout=15.0)` with a TimeoutError —
+  shutdown hangs because the triager task is never cancelled and the
+  CancelledError arm never fires.
+* Restore the cancel loop, then remove the `except asyncio.CancelledError`
+  arm from `run_python_triager` -> the test fails at the post-driver
+  poll: the sleep grandchild survives shutdown
+  (`AssertionError: triager grandchild N survived shutdown -- cancelled
+  python triager subprocess was orphaned`).
+
+Both axes are necessary; either one alone leaves a real bug. After
+restore, 127 passed in 27.44s.
+
+### Final state
+
+Risk 3 hardening now covers SIX subprocess sites uniformly: source-fire,
+dep-check probe, push channel, email channel, digest LLM render, and
+python triager. The cancel-before-gather pattern is documented inline
+in `_triage_loop`. The `_kill_and_reap` docstring's area enumeration
+matches the code.

@@ -121,8 +121,8 @@ async def _kill_and_reap(process: asyncio.subprocess.Process) -> None:
 
     Invoked on the timeout AND CancelledError paths of every subprocess
     site angelus runs -- source-fire and dep-check probes here in sources/,
-    push and email channel sends in channels/, and the digest LLM body
-    render in pipes/. Cancellation sources differ by site: daemon shutdown
+    push and email channel sends in channels/, the digest LLM body render
+    in pipes/, and the python triager subprocess in triage/. Cancellation sources differ by site: daemon shutdown
     cancels APScheduler-submitted source-fire and pipe-digest tasks
     (AsyncIOExecutor.shutdown just .cancel()s pending futures), the
     channel-send sites are cancelled when their drain task is cancelled,

@@ -346,6 +346,85 @@ def test_full_daemon_shutdown_reaps_digest_llm_subprocess(
         )
 
 
+def test_full_daemon_shutdown_reaps_python_triager_subprocess(
+    tmp_path, monkeypatch,
+) -> None:
+    """run_python_triager spawns a sys.executable subprocess for python
+    triagers, awaited from _triage_loop which is one of daemon.tasks
+    cancelled in daemon.run()'s finally. A forking triager (one that
+    exec's another tool or shells out) must not orphan its grandchild
+    on shutdown, same property the source-fire and digest-LLM tests
+    pin.
+
+    Discrimination (recorded in FELL_NOTES): removing the CancelledError
+    arm OR `start_new_session=True` from run_python_triager leaves the
+    forking grandchild alive after shutdown -> this test fails.
+    """
+    marker = tmp_path / "tri_child.pid"
+    _base_lodging(tmp_path)
+    # The triager handler is a python script that immediately execvp's a
+    # shell with the forking-hang pattern. start_new_session=True on
+    # create_subprocess_exec puts the whole tree in a fresh process group;
+    # SIGKILL to the python process leader only does NOT reap the sleep
+    # grandchild -- only the process-group kill via _kill_and_reap does.
+    handler_dir = tmp_path / "triagers" / "handlers"
+    handler_dir.mkdir(parents=True)
+    handler_path = handler_dir / "fork_hang.py"
+    handler_path.write_text(
+        "import os, sys\n"
+        "sys.stdin.read()  # consume the daemon's payload write\n"
+        f"os.execvp('sh', ['sh', '-c', 'sleep 30 & echo $! > {marker}; wait'])\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "triagers").mkdir(exist_ok=True)
+    (tmp_path / "triagers" / "watch.yaml").write_text(
+        "inputs:\n  source: scheduled/watch\n"
+        "handler:\n  kind: python\n  path: triagers/handlers/fork_hang.py\n"
+        "timeout_seconds: 60\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ANGELUS_DRY_RUN", "1")
+
+    async def driver() -> int:
+        daemon = AngelusDaemon(tmp_path)
+        task = asyncio.create_task(daemon.run())
+        try:
+            # Wait for the source to fire, the triager to spawn, and the
+            # forking handler to write its grandchild pid.
+            for _ in range(400):
+                if marker.exists() and marker.read_text().strip():
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                raise AssertionError("triager subprocess never launched its grandchild")
+            gc_pid = int(marker.read_text().strip())
+            assert _alive(gc_pid)
+
+            started = time.monotonic()
+            daemon.request_stop()
+            await asyncio.wait_for(task, timeout=15.0)
+            elapsed = time.monotonic() - started
+            assert elapsed < 8.0, f"shutdown took {elapsed:.1f}s (hang)"
+            return gc_pid
+        finally:
+            if not task.done():
+                daemon.request_stop()
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    gc_pid = asyncio.run(driver())
+    for _ in range(200):
+        if not _alive(gc_pid):
+            break
+        time.sleep(0.01)
+    else:
+        os.kill(gc_pid, 9)
+        raise AssertionError(
+            f"triager grandchild {gc_pid} survived shutdown -- "
+            "cancelled python triager subprocess was orphaned"
+        )
+
+
 # --- Risk 4: mute consultation vs hot-reloaded pipes ---------------------
 
 
