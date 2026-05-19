@@ -13,6 +13,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
+from angelus.control import ControlServer
 from angelus.lodging import Lodging, ScheduledSource, load_lodging
 from angelus.lodging.reloader import LodgingReloader
 from angelus.pipes import PipeDrain
@@ -29,6 +30,7 @@ class AngelusDaemon:
         state_dir = root / "state"
         state_dir.mkdir(parents=True, exist_ok=True)
         self.pid_file = state_dir / "angelus.pid"
+        self.socket_path = state_dir / "angelus.sock"
         self.connection = init_db(state_dir / "angelus.sqlite3")
         self.catalog = Catalog(self.connection, root)
         self.lodging: Lodging = load_lodging(root)
@@ -50,12 +52,23 @@ class AngelusDaemon:
             for name, pipe in self.lodging.pipes.items()
         }
         self.reloader = LodgingReloader(self, root)
+        self.control = ControlServer(
+            self.socket_path,
+            {
+                "health": self._op_health,
+                "incident_list": self._op_incident_list,
+            },
+        )
 
     async def run(self) -> None:
         scheduler_started = False
         reloader_started = False
+        control_started = False
         try:
             self.pid_file.write_text(str(os.getpid()), encoding="utf-8")
+            await self.control.start()
+            control_started = True
+            LOGGER.info("control socket listening at %s", self.socket_path)
             LOGGER.info(
                 "loaded lodging: %d sources, %d triagers, %d pipes, %d channels",
                 len(self.lodging.sources),
@@ -82,6 +95,13 @@ class AngelusDaemon:
             await self.stop_event.wait()
             LOGGER.info("shutdown requested")
         finally:
+            if control_started:
+                try:
+                    await self.control.stop()
+                except OSError:
+                    LOGGER.warning(
+                        "failed to stop control server", exc_info=True
+                    )
             if reloader_started:
                 await self.reloader.stop()
             if scheduler_started:
@@ -93,10 +113,63 @@ class AngelusDaemon:
                 self.pid_file.unlink(missing_ok=True)
             except OSError:
                 LOGGER.warning("failed to remove PID file %s", self.pid_file, exc_info=True)
+            try:
+                self.socket_path.unlink(missing_ok=True)
+            except OSError:
+                LOGGER.warning(
+                    "failed to remove control socket %s",
+                    self.socket_path,
+                    exc_info=True,
+                )
             self.connection.close()
 
     def request_stop(self) -> None:
         self.stop_event.set()
+
+    async def _op_health(self, _args: dict) -> dict:
+        """health control op. Runs on the daemon's event loop so it can read
+        next-fire times off the live APScheduler (only the daemon knows
+        these -- this is why health goes through the socket)."""
+        last_fires = self.catalog.latest_source_fires()
+        sources = []
+        for ref in sorted(self.lodging.sources):
+            job = self.scheduler.get_job(ref)
+            next_fire = (
+                job.next_run_time.isoformat()
+                if job is not None and job.next_run_time is not None
+                else None
+            )
+            sources.append(
+                {
+                    "name": ref,
+                    "last_fire_at": last_fires.get(ref),
+                    "next_fire_at": next_fire,
+                }
+            )
+        return {
+            "daemon": {"running": True, "pid": os.getpid()},
+            "sources": sources,
+            "queues": {
+                "observations_pending_triage": (
+                    self.catalog.observations_pending_triage_count()
+                ),
+                "findings_pending_dispatch": (
+                    self.catalog.findings_pending_dispatch_by_pipe()
+                ),
+            },
+            # Belfry is a separate external process (belfry/belfry.py); it
+            # pings healthchecks.io and reads source_fires read-only but does
+            # not persist a liveness timestamp anywhere angelus can read. No
+            # storage is invented to fill this -- null until a real source
+            # exists. Reported in the 5b-1 tender.
+            "belfry": None,
+        }
+
+    async def _op_incident_list(self, _args: dict) -> dict:
+        return {
+            "open": self.catalog.open_incidents(),
+            "recently_closed": self.catalog.recently_closed_incidents(days=7),
+        }
 
     def _install_signal_handlers(self) -> None:
         loop = asyncio.get_running_loop()
