@@ -973,6 +973,24 @@ class Catalog:
         )
         self.connection.commit()
 
+    def delete_dep_health(self, dependency_name: str) -> None:
+        """Drop a dependency's dep_health row.
+
+        Called by apply_lodging when a dependency is hot-removed from
+        lodging. Without this the row would orphan: nothing else ever
+        deletes dep_health, and a removed dependency can never receive
+        another dep_record (the dep-check probe exits non-zero for an
+        unlodged name), so all_dep_health() -- the health op's reader --
+        would surface a frozen, unrecoverable status forever. Synchronous
+        and self-committing like the rest of this class; the caller must
+        not await between this and its commit. Idempotent: a second call
+        deletes nothing."""
+        self.connection.execute(
+            "DELETE FROM dep_health WHERE dependency_name = ?",
+            (dependency_name,),
+        )
+        self.connection.commit()
+
     def all_dep_health(self) -> list[dict[str, Any]]:
         """Every dep_health row, name-ordered. Read-only; a plain SELECT.
 

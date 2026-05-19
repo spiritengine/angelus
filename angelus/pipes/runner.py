@@ -12,6 +12,7 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from angelus.channels import send_email, send_push
 from angelus.lodging import Channel, Pipe
+from angelus.sources.runner import _kill_and_reap
 from angelus.storage import Catalog, utcnow
 
 LLM_FALLBACK_FOOTER = "LLM digest body unavailable — see structured data above."
@@ -27,9 +28,24 @@ class PipeDrain:
         known_pipes: set[str],
     ) -> None:
         self.catalog = catalog
-        # `pipe`, `channels`, and `known_pipes` are mutable across hot-reloads.
-        # Each `drain_once` snapshots them under the lock so an in-flight drain
-        # always completes with a consistent view.
+        # `pipe`, `channels`, and `known_pipes` are mutated across hot-reloads
+        # by AngelusDaemon.apply_lodging, which does NOT take self.lock --
+        # so the lock is NOT what serialises a drain against a reload (it
+        # only serialises drain_once calls with each other and with the
+        # per-pipe loop's re-entrancy). What actually keeps a drain's view
+        # consistent is three properties together: (1) drain_once reads the
+        # three fields in consecutive await-free statements, so the event
+        # loop cannot interleave apply_lodging mid-snapshot; (2) apply_lodging
+        # only swaps drain.pipe for a *new* Pipe object on a pipe that is
+        # simultaneously being removed or moved off immediate cadence -- a
+        # pipe whose loop is being torn down, so no fresh drain_once observes
+        # a changed pipe beside stale channels; (3) a reload is single-entry
+        # and cross-ref-validated, so a pipe's channels are always a subset
+        # of the channels dict of the same reload generation. A
+        # mixed-generation snapshot (e.g. unchanged pipe + newer channels)
+        # is therefore still internally consistent and cannot KeyError. The
+        # is_muted check is keyed by the finding's dedup_key, independent of
+        # this snapshot, so reload churn cannot make it incoherent.
         self.pipe = pipe
         self.channels = channels
         self.workdir = workdir
@@ -264,15 +280,26 @@ class PipeDrain:
                 prompt,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                # Own process group so a timeout/cancel SIGKILLs the whole
+                # `horizon cast` tree (it shells out and forks), not just
+                # the leader -- the same hardening run_shell_source uses.
+                start_new_session=True,
             )
         except OSError as exc:
             return None, f"chronicler launch failed: {exc}"
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=120)
         except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
+            await _kill_and_reap(process)
             return None, "chronicler timed out after 120s"
+        except asyncio.CancelledError:
+            # A digest pipe drains from an APScheduler interval/cron job;
+            # AsyncIOExecutor.shutdown() cancels that job task on daemon
+            # shutdown. Without reaping, the `horizon` subtree (a forking
+            # command) outlives the daemon -- the same orphan class as a
+            # non-reaped scheduled-source timeout. Reap the group, re-raise.
+            await _kill_and_reap(process)
+            raise
         output = stdout.decode("utf-8", errors="replace").strip()
         if process.returncode != 0:
             error = stderr.decode("utf-8", errors="replace").strip()

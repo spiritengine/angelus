@@ -341,6 +341,17 @@ class AngelusDaemon:
         old = self.lodging
         self.lodging = new_lodging
 
+        # A hot-removed dependency must not leave a frozen dep_health row.
+        # Nothing else prunes dep_health, and an unlodged dependency can
+        # never get another dep_record (the dep-check probe exits non-zero
+        # for it), so the health op would surface a stale, unrecoverable
+        # status forever. Prune here -- a synchronous, self-committing
+        # catalog call with no await before its commit, so this stays on
+        # the cancel-safe side of the reload like every other write.
+        for name in set(old.dependencies) - set(new_lodging.dependencies):
+            self.catalog.delete_dep_health(name)
+            LOGGER.info("pruned dep_health for removed dependency %s", name)
+
         old_sources = old.sources
         new_sources = new_lodging.sources
         for ref in set(old_sources) - set(new_sources):

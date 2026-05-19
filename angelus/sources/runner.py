@@ -41,6 +41,16 @@ async def run_shell_source(source: ScheduledSource) -> tuple[bool, dict[str, obj
             "error": f"shell check timed out after {source.timeout_seconds:g}s",
             "timeout_seconds": source.timeout_seconds,
         }
+    except asyncio.CancelledError:
+        # The live scheduled-fire path: APScheduler submits _fire_source as
+        # an event-loop task and AsyncIOExecutor.shutdown() cancels it on
+        # daemon shutdown (it never honours wait=True -- it just .cancel()s
+        # pending futures). A bare cancel here would unwind without touching
+        # the child, orphaning the check subprocess AND its process group
+        # (start_new_session) exactly like an un-reaped timeout would. Reap
+        # the whole group, then re-raise so cancellation is never swallowed.
+        await _kill_and_reap(process)
+        raise
     if process.returncode != 0:
         error = stderr.decode("utf-8", errors="replace").strip()
         return False, {"error": error, "returncode": process.returncode}
@@ -91,6 +101,12 @@ async def run_dep_check(dependency: Dependency) -> tuple[str, str]:
         return "unhealthy", (
             f"check timed out after {dependency.timeout_seconds:g}s"
         )
+    except asyncio.CancelledError:
+        # Symmetric with run_shell_source: cancellation must reap the whole
+        # process group before unwinding so a cancelled dep-check leaves no
+        # orphaned child. Re-raise -- cancellation is never swallowed.
+        await _kill_and_reap(process)
+        raise
     out = stdout.decode("utf-8", errors="replace").strip()
     err = stderr.decode("utf-8", errors="replace").strip()
     if process.returncode == 0:
@@ -100,8 +116,15 @@ async def run_dep_check(dependency: Dependency) -> tuple[str, str]:
 
 
 async def _kill_and_reap(process: asyncio.subprocess.Process) -> None:
-    """SIGKILL the timed-out command's whole process group, then reap it
-    within a hard ceiling.
+    """SIGKILL a timed-out OR cancelled command's whole process group, then
+    reap it within a hard ceiling.
+
+    Called from both the timeout and the CancelledError paths of
+    run_shell_source / run_dep_check. Daemon shutdown cancels the
+    APScheduler-submitted source-fire task (AsyncIOExecutor.shutdown just
+    .cancel()s pending futures); without reaping on cancel the check child
+    and its process group would survive the daemon, the same orphan a
+    non-reaped timeout produces.
 
     Why the group and not just the shell: asyncio resolves
     `process.wait()` only when the subprocess transport is fully done --
