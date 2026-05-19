@@ -203,62 +203,21 @@ def test_dep_health_pruned_when_dependency_hot_removed(tmp_path) -> None:
     asyncio.run(driver())
 
 
-def test_dep_record_concurrent_with_dependency_reload_is_consistent(
-    tmp_path,
-) -> None:
-    """A dep_record landing while the same dependency's file is being
-    hot-reloaded must still write a coherent dep_health row and (when
-    unhealthy) a now-finding filtered by a consistent self.lodging.pipes.
-    The probe is a SEPARATE process in production; here we drive the
-    daemon-side handler concurrently with the reload to prove the
-    daemon-side write is coherent.
-    """
-    _base_lodging(tmp_path)
-    (tmp_path / "dependencies").mkdir()
-    (tmp_path / "dependencies" / "skein.yaml").write_text(
-        "name: skein\ncheck: skein --help\n", encoding="utf-8"
-    )
-    daemon = AngelusDaemon(tmp_path)
-    reloader = LodgingReloader(daemon, tmp_path, debounce_seconds=0.0)
-
-    async def driver() -> None:
-        try:
-            # Change the dependency file and process the reload while a
-            # dep_record for the same name is dispatched in the same loop.
-            (tmp_path / "dependencies" / "skein.yaml").write_text(
-                "name: skein\ncheck: skein --version\n", encoding="utf-8"
-            )
-            reloader.event_queue.put(
-                str(tmp_path / "dependencies" / "skein.yaml")
-            )
-            reload_task = asyncio.create_task(
-                reloader.process_pending_events()
-            )
-            rec = await daemon._op_dep_record(
-                {"name": "skein", "status": "unhealthy", "detail": "boom"}
-            )
-            await reload_task
-            assert rec == {"name": "skein", "status": "unhealthy"}
-            rows = list(
-                daemon.connection.execute(
-                    "SELECT status, detail FROM dep_health "
-                    "WHERE dependency_name = 'skein'"
-                )
-            )
-            assert len(rows) == 1
-            assert rows[0]["status"] == "unhealthy"
-            # Exactly one now-finding for the unhealthy record.
-            n = daemon.connection.execute(
-                "SELECT COUNT(*) AS n FROM findings f "
-                "JOIN pipe_queues pq ON pq.finding_id = f.id AND pq.pipe='now' "
-                "WHERE f.source='internal/dep' AND f.entity='skein'"
-            ).fetchone()["n"]
-            assert n == 1
-            assert daemon.lodging.dependencies["skein"].check == "skein --version"
-        finally:
-            daemon.connection.close()
-
-    asyncio.run(driver())
+# No standalone test for "dep_record concurrent with dependency reload."
+# A round-1 readonly fell (issue-20260519-e5hr) flagged the prior attempt
+# as sequential masquerading as concurrent: _op_dep_record has zero awaits
+# in its body (verified in angelus/daemon.py, its docstring states the
+# property explicitly), so `await daemon._op_dep_record(...)` does not
+# yield to the event loop; a reload task created beforehand cannot
+# interleave inside it. There is no concurrent window inside dep_record
+# itself worth probing as a separate test. The interaction surface that
+# IS worth probing -- can a control op observe a half-swapped self.lodging
+# while a reload is mid-flight at an `await self._cancel_pipe_loop` point
+# in apply_lodging -- is Risk 1 and is exercised by
+# test_control_op_sees_coherent_lodging_during_slow_reload above. dep_record
+# is one such control op; its lodging-reading site is
+# `set(self.lodging.pipes)` in the write_internal_finding call, structurally
+# identical to the lodging read the Risk 1 test exercises with replay.
 
 
 # --- Risk 3: control socket shutdown with all subsystems live ------------
