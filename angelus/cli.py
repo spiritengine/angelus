@@ -1,13 +1,14 @@
 """Command-line entry point for Angelus.
 
 Read commands talk to the running daemon over its control socket
-(state/angelus.sock). If the daemon is down or unreachable, health and
-incident-list fall back to reading sqlite in true read-only mode
-(file:...?mode=ro) -- the CLI can never write the database, preserving the
-single-writer invariant. "The daemon is down" is a successful health report,
-not a CLI error: the fallback path exits 0.
+(state/angelus.sock). If the daemon is down or unreachable, health,
+incident-list and mute-list fall back to reading sqlite in true read-only
+mode (file:...?mode=ro) -- the CLI can never write the database, preserving
+the single-writer invariant. "The daemon is down" is a successful health
+report, not a CLI error: the fallback path exits 0.
 
-Write commands (mute / incident close / replay / reprocess) are the inverse:
+Write commands (mute add / incident close / replay / reprocess) are the
+inverse:
 they MUST go through the daemon (the single sqlite writer) and have NO
 sqlite fallback -- a fallback would reintroduce a second writer. A
 missing/refused/garbled socket is a hard, non-zero exit with a clear
@@ -228,12 +229,19 @@ def incident_close(incident_id: int, comment: str | None, root: Path) -> None:
         raise SystemExit(1)
 
 
-@main.command()
+@main.group()
+def mute() -> None:
+    """Mute findings, or list active mutes."""
+
+
+@mute.command("add")
 @click.argument("dedup_key")
 @click.argument("duration")
 @click.option("--comment", default=None, help="Why this is muted.")
 @_ROOT_OPTION
-def mute(dedup_key: str, duration: str, comment: str | None, root: Path) -> None:
+def mute_add(
+    dedup_key: str, duration: str, comment: str | None, root: Path
+) -> None:
     """Mute findings with DEDUP_KEY for DURATION (e.g. 30m, 4h, 2d).
 
     Requires the daemon. DURATION is <int><unit> with unit s/m/h/d; a
@@ -244,9 +252,29 @@ def mute(dedup_key: str, duration: str, comment: str | None, root: Path) -> None
         root,
         "mute",
         {"dedup_key": dedup_key, "duration": duration, "comment": comment},
-        "mute",
+        "mute add",
     )
     click.echo(f"muted {result['dedup_key']} until {result['expires_at']}")
+
+
+@mute.command("list")
+@_ROOT_OPTION
+def mute_list(root: Path) -> None:
+    """List active mutes (read-only; the daemon is optional).
+
+    Symmetric with `incident list`: goes through the control socket
+    but falls back to a read-only sqlite read when the daemon is down,
+    since listing in-effect mutes is safe without the writer.
+    """
+    root = root.resolve()
+    response = _request(root, "mute_list", {})
+    if response is not None:
+        if not response.get("ok"):
+            click.echo(f"error: {response.get('error')}", err=True)
+            raise SystemExit(1)
+        _render_mutes(response["result"])
+        return
+    _render_mutes_fallback(root)
 
 
 @main.command()
@@ -381,5 +409,32 @@ def _render_incidents_fallback(root: Path) -> None:
                 "recently_closed": catalog.recently_closed_incidents(days=7),
             }
         )
+    finally:
+        connection.close()
+
+
+def _render_mutes(result: dict[str, Any]) -> None:
+    click.echo("active mutes:")
+    active = result["active"]
+    if not active:
+        click.echo("  none")
+    for m in active:
+        comment = m["comment"] if m["comment"] else "(none)"
+        click.echo(
+            f"  {m['dedup_key']}  expires {m['expires_at']}  comment: {comment}"
+        )
+
+
+def _render_mutes_fallback(root: Path) -> None:
+    status, _pid = _pid_status(root / "state" / "angelus.pid")
+    connection = _ro_connect(root / "state" / "angelus.sqlite3")
+    if connection is None:
+        click.echo(f"daemon: {status}")
+        click.echo("sqlite: unavailable")
+        return
+    click.echo(f"daemon: {status} (reading sqlite read-only)")
+    try:
+        catalog = Catalog(connection, root)
+        _render_mutes({"active": catalog.active_mutes()})
     finally:
         connection.close()

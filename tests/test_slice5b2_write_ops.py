@@ -301,6 +301,73 @@ def test_expired_mute_does_not_suppress(tmp_path, monkeypatch) -> None:
         connection.close()
 
 
+# --- mute list read op: active-only, comment surfaced --------------------
+
+
+def _seed_expired_mute(connection, dedup_key: str, comment: str) -> None:
+    """A mute whose expires_at is firmly in the past -- active_mutes
+    must filter it out via the same expires_at > now predicate is_muted
+    uses."""
+    connection.execute(
+        """
+        INSERT INTO mutes (dedup_key, expires_at, created_at, comment)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            dedup_key,
+            "2000-01-01T00:00:00.000Z",
+            "2000-01-01T00:00:00.000Z",
+            comment,
+        ),
+    )
+    connection.commit()
+
+
+def test_mute_list_op_active_only_with_comment(tmp_path) -> None:
+    @_serve(tmp_path)
+    async def _(daemon):
+        # One active mute (with a comment) and one long-expired mute.
+        daemon.catalog.add_mute(
+            "scheduled/dead_link/home", 3600, "noisy during migration"
+        )
+        _seed_expired_mute(
+            daemon.catalog.connection, "scheduled/old/key", "should not show"
+        )
+
+        resp = await _ask(daemon.socket_path, {"op": "mute_list"})
+        assert resp["ok"] is True
+        active = resp["result"]["active"]
+        # Active-only: the expired row is excluded entirely.
+        assert [m["dedup_key"] for m in active] == ["scheduled/dead_link/home"]
+        # Discriminating on comment: this fails if mute_list drops it.
+        assert active[0]["comment"] == "noisy during migration"
+        assert active[0]["expires_at"].endswith("Z")
+        assert "created_at" in active[0]
+
+
+def test_mute_list_cli_daemon_down_ro_fallback(tmp_path) -> None:
+    """No daemon: `mute list` falls back to read-only sqlite (mirrors
+    health/incident-list) and still surfaces the active mute and its
+    comment, exit 0."""
+    state = tmp_path / "state"
+    state.mkdir()
+    connection = init_db(state / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    catalog.add_mute("scheduled/dead_link/home", 3600, "noisy during migration")
+    _seed_expired_mute(connection, "scheduled/old/key", "should not show")
+    connection.close()
+
+    result = CliRunner().invoke(
+        main, ["mute", "list", "--root", str(tmp_path)]
+    )
+    assert result.exit_code == 0
+    assert "scheduled/dead_link/home" in result.output
+    # The comment round-trips through the ro fallback path too.
+    assert "noisy during migration" in result.output
+    # Active-only holds in the fallback as well.
+    assert "scheduled/old/key" not in result.output
+
+
 # --- incident close op ---------------------------------------------------
 
 
@@ -493,29 +560,39 @@ def test_reprocess_op_rebudgets_triage_and_idempotent(tmp_path) -> None:
 
 
 def test_daemon_down_write_commands_exit_nonzero_no_write(tmp_path) -> None:
+    """All four write commands (mute add / incident close / replay /
+    reprocess) require the daemon: with no socket each exits non-zero
+    with a clear message and the db is left untouched (no read-only
+    fallback writer). Structurally they share _require_daemon, but the
+    contract names all four, so all four are exercised."""
     state = tmp_path / "state"
     state.mkdir()
     connection = init_db(state / "angelus.sqlite3")
     catalog = Catalog(connection, tmp_path)
     incident_id = _open_incident(catalog)
+    finding_id = _write_now_finding(catalog, "scheduled/down/example")
     connection.close()
 
     runner = CliRunner()
 
-    muted = runner.invoke(
-        main, ["mute", "scheduled/x", "30m", "--root", str(tmp_path)]
-    )
-    assert muted.exit_code != 0
-    assert "daemon is not running" in muted.output
-    assert "mute requires the daemon" in muted.output
+    # (argv, the command label _require_daemon prints) for each write op.
+    cases = [
+        (["mute", "add", "scheduled/x", "30m"], "mute add requires the daemon"),
+        (
+            ["incident", "close", str(incident_id)],
+            "incident close requires the daemon",
+        ),
+        (["replay", str(finding_id)], "replay requires the daemon"),
+        (["reprocess", "scheduled/down"], "reprocess requires the daemon"),
+    ]
+    for argv, message in cases:
+        result = runner.invoke(main, [*argv, "--root", str(tmp_path)])
+        assert result.exit_code != 0, argv
+        assert "daemon is not running" in result.output, argv
+        assert message in result.output, argv
 
-    closed = runner.invoke(
-        main, ["incident", "close", str(incident_id), "--root", str(tmp_path)]
-    )
-    assert closed.exit_code != 0
-    assert "daemon is not running" in closed.output
-
-    # No fallback writer touched the db: no mute rows, incident still open.
+    # No fallback writer touched the db: no mute rows, incident still
+    # open, finding still in its original pre-replay queue state.
     check = init_db(state / "angelus.sqlite3")
     try:
         assert check.execute("SELECT COUNT(*) AS n FROM mutes").fetchone()["n"] == 0
@@ -523,6 +600,13 @@ def test_daemon_down_write_commands_exit_nonzero_no_write(tmp_path) -> None:
             "SELECT status FROM incidents WHERE id = ?", (incident_id,)
         ).fetchone()
         assert row["status"] == "open"
+        pending = check.execute(
+            "SELECT COUNT(*) AS n FROM pipe_queues WHERE finding_id = ?",
+            (finding_id,),
+        ).fetchone()["n"]
+        # _write_now_finding queued exactly one pipe row; replay being
+        # refused (daemon down) must not have re-queued or duplicated it.
+        assert pending == 1
     finally:
         check.close()
 

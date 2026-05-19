@@ -780,6 +780,29 @@ class Catalog:
         ).fetchone()
         return row is not None
 
+    def active_mutes(self) -> list[dict[str, Any]]:
+        """Active mutes -- rows whose expires_at is still in the future.
+        Read-only; a plain SELECT, no write.
+
+        Symmetric with is_muted: the same `expires_at > now`
+        lexicographic predicate is the only mechanism, so an expired
+        mute simply does not appear and no GC sweeper is needed. The
+        operator listing mutes wants the ones in effect, so this is
+        active-only by design. Ordered by expires_at ascending --
+        soonest-to-lift first -- with id as a stable tiebreaker for
+        overlapping rows that share an expires_at.
+        """
+        rows = self.connection.execute(
+            """
+            SELECT dedup_key, expires_at, created_at, comment
+            FROM mutes
+            WHERE expires_at > ?
+            ORDER BY expires_at ASC, id ASC
+            """,
+            (utcnow(),),
+        )
+        return [dict(row) for row in rows]
+
     def close_incident(
         self, incident_id: int, comment: str | None
     ) -> str:

@@ -62,6 +62,7 @@ class AngelusDaemon:
             {
                 "health": self._op_health,
                 "incident_list": self._op_incident_list,
+                "mute_list": self._op_mute_list,
                 "mute": self._op_mute,
                 "incident_close": self._op_incident_close,
                 "replay": self._op_replay,
@@ -179,6 +180,14 @@ class AngelusDaemon:
             "open": self.catalog.open_incidents(),
             "recently_closed": self.catalog.recently_closed_incidents(days=7),
         }
+
+    async def _op_mute_list(self, _args: dict) -> dict:
+        """mute_list control op. A READ op -- a synchronous catalog
+        SELECT of the active mutes, no write. Routed through the same
+        socket as the write ops (owner-only perms gate the lot), but
+        like health/incident_list it has a read-only sqlite fallback in
+        the CLI when the daemon is down."""
+        return {"active": self.catalog.active_mutes()}
 
     # The four write ops below run inside the daemon -- the single sqlite
     # writer. Each handler is synchronous in body: it validates args and
