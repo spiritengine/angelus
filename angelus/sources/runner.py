@@ -103,17 +103,27 @@ async def _kill_and_reap(process: asyncio.subprocess.Process) -> None:
     """SIGKILL the timed-out command's whole process group, then reap it
     within a hard ceiling.
 
-    Why the group and not just the shell: asyncio's child watcher reaps
-    the DIRECT child (the shell) promptly once SIGKILL lands, so
-    process.wait() returns at once -- there is no pipe-drain hang. The
-    defect a plain process.kill() leaves is for a FORKING check command:
-    `sh -c` forks the real work as a grandchild, and SIGKILL to the shell
-    alone orphans that grandchild (it reparents to init) with the
-    stdout/stderr fds it inherited still open -- a leaked process + leaked
-    fds that accumulate every timeout. Killing the whole process group
-    reaps the grandchild too. (A non-forking simple command like
-    `sleep 30` is exec'd by dash directly, so it has no grandchild and
-    neither leaks nor hangs -- which is exactly why it cannot test this.)
+    Why the group and not just the shell: asyncio resolves
+    `process.wait()` only when the subprocess transport is fully done --
+    the OS process has exited AND the stdout/stderr pipe transports have
+    seen EOF (connection_lost). For a FORKING check command `sh -c`
+    forks the real work as a grandchild that inherits copies of the
+    stdout/stderr pipe write-ends. SIGKILL to the shell alone exits the
+    shell, but the orphaned grandchild (reparented to init) keeps those
+    write-ends open, so the read-ends never see EOF, so the transport
+    never completes, so `await process.wait()` blocks until the
+    grandchild itself exits -- the full command runtime (~30s for
+    `sleep 30`). Empirically confirmed: a plain process.kill() on a
+    forking command hangs ~30s. Killing the whole process group also
+    kills the grandchild, closing the write-ends; EOF arrives and wait()
+    returns at the timeout. (The original friction-20260519-pcml
+    diagnosis -- "process.wait() blocks until the pipes drain" -- was
+    correct; this is that mechanism stated precisely.)
+
+    A non-forking simple command like `sleep 30` is exec'd by dash
+    directly: it IS the direct child, SIGKILL reaches it, EOF follows,
+    no hang -- which is exactly why such a command cannot exercise or
+    test this path. A forking command is required to reproduce it.
 
     The bounded reap only guards a pathological unkillable/zombie tree so
     the caller can never hang forever.
