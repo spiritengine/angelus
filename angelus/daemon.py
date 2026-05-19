@@ -341,6 +341,17 @@ class AngelusDaemon:
         old = self.lodging
         self.lodging = new_lodging
 
+        # A hot-removed dependency must not leave a frozen dep_health row.
+        # Nothing else prunes dep_health, and an unlodged dependency can
+        # never get another dep_record (the dep-check probe exits non-zero
+        # for it), so the health op would surface a stale, unrecoverable
+        # status forever. Prune here -- a synchronous, self-committing
+        # catalog call with no await before its commit, so this stays on
+        # the cancel-safe side of the reload like every other write.
+        for name in set(old.dependencies) - set(new_lodging.dependencies):
+            self.catalog.delete_dep_health(name)
+            LOGGER.info("pruned dep_health for removed dependency %s", name)
+
         old_sources = old.sources
         new_sources = new_lodging.sources
         for ref in set(old_sources) - set(new_sources):
@@ -457,6 +468,17 @@ class AngelusDaemon:
                 await asyncio.sleep(0.1 if did_work or in_flight else 1)
         finally:
             if in_flight:
+                # Triager subprocesses (run_python_triager) await
+                # process.communicate() and have no external canceller
+                # (APScheduler cancels source-fire and pipe-digest tasks
+                # but not these). Without cancelling here, a triager
+                # stuck waiting on its subprocess hangs shutdown until
+                # the triager's own timeout_seconds fires. Cancel first,
+                # then gather: each task's CancelledError arm runs
+                # _kill_and_reap on the subprocess (triage/runner.py),
+                # so the subprocess tree is reaped before we return.
+                for task in in_flight:
+                    task.cancel()
                 await asyncio.gather(*in_flight, return_exceptions=True)
                 self._reap_triage_tasks(in_flight)
 
@@ -468,21 +490,40 @@ class AngelusDaemon:
                 LOGGER.error("triage task crashed", exc_info=exc)
 
     async def _triage_under_semaphore(self, row, triager_name: str) -> None:
-        async with self.triage_semaphore:
-            triager = self.lodging.triagers.get(triager_name)
-            if triager is None:
-                # Triager hot-removed between mark_triage_processing and now.
-                # The 'processing' row would otherwise orphan: ready_observations_for
-                # excludes it, and recover_writing_rows doesn't touch
-                # observation_triage. Delete so a later re-add of the same
-                # triager can pick the observation up fresh; no attempt
-                # consumed since the triager never ran.
-                self._clear_triage_for_removed_triager(int(row["id"]), triager_name)
-                return
-            lock_key = (triager.name, triager.source_ref)
-            lock = self.triager_locks.setdefault(lock_key, asyncio.Lock())
-            async with lock:
-                await self._run_triager(row, triager_name)
+        observation_id = int(row["id"])
+        # Cancellation by _triage_loop's shutdown-finally can land at any
+        # await in this method: queueing on the semaphore, queueing on
+        # the per-triager lock, or inside _run_triager itself. In every
+        # one of those cases mark_triage_processing has already written
+        # the row (it runs synchronously in _triage_loop's body just
+        # before this task is created), so we must clear it on the way
+        # out -- recover_writing_rows does not touch observation_triage
+        # and ready_observations_for excludes 'processing' rows, so an
+        # unrecovered row would orphan the observation across daemon
+        # restarts. clear_triage_processing is bounded to
+        # status='processing', so a transition that legitimately landed
+        # at 'success'/'failed' (which can only have happened inside
+        # _run_triager BEFORE the cancellation arrived) is not
+        # clobbered. The outer arm catches all three cancellation
+        # landing points uniformly; an inner arm in _run_triager is
+        # unnecessary because CancelledError propagates out through
+        # async with and lands here.
+        try:
+            async with self.triage_semaphore:
+                triager = self.lodging.triagers.get(triager_name)
+                if triager is None:
+                    # Triager hot-removed between mark_triage_processing and now.
+                    # Same orphan risk as the cancel arm above; the helper
+                    # logs and delegates to catalog.clear_triage_processing.
+                    self._clear_triage_for_removed_triager(observation_id, triager_name)
+                    return
+                lock_key = (triager.name, triager.source_ref)
+                lock = self.triager_locks.setdefault(lock_key, asyncio.Lock())
+                async with lock:
+                    await self._run_triager(row, triager_name)
+        except asyncio.CancelledError:
+            self.catalog.clear_triage_processing(observation_id, triager_name)
+            raise
 
     def _clear_triage_for_removed_triager(
         self, observation_id: int, triager_name: str

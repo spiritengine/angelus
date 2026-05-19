@@ -8,6 +8,7 @@ import sys
 from typing import Any
 
 from angelus.lodging import Triager
+from angelus.sources.runner import _kill_and_reap
 
 
 async def run_python_triager(
@@ -15,12 +16,19 @@ async def run_python_triager(
     observation: dict[str, Any],
     prior_state: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    # start_new_session puts the child in its own process group so a
+    # forking triager (one that exec's another tool or shells out) can
+    # be reaped completely on timeout or cancellation: SIGKILL to the
+    # shell alone leaves an orphaned grandchild holding the pipe
+    # write-ends, blocking wait() until the grandchild itself exits.
+    # See angelus/sources/runner.py:_kill_and_reap for the full mechanism.
     process = await asyncio.create_subprocess_exec(
         sys.executable,
         str(triager.handler_path),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
     payload = json.dumps(
         {"observation": observation, "prior_state": prior_state},
@@ -31,11 +39,16 @@ async def run_python_triager(
             process.communicate(payload), timeout=triager.timeout_seconds
         )
     except TimeoutError as exc:
-        process.kill()
-        await process.wait()
+        await _kill_and_reap(process)
         raise RuntimeError(
             f"triager {triager.name} timed out after {triager.timeout_seconds:g}s"
         ) from exc
+    except asyncio.CancelledError:
+        # Daemon shutdown cancels the _triage_loop task; without
+        # reaping here the triager child and its process group survive
+        # the daemon (same orphan a non-reaped timeout produces).
+        await _kill_and_reap(process)
+        raise
     if stderr:
         sys.stderr.write(stderr.decode("utf-8", errors="replace"))
     if process.returncode != 0:

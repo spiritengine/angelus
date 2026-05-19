@@ -127,13 +127,24 @@ class Catalog:
         self, observation_id: int, triager_name: str
     ) -> None:
         """Delete a 'processing' observation_triage row when its triager
-        was hot-removed mid-flight. Called from either None-check site:
-        after the triage semaphore is acquired but before the per-triager
-        lock (triager removed between mark_triage_processing and task
-        start), or after the per-triager lock is acquired (triager
-        removed while a sibling task held the lock). Bounded to
-        status='processing' so a legit concurrent transition to
-        'success'/'failed' is not clobbered."""
+        no longer needs the row to exist. Reached on two intents:
+
+        - Hot-remove: a triager disappears from lodging after
+          mark_triage_processing has written the row but before the
+          triage runs. The observation must remain eligible for a later
+          re-added triager; deleting the row lets ready_observations_for
+          surface it again.
+        - Shutdown-cancel: _triage_loop cancels its in-flight tasks on
+          shutdown; the cancelled task never reaches mark_triage_success
+          or mark_triage_failed and would otherwise leave a stuck
+          'processing' row that recover_writing_rows does not heal.
+
+        Bounded to status='processing' so a concurrent transition to
+        'success'/'failed' that legitimately occurred BEFORE the
+        cancellation arrived is not clobbered. Caller function names
+        are deliberately not enumerated here -- they rot the moment
+        new callers adopt the helper, and the intents above survive
+        renames."""
         self.connection.execute(
             """
             DELETE FROM observation_triage
@@ -970,6 +981,24 @@ class Catalog:
                 updated_at = excluded.updated_at
             """,
             (dependency_name, status, last_check_at, detail, utcnow()),
+        )
+        self.connection.commit()
+
+    def delete_dep_health(self, dependency_name: str) -> None:
+        """Drop a dependency's dep_health row.
+
+        Called by apply_lodging when a dependency is hot-removed from
+        lodging. Without this the row would orphan: nothing else ever
+        deletes dep_health, and a removed dependency can never receive
+        another dep_record (the dep-check probe exits non-zero for an
+        unlodged name), so all_dep_health() -- the health op's reader --
+        would surface a frozen, unrecoverable status forever. Synchronous
+        and self-committing like the rest of this class; the caller must
+        not await between this and its commit. Idempotent: a second call
+        deletes nothing."""
+        self.connection.execute(
+            "DELETE FROM dep_health WHERE dependency_name = ?",
+            (dependency_name,),
         )
         self.connection.commit()
 

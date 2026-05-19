@@ -12,6 +12,7 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from angelus.channels import send_email, send_push
 from angelus.lodging import Channel, Pipe
+from angelus.sources.runner import _kill_and_reap
 from angelus.storage import Catalog, utcnow
 
 LLM_FALLBACK_FOOTER = "LLM digest body unavailable — see structured data above."
@@ -27,9 +28,34 @@ class PipeDrain:
         known_pipes: set[str],
     ) -> None:
         self.catalog = catalog
-        # `pipe`, `channels`, and `known_pipes` are mutable across hot-reloads.
-        # Each `drain_once` snapshots them under the lock so an in-flight drain
-        # always completes with a consistent view.
+        # `pipe`, `channels`, and `known_pipes` are mutated across hot-reloads
+        # by AngelusDaemon.apply_lodging, which does NOT take self.lock --
+        # so the lock is NOT what serialises a drain against a reload (it
+        # only serialises drain_once calls with each other and with the
+        # per-pipe loop's re-entrancy). What actually keeps a drain's view
+        # consistent is three properties together: (1) drain_once reads the
+        # three fields in consecutive await-free statements, so the event
+        # loop cannot interleave apply_lodging mid-snapshot; (2) inside
+        # apply_lodging itself drain.pipe is reassigned UNCONDITIONALLY for
+        # every pipe in the old/new intersection (one statement near the
+        # top of the intersection loop, not gated on cadence change or
+        # tear-down), and the bottom for-loop re-points every drain's
+        # channels/known_pipes afterwards; the only `await` points inside a
+        # single apply_lodging invocation are the `await self._cancel_pipe_loop(...)`
+        # calls in remove and cadence-change branches, so in the common
+        # content-only edit case apply_lodging has no awaits at all and a
+        # drain_once cannot interleave any of its mutations -- when other
+        # pipes in the same reload DO trigger a cancel await, a drain_once
+        # on an untouched pipe may snapshot a (new-pipe, old-channels,
+        # old-known_pipes) mix, which is safe by (3); (3) a reload is
+        # single-entry and cross-ref-validated, so any pipe's channels are
+        # a subset of the channels dict of the same reload generation, and
+        # the test test_drain_snapshot_stays_internally_consistent_during_slow_reload
+        # pins this empirically (inverting it by injecting a ghost channel
+        # into new_pipe.channels at the intersection loop fails the subset
+        # assertion). The is_muted check is keyed by the finding's
+        # dedup_key, independent of this snapshot, so reload churn cannot
+        # make it incoherent.
         self.pipe = pipe
         self.channels = channels
         self.workdir = workdir
@@ -264,15 +290,26 @@ class PipeDrain:
                 prompt,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                # Own process group so a timeout/cancel SIGKILLs the whole
+                # `horizon cast` tree (it shells out and forks), not just
+                # the leader -- the same hardening run_shell_source uses.
+                start_new_session=True,
             )
         except OSError as exc:
             return None, f"chronicler launch failed: {exc}"
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=120)
         except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
+            await _kill_and_reap(process)
             return None, "chronicler timed out after 120s"
+        except asyncio.CancelledError:
+            # A digest pipe drains from an APScheduler interval/cron job;
+            # AsyncIOExecutor.shutdown() cancels that job task on daemon
+            # shutdown. Without reaping, the `horizon` subtree (a forking
+            # command) outlives the daemon -- the same orphan class as a
+            # non-reaped scheduled-source timeout. Reap the group, re-raise.
+            await _kill_and_reap(process)
+            raise
         output = stdout.decode("utf-8", errors="replace").strip()
         if process.returncode != 0:
             error = stderr.decode("utf-8", errors="replace").strip()

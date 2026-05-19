@@ -8,6 +8,7 @@ import shlex
 from pathlib import Path
 
 from angelus.lodging import Channel
+from angelus.sources.runner import _kill_and_reap
 
 DEFAULT_TIMEOUT_SECONDS = 30.0
 
@@ -31,6 +32,9 @@ async def send_email(
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        # Own process group so timeout/cancel reaps the whole tree, not
+        # just the leader (shared kill-on-timeout hardening).
+        start_new_session=True,
     )
     try:
         _, stderr = await asyncio.wait_for(
@@ -38,11 +42,16 @@ async def send_email(
             timeout=timeout_seconds,
         )
     except asyncio.TimeoutError as exc:
-        process.kill()
-        await process.wait()
+        await _kill_and_reap(process)
         raise RuntimeError(
             f"{channel.name} timed out after {timeout_seconds:g}s"
         ) from exc
+    except asyncio.CancelledError:
+        # Reached from a digest pipe-drain job; AsyncIOExecutor.shutdown()
+        # cancels that job task on daemon shutdown. Reap the group so the
+        # send subprocess never outlives the daemon; re-raise.
+        await _kill_and_reap(process)
+        raise
     if process.returncode != 0:
         error = stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(f"{channel.name} failed: {error}")
