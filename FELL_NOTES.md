@@ -789,23 +789,35 @@ per property of the overflow protocol):
   "informational".
 
 ### Discrimination evidence
-Two inversions performed in the worktree, observed, reverted (each
-inversion was a local edit to `angelus/pipes/runner.py`):
+Three inversions performed in the worktree, observed, reverted:
 
-* Invert `_over_rate_limit` to `return False` -> the cap never
-  triggers, all 4 findings dispatch as 'sent'. Axis A fails first
-  at `assert len(now_sent) == 2` with
-  `[('push','sent'), ('push','sent'), ('push','sent'), ('push','sent')]`.
+* Invert `_over_rate_limit` in `angelus/pipes/runner.py` to
+  `return False` -> the cap never triggers, all 4 findings dispatch
+  as 'sent'. Axis A fails first at `assert len(now_sent) == 2`
+  with `[('push','sent'), ('push','sent'), ('push','sent'), ('push','sent')]`.
 * Replace the `suppress_pipe_item_to(...); continue` lines in
-  `_drain_immediate` with bare `continue` -> the cap triggers (axis
-  A still holds: only 2 send) but the suppressed findings stay at
-  status='pending' on `now` and never reach `daily`. Axis B fails
-  at the now-queue snapshot equality:
-  `(3, 'pending') != (3, 'suppressed')`.
+  `_drain_immediate` (`angelus/pipes/runner.py`) with bare
+  `continue` -> the cap triggers (axis A still holds: only 2 send)
+  but the suppressed findings stay at status='pending' on `now` and
+  never reach `daily`. Axis B fails at the now-queue snapshot
+  equality: `(3, 'pending') != (3, 'suppressed')`.
+* Append `for it in items: it["severity"] = "informational"` to
+  `Catalog.suppressed_findings_since` in
+  `angelus/storage/catalog.py` (post-`_finding_dict`) -> the
+  suppressed-rows reader downcasts severity on its way out, so the
+  digest reads 'informational' rows even though `findings.severity`
+  is still 'high'. Axes A/B/C still pass; axis D fails first at
+  `assert state["suppressed_findings"] == [{"entity": "e2",
+  "severity": "high"}, ...]` (got
+  `{"entity": "e2", "severity": "informational"}` at index 0).
+  The downstream `[high] e2` / `informational not in daily_msg`
+  assertions would also have failed had pytest continued, since
+  the same downcast feeds the daily template's
+  `suppressed_findings` list.
 
-Both inversions reverted; the test passes deterministically (the
-test runs in ~0.6s with no real subprocess on `send_push` due to
-the monkeypatch).
+All three inversions reverted; the test passes deterministically
+(the test runs in ~0.6s with no real subprocess on `send_push` due
+to the monkeypatch).
 
 ---
 

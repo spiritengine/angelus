@@ -749,10 +749,10 @@ class Catalog:
         Two intents this recovers from, both of which can leave the row
         orphaned at 'processing' across a daemon restart:
         - hard kill: SIGKILL/SIGSEGV/host loss bypasses Python's
-          shutdown handlers, so the graceful clear_triage_processing arm
-          in _triage_under_semaphore's CancelledError handler never
-          fires. Round 5 wired the graceful path; this is the round-5
-          companion for the hard-exit path.
+          shutdown handlers, so the in-process graceful-cancel arm
+          (which clears the same row via a triage task's cancellation
+          handler) never fires; this is the hard-exit companion to
+          that arm.
         - host crash mid-triage: same shape, same orphan.
 
         Bounded to status='processing' so any transition that
