@@ -201,6 +201,20 @@ class PipeDrain:
         any_channel_succeeded = False
         for channel_name in pipe.channels:
             channel = channels[channel_name]
+            # Product decision: the digest path does NOT consult
+            # is_channel_unhealthy before attempting send, even though the
+            # immediate path does. The digest is the consolidation/audit
+            # surface (slice-3 issue-20260514-wh1k); the dispatch row IS
+            # the dispatch state, and the operator must keep seeing the
+            # actual outcome each cycle until recovery. Adopting the
+            # immediate path's skip would silently swallow a digest cycle
+            # against a known-broken channel -- exactly the gap
+            # (friction-20260514-c64x) the per-channel attempt counter
+            # below was added to close. The attempt-anyway shape also gives
+            # an intermittently-recovered channel a natural reset path via
+            # record_digest_send_success below; a skip would freeze the
+            # counter and the channel could never recover without a daemon
+            # restart.
             try:
                 await self._send_channel(channel, message, subject)
             except Exception as exc:
@@ -219,6 +233,21 @@ class PipeDrain:
                     str(exc),
                     known_pipes,
                 )
+                # Escalate to channel_health via the digest-specific
+                # per-channel counter. The (pipe, finding_id) shape on
+                # pipe_queues used by the immediate path would inflate the
+                # threshold N-per-cycle on the digest path (one cycle
+                # carries N finding_ids); this counter is keyed only by
+                # (pipe, channel) so N CONSECUTIVE failure cycles cross
+                # the same MAX_RETRY_ATTEMPTS threshold the immediate path
+                # uses. Without this, a digest-only channel failure mode
+                # (e.g. dead SMTP route while push works) would generate
+                # one internal/dispatch finding per cycle forever and
+                # never register in channel_health -- the gap
+                # friction-20260514-c64x + friction-20260514-5ddc named.
+                self.catalog.record_digest_send_failure(
+                    pipe.name, channel.name, str(exc)
+                )
             else:
                 any_channel_succeeded = True
                 self.catalog.record_dispatch(
@@ -228,6 +257,10 @@ class PipeDrain:
                     "sent",
                     mark_queue=False,
                 )
+                # Reset the per-channel digest attempt counter so an
+                # intermittent channel does not gradually accumulate to
+                # threshold across many mostly-succeeding cycles.
+                self.catalog.record_digest_send_success(pipe.name, channel.name)
         if any_channel_succeeded:
             self.catalog.mark_pipe_items_dispatched(pipe.name, finding_ids)
             self.catalog.mark_pipe_drained(pipe.name, drained_at)
