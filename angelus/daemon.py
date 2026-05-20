@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import signal
+from datetime import UTC, datetime
 from pathlib import Path
 
 from apscheduler.jobstores.base import JobLookupError
@@ -22,6 +23,9 @@ from angelus.storage import Catalog, init_db, utcnow
 from angelus.triage import run_python_triager
 
 LOGGER = logging.getLogger(__name__)
+
+DEFAULT_BELFRY_SENTINEL_FILENAME = "belfry-pinged-at"
+DEFAULT_BELFRY_STALE_AFTER_SEC = 1200
 
 
 class AngelusDaemon:
@@ -187,12 +191,12 @@ class AngelusDaemon:
                     self.catalog.findings_pending_dispatch_by_pipe()
                 ),
             },
-            # Belfry is a separate external process (belfry/belfry.py); it
-            # pings healthchecks.io and reads source_fires read-only but does
-            # not persist a liveness timestamp anywhere angelus can read. No
-            # storage is invented to fill this -- null until a real source
-            # exists. Reported in the 5b-1 tender.
-            "belfry": None,
+            # Belfry is a separate external process (belfry/belfry.py) that
+            # cannot write sqlite (single-writer-to-sqlite invariant). On each
+            # cron tick belfry touches a sentinel file; the daemon reads its
+            # mtime here. Missing file -> never-pinged shape. Per Section 5b
+            # Q2 of brief-20260520-tqov.
+            "belfry": _belfry_status(self.root),
             # dep_health's mandatory reader (slice 5c): every row the
             # dep_record write op upserts is surfaced here so a written dep
             # status is never dead config. Read-only SELECT.
@@ -598,6 +602,78 @@ class AngelusDaemon:
                 return
             await drain.drain_once()
             await asyncio.sleep(1)
+
+
+def _belfry_sentinel_path(root: Path) -> Path:
+    """Resolve the belfry liveness sentinel path on the daemon side.
+
+    ANGELUS_BELFRY_SENTINEL_PATH overrides; default is
+    <root>/state/belfry-pinged-at. Belfry uses the same env var and
+    default (belfry/belfry.py:sentinel_path) so the two sides stay in
+    sync. A drifted path on either side would surface as permanent
+    "never pinged" -- the mandatory-reader contract catches that at
+    integration-test time.
+    """
+    override = os.environ.get("ANGELUS_BELFRY_SENTINEL_PATH")
+    if override:
+        return Path(override)
+    return root / "state" / DEFAULT_BELFRY_SENTINEL_FILENAME
+
+
+def _belfry_stale_after_seconds() -> int:
+    """How old the sentinel mtime can get before we call belfry stale.
+
+    ANGELUS_BELFRY_STALE_AFTER_SEC overrides; default is 1200s (20min).
+    The default is roughly 2x belfry's typical cron cadence (5-15min) so
+    a single skipped tick is not enough to flip stale=true; two-plus
+    skipped ticks are. Invalid or non-positive overrides fall back to
+    the default so health never crashes on a misconfigured env.
+    """
+    raw = os.environ.get("ANGELUS_BELFRY_STALE_AFTER_SEC")
+    if raw is None:
+        return DEFAULT_BELFRY_STALE_AFTER_SEC
+    try:
+        seconds = int(raw)
+    except ValueError:
+        LOGGER.warning(
+            "invalid ANGELUS_BELFRY_STALE_AFTER_SEC=%r; using default", raw
+        )
+        return DEFAULT_BELFRY_STALE_AFTER_SEC
+    if seconds <= 0:
+        LOGGER.warning(
+            "ANGELUS_BELFRY_STALE_AFTER_SEC=%d must be positive; using default",
+            seconds,
+        )
+        return DEFAULT_BELFRY_STALE_AFTER_SEC
+    return seconds
+
+
+def _belfry_status(root: Path) -> dict:
+    """Liveness shape for the health op's belfry field.
+
+    Returns {"last_pinged_at": <iso8601-Z>|None, "stale": <bool>}. The
+    dict shape (never bare None) is deliberate -- the CLI render can
+    branch on the boolean without first guarding the outer value, which
+    matches how 'sources' and 'deps' are surfaced.
+
+    Missing sentinel -> {"last_pinged_at": None, "stale": True}. Belfry
+    has never run on this root, which is the most-stale state possible.
+    """
+    path = _belfry_sentinel_path(root)
+    try:
+        mtime = path.stat().st_mtime
+    except FileNotFoundError:
+        return {"last_pinged_at": None, "stale": True}
+    except OSError as exc:
+        LOGGER.warning("failed to stat belfry sentinel %s: %s", path, exc)
+        return {"last_pinged_at": None, "stale": True}
+    pinged_at = datetime.fromtimestamp(mtime, tz=UTC)
+    age_sec = (datetime.now(UTC) - pinged_at).total_seconds()
+    stale = age_sec > _belfry_stale_after_seconds()
+    return {
+        "last_pinged_at": pinged_at.isoformat().replace("+00:00", "Z"),
+        "stale": stale,
+    }
 
 
 _CADENCE_UNITS = {

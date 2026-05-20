@@ -403,11 +403,22 @@ def _render_health(result: dict[str, Any]) -> None:
         click.echo("  none")
     for pipe in sorted(pending):
         click.echo(f"  {pipe}: {pending[pipe]}")
-    belfry = result["belfry"]
-    click.echo(
-        f"last belfry ping: {belfry if belfry is not None else 'not recorded'}"
-    )
+    _render_belfry(result["belfry"])
     _render_deps(result.get("deps") or [])
+
+
+def _render_belfry(belfry: dict[str, Any] | None) -> None:
+    """Plain text, two lines (timestamp and freshness). Screen-reader
+    friendly: no tables, no embedded markup, one fact per line. The
+    daemon now always returns a dict shape; bare-None is the legacy
+    surface from pre-slice-8 daemons and is rendered explicitly so a
+    stale binary still produces a readable line."""
+    if belfry is None:
+        click.echo("last belfry ping: not recorded")
+        return
+    last = belfry.get("last_pinged_at") or "never"
+    click.echo(f"last belfry ping: {last}")
+    click.echo(f"belfry stale: {'yes' if belfry.get('stale') else 'no'}")
 
 
 def _render_deps(deps: list[dict[str, Any]]) -> None:
@@ -426,6 +437,8 @@ def _render_deps(deps: list[dict[str, Any]]) -> None:
 
 
 def _render_health_fallback(root: Path) -> None:
+    from angelus.daemon import _belfry_status
+
     status, pid = _pid_status(root / "state" / "angelus.pid")
     click.echo(f"daemon: {status}")
     if pid is not None:
@@ -433,6 +446,11 @@ def _render_health_fallback(root: Path) -> None:
     connection = _ro_connect(root / "state" / "angelus.sqlite3")
     if connection is None:
         click.echo("sqlite: unavailable")
+        # Belfry sentinel is a plain file read -- surface it even if sqlite
+        # is unavailable. The whole point of belfry is to be useful when
+        # angelus is unhealthy, and "is belfry alive too?" is exactly the
+        # question this fallback exists to answer.
+        _render_belfry(_belfry_status(root))
         return
     try:
         catalog = Catalog(connection, root)
@@ -451,6 +469,7 @@ def _render_health_fallback(root: Path) -> None:
         _render_deps(catalog.all_dep_health())
     finally:
         connection.close()
+    _render_belfry(_belfry_status(root))
     click.echo("(sources and next-fire times need the daemon)")
 
 
