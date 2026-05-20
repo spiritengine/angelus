@@ -650,6 +650,81 @@ class Catalog:
         self.connection.execute("DELETE FROM channel_health")
         self.connection.commit()
 
+    def record_digest_send_failure(
+        self, pipe: str, channel: str, error: str
+    ) -> bool:
+        """Increment the per-channel digest attempt counter.
+
+        Returns True when this call crosses MAX_RETRY_ATTEMPTS and the
+        channel is marked unhealthy in channel_health; False otherwise.
+
+        Counter shape is (pipe, channel) -- intentionally NOT per-finding.
+        A digest cycle attempts one channel carrying a batch of finding_ids;
+        the immediate path's per-(pipe, finding_id) counter on pipe_queues
+        would inflate the threshold N-per-cycle on the digest path. Reuses
+        the same MAX_RETRY_ATTEMPTS threshold so the two paths' ladders
+        match.
+        """
+        now = utcnow()
+        row = self.connection.execute(
+            """
+            SELECT attempts FROM digest_channel_attempts
+            WHERE pipe = ? AND channel = ?
+            """,
+            (pipe, channel),
+        ).fetchone()
+        attempts = int(row["attempts"]) if row is not None else 0
+        next_attempt = attempts + 1
+        self.connection.execute(
+            """
+            INSERT INTO digest_channel_attempts
+                (pipe, channel, attempts, last_error, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (pipe, channel) DO UPDATE SET
+                attempts = excluded.attempts,
+                last_error = excluded.last_error,
+                updated_at = excluded.updated_at
+            """,
+            (pipe, channel, next_attempt, error, now),
+        )
+        crossed = next_attempt >= MAX_RETRY_ATTEMPTS
+        if crossed:
+            self.mark_channel_unhealthy(channel, error)
+        self.connection.commit()
+        return crossed
+
+    def record_digest_send_success(self, pipe: str, channel: str) -> None:
+        """Reset the per-channel digest attempt counter after a successful send.
+
+        An intermittent channel must not gradually accumulate to threshold
+        across a long stretch of (mostly-succeeding) cycles -- only N
+        CONSECUTIVE failures should mark unhealthy, matching the immediate
+        path's per-finding ladder semantics. channel_health itself is NOT
+        cleared here: it is daemon-restart-scoped by slice-2 design, and
+        re-clearing on a single success would let a flapping channel oscillate
+        in and out of the immediate path's is_channel_unhealthy skip on
+        every drain.
+        """
+        self.connection.execute(
+            """
+            DELETE FROM digest_channel_attempts
+            WHERE pipe = ? AND channel = ?
+            """,
+            (pipe, channel),
+        )
+        self.connection.commit()
+
+    def clear_digest_channel_attempts(self) -> None:
+        """Wipe the per-channel digest attempt counter (daemon-restart scope).
+
+        Mirrors clear_channel_health: the threshold ladder resets when the
+        daemon restarts, so an operator-initiated restart is the supported
+        path to re-enable a channel that has been marked unhealthy via the
+        digest path.
+        """
+        self.connection.execute("DELETE FROM digest_channel_attempts")
+        self.connection.commit()
+
     def write_internal_finding(
         self, source: str, finding_type: str, entity: str, body: str, known_pipes: set[str]
     ) -> int:
