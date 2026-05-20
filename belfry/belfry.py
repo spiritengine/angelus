@@ -10,6 +10,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import time
 import urllib.parse
 import urllib.request
 from datetime import UTC, datetime, timedelta
@@ -17,12 +18,25 @@ from pathlib import Path
 
 
 DEFAULT_WEDGE_THRESHOLD_SEC = 600
+DEFAULT_SENTINEL_FILENAME = "belfry-pinged-at"
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
     root = Path(argv[0] if argv else ".").resolve()
     state = root / "state"
+
+    # Touch the liveness sentinel on every tick, success or failure. The
+    # question this answers is "is belfry firing on schedule?" -- belfry's
+    # OWN liveness, separate from whatever angelus health the rest of the
+    # tick discovers. A tick that finds angelus down still proves belfry
+    # itself is alive and on cron, so the touch must precede the
+    # angelus-health checks below and run on every code path. The angelus
+    # daemon reads this file's mtime in _op_health; see Section 5b Q2 of
+    # brief-20260520-tqov for the sentinel-file-over-sqlite-table rationale
+    # (single-writer-to-sqlite invariant preserved by leaving sqlite
+    # untouched here).
+    touch_sentinel(sentinel_path(state))
 
     dead_reason = pid_failure(state / "angelus.pid")
     wedge_reason = None if dead_reason else wedge_failure(state / "angelus.sqlite3")
@@ -37,6 +51,41 @@ def main(argv: list[str] | None = None) -> int:
     ok = ping_env("ANGELUS_BELFRY_SUCCESS_URL")
     print("angelus belfry: ok")
     return 0 if ok else 2
+
+
+def sentinel_path(state_dir: Path) -> Path:
+    """Resolve the belfry liveness sentinel path.
+
+    ANGELUS_BELFRY_SENTINEL_PATH overrides; default is
+    <state_dir>/belfry-pinged-at. The same env var and default are read
+    by the angelus daemon in _op_health so both sides stay in sync.
+    """
+    override = os.environ.get("ANGELUS_BELFRY_SENTINEL_PATH")
+    if override:
+        return Path(override)
+    return state_dir / DEFAULT_SENTINEL_FILENAME
+
+
+def touch_sentinel(path: Path) -> None:
+    """Update the sentinel file's mtime to now, creating it if missing.
+
+    Failures are logged to stderr and swallowed: the sentinel is a
+    liveness signal, not a correctness boundary -- a transient EIO must
+    not stop belfry from issuing its angelus-health pings on this tick.
+    A missing sentinel is itself the "never pinged" signal the daemon
+    surfaces, so failing closed (no touch) degrades into the existing
+    daemon-side handling.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch(exist_ok=True)
+        now = time.time()
+        os.utime(path, (now, now))
+    except OSError as exc:
+        print(
+            f"angelus belfry: failed to touch sentinel {path}: {exc}",
+            file=sys.stderr,
+        )
 
 
 def pid_failure(pid_file: Path) -> str | None:
