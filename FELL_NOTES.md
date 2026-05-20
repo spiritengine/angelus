@@ -1168,8 +1168,10 @@ of source overdue-ness, but finding-20260520-ewun recorded that this
 surface is non-functional under the actual APScheduler behavior:
 `max_instances=1` jobs can keep a future-facing `next_run_time` even
 through repeated failures, so "overdue" does not reliably answer "this
-source is blocked by a dead prerequisite." Patrick's correction was to
-derive the operator signal from lodged dependency health instead.
+source is blocked by a dead prerequisite," and finding-20260520-dwt7
+recorded that master had no lodged source->dependency surface to read
+against. Patrick's correction was to derive the operator signal from
+lodged dependency health instead.
 
 Master at `2e99ee3` had the reader half ready (`_op_health["deps"]`
 already surfaces dependency health) but was missing the source-side
