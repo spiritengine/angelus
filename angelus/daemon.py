@@ -92,6 +92,12 @@ class AngelusDaemon:
             LOGGER.info("startup recovery: %d ready, %d failed", recovered, failed)
             # Channels stay unhealthy only until daemon restart (slice 2 scope).
             self.catalog.clear_channel_health()
+            # Same restart-scope for the per-channel digest attempt counter
+            # that feeds the channel_health threshold ladder on the digest
+            # path -- if a daemon restart wipes channel_health, leaving the
+            # counter populated would let a single subsequent failure cross
+            # the threshold immediately on the new generation.
+            self.catalog.clear_digest_channel_attempts()
             self._register_initial_jobs()
             self.scheduler.start()
             scheduler_started = True
