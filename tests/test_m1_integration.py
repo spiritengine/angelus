@@ -603,3 +603,113 @@ def test_muted_unhealthy_dep_is_silent_on_now_but_visible_in_health(
 
     asyncio.run(driver())
     assert reloader is None
+
+
+# --- M2 slice 1: channel rename rehearsal --------------------------------
+
+
+def test_channel_rename_mid_pending_finding_is_rejected_at_cross_ref(
+    tmp_path,
+) -> None:
+    """Renaming channels/push.yaml -> channels/telegram.yaml while a
+    finding is still pending in pipe_queues for the `now` pipe (which
+    references `push`) must NOT silently lose the finding and must NOT
+    drop the `push` channel from lodging. The push.yaml deletion event
+    is rejected at cross-ref time, an internal/lodging cross_ref_broken
+    finding lands for the deletion side of the rename, and the original
+    finding stays pending. A reversion (rename back to push.yaml)
+    settles the system to a clean steady state with no lingering
+    rejection.
+
+    Discrimination (recorded in FELL_NOTES): if the `if errors:
+    self._reject_cross_ref(...) return` arm in
+    LodgingReloader._apply_removal were removed, the push removal would
+    apply unchecked, lodging.channels would lose `push`, and no
+    cross_ref_broken finding would be written. The assertion
+    `"push" in daemon.lodging.channels` (and equally the
+    `cross_ref_broken`-finding presence assertion) fires under that
+    inversion.
+    """
+    _base_lodging(tmp_path)
+    daemon = AngelusDaemon(tmp_path)
+    reloader = LodgingReloader(daemon, tmp_path, debounce_seconds=0.0)
+
+    push_path = tmp_path / "channels" / "push.yaml"
+    telegram_path = tmp_path / "channels" / "telegram.yaml"
+
+    async def driver() -> None:
+        try:
+            finding_id = daemon.catalog.write_finding(
+                None,
+                {"source": "s", "type": "down", "entity": "e",
+                 "target_pipes": ["now"]},
+                set(daemon.lodging.pipes),
+            )
+            pending = [
+                (r["pipe"], r["status"])
+                for r in daemon.connection.execute(
+                    "SELECT pipe, status FROM pipe_queues "
+                    "WHERE finding_id = ?",
+                    (finding_id,),
+                )
+            ]
+            assert pending == [("now", "pending")], pending
+
+            # Mid-flight rename on disk. watchdog produces a delete event
+            # for the old path AND a create event for the new path on a
+            # rename; drive both into the queue in that order so the
+            # delete is processed under the still-broken cross-ref.
+            os.rename(push_path, telegram_path)
+            reloader.event_queue.put(str(push_path))
+            reloader.event_queue.put(str(telegram_path))
+            await reloader.process_pending_events()
+
+            # The push-removal event broke the cross-ref (pipes/now
+            # still references `push`) and was rejected with an
+            # internal/lodging cross_ref_broken finding for the
+            # push.yaml path.
+            cross_ref = [
+                dict(r) for r in daemon.connection.execute(
+                    "SELECT type, entity FROM findings "
+                    "WHERE source = 'internal/lodging' "
+                    "AND type = 'cross_ref_broken'"
+                )
+            ]
+            assert cross_ref, "expected a cross_ref_broken finding"
+            assert any(
+                r["entity"] == "channels/push.yaml" for r in cross_ref
+            ), cross_ref
+
+            # `push` survives in lodging (the whole point of the
+            # rejection); the unrelated telegram-add applied in its
+            # own right.
+            assert "push" in daemon.lodging.channels
+            assert "telegram" in daemon.lodging.channels
+            assert daemon.lodging.pipes["now"].channels == ["push"]
+
+            # The original pending finding is NOT lost.
+            rows = [
+                (r["pipe"], r["status"])
+                for r in daemon.connection.execute(
+                    "SELECT pipe, status FROM pipe_queues "
+                    "WHERE finding_id = ?",
+                    (finding_id,),
+                )
+            ]
+            assert rows == [("now", "pending")], rows
+
+            # Reversion: rename telegram.yaml -> push.yaml. The reloader
+            # picks up both events, the push-add no-ops against the
+            # still-live `push` entry, telegram-remove applies cleanly
+            # (nothing references telegram), and the rejection clears.
+            os.rename(telegram_path, push_path)
+            reloader.event_queue.put(str(push_path))
+            reloader.event_queue.put(str(telegram_path))
+            await reloader.process_pending_events()
+            assert "push" in daemon.lodging.channels
+            assert "telegram" not in daemon.lodging.channels
+            assert reloader.rejected == {}, reloader.rejected
+        finally:
+            daemon.connection.close()
+
+    asyncio.run(driver())
