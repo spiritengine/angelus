@@ -531,6 +531,204 @@ def test_empty_day_channel_failure_records_dispatch_and_emits_internal(
     assert channel_health_rows == []
 
 
+def _digest_email_drain(catalog: Catalog, workdir: Path) -> PipeDrain:
+    return PipeDrain(
+        catalog,
+        Pipe(
+            name="daily",
+            cadence="0 8 * * *",
+            render_kind="digest",
+            template=None,
+            channels=["email"],
+            render=_daily_pipe().render,
+        ),
+        {
+            "email": Channel(
+                name="email",
+                kind="email",
+                command="/home/user/projects/patbot-email/patbot-email",
+                to="person@example.com",
+            )
+        },
+        workdir,
+        {"now", "daily"},
+    )
+
+
+def test_digest_channel_repeated_failure_marks_channel_unhealthy(
+    tmp_path, monkeypatch
+) -> None:
+    from angelus.storage.catalog import MAX_RETRY_ATTEMPTS
+
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    _write_templates(tmp_path)
+    drain = _digest_email_drain(catalog, tmp_path)
+
+    async def fake_email(_channel, _subject: str, _body: str, _workdir: Path) -> None:
+        raise RuntimeError("smtp dead")
+
+    async def fake_llm(self, _pipe, _structured):
+        return "This is the chronicler body.", None
+
+    monkeypatch.setattr(pipe_runner, "send_email", fake_email)
+    monkeypatch.setattr(PipeDrain, "_render_llm_body", fake_llm)
+    monkeypatch.setattr(pipe_runner, "_is_same_utc_day", lambda *_args: False)
+
+    try:
+        catalog.write_finding(
+            None,
+            {
+                "source": "scheduled/test",
+                "type": "down",
+                "entity": "site",
+                "severity": "high",
+                "target_pipes": ["daily"],
+            },
+            {"daily"},
+        )
+        per_cycle_attempts: list[int] = []
+        per_cycle_health: list[list[str]] = []
+        for _ in range(MAX_RETRY_ATTEMPTS):
+            asyncio.run(drain.drain_once())
+            attempts_row = connection.execute(
+                """
+                SELECT attempts FROM digest_channel_attempts
+                WHERE pipe = 'daily' AND channel = 'email'
+                """
+            ).fetchone()
+            per_cycle_attempts.append(
+                int(attempts_row["attempts"]) if attempts_row is not None else 0
+            )
+            per_cycle_health.append(
+                [
+                    row["channel"]
+                    for row in connection.execute(
+                        "SELECT channel FROM channel_health WHERE status = 'unhealthy'"
+                    )
+                ]
+            )
+    finally:
+        connection.close()
+
+    assert per_cycle_attempts == list(range(1, MAX_RETRY_ATTEMPTS + 1))
+    assert per_cycle_health[: MAX_RETRY_ATTEMPTS - 1] == [
+        [] for _ in range(MAX_RETRY_ATTEMPTS - 1)
+    ]
+    assert per_cycle_health[-1] == ["email"]
+
+
+def test_digest_channel_success_resets_failure_counter(tmp_path, monkeypatch) -> None:
+    from angelus.storage.catalog import MAX_RETRY_ATTEMPTS
+
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    _write_templates(tmp_path)
+    drain = _digest_email_drain(catalog, tmp_path)
+    cycle_outcomes = (
+        ["fail"] * (MAX_RETRY_ATTEMPTS - 1)
+        + ["ok"]
+        + ["fail"] * (MAX_RETRY_ATTEMPTS - 1)
+    )
+    cycle_index = {"i": 0}
+
+    async def fake_email(_channel, _subject: str, _body: str, _workdir: Path) -> None:
+        outcome = cycle_outcomes[cycle_index["i"]]
+        cycle_index["i"] += 1
+        if outcome == "fail":
+            raise RuntimeError("smtp dead")
+
+    async def fake_llm(self, _pipe, _structured):
+        return "This is the chronicler body.", None
+
+    monkeypatch.setattr(pipe_runner, "send_email", fake_email)
+    monkeypatch.setattr(PipeDrain, "_render_llm_body", fake_llm)
+    monkeypatch.setattr(pipe_runner, "_is_same_utc_day", lambda *_args: False)
+
+    try:
+        for cycle in range(len(cycle_outcomes)):
+            catalog.write_finding(
+                None,
+                {
+                    "source": "scheduled/test",
+                    "type": "down",
+                    "entity": f"site-cycle-{cycle}",
+                    "severity": "high",
+                    "target_pipes": ["daily"],
+                },
+                {"daily"},
+            )
+            asyncio.run(drain.drain_once())
+        final_attempts_row = connection.execute(
+            """
+            SELECT attempts FROM digest_channel_attempts
+            WHERE pipe = 'daily' AND channel = 'email'
+            """
+        ).fetchone()
+        final_health = list(
+            connection.execute(
+                "SELECT channel FROM channel_health WHERE status = 'unhealthy'"
+            )
+        )
+    finally:
+        connection.close()
+
+    assert cycle_index["i"] == len(cycle_outcomes)
+    assert final_attempts_row is not None
+    assert int(final_attempts_row["attempts"]) == MAX_RETRY_ATTEMPTS - 1
+    assert final_health == []
+
+
+def test_digest_attempts_send_even_when_channel_marked_unhealthy(
+    tmp_path, monkeypatch
+) -> None:
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    _write_templates(tmp_path)
+    drain = _digest_email_drain(catalog, tmp_path)
+    catalog.mark_channel_unhealthy("email", "marked-by-earlier-cycle")
+    connection.commit()
+    attempts: list[str] = []
+
+    async def fake_email(_channel, subject: str, _body: str, _workdir: Path) -> None:
+        attempts.append(subject)
+        raise RuntimeError("still broken")
+
+    async def fake_llm(self, _pipe, _structured):
+        return "This is the chronicler body.", None
+
+    monkeypatch.setattr(pipe_runner, "send_email", fake_email)
+    monkeypatch.setattr(PipeDrain, "_render_llm_body", fake_llm)
+
+    try:
+        catalog.write_finding(
+            None,
+            {
+                "source": "scheduled/test",
+                "type": "down",
+                "entity": "site",
+                "severity": "high",
+                "target_pipes": ["daily"],
+            },
+            {"daily"},
+        )
+        asyncio.run(drain.drain_once())
+        dispatch = connection.execute(
+            """
+            SELECT status, last_error
+            FROM dispatches
+            WHERE pipe = 'daily' AND channel = 'email'
+            """
+        ).fetchone()
+    finally:
+        connection.close()
+
+    assert len(attempts) == 1
+    assert dispatch is not None
+    assert dispatch["status"] == "failed"
+    assert dispatch["last_error"] == "still broken"
+
+
 def test_llm_timeout_kills_subprocess_and_falls_back(tmp_path, monkeypatch) -> None:
     connection = init_db(tmp_path / "angelus.sqlite3")
     catalog = Catalog(connection, tmp_path)
