@@ -741,6 +741,31 @@ class Catalog:
             known_pipes,
         )
 
+    def recover_triage_processing_rows(self) -> int:
+        """Delete observation_triage rows left at status='processing' from
+        a prior daemon's hard exit (SIGKILL, OS kill, host crash). Returns
+        the row count cleared.
+
+        Two intents this recovers from, both of which can leave the row
+        orphaned at 'processing' across a daemon restart:
+        - hard kill: SIGKILL/SIGSEGV/host loss bypasses Python's
+          shutdown handlers, so the in-process graceful-cancel arm
+          (which clears the same row via a triage task's cancellation
+          handler) never fires; this is the hard-exit companion to
+          that arm.
+        - host crash mid-triage: same shape, same orphan.
+
+        Bounded to status='processing' so any transition that
+        legitimately completed before the crash (status now 'success' or
+        'failed') is untouched. Runs once at daemon startup before the
+        triage loop spins up, so there is no concurrency to race
+        against."""
+        cursor = self.connection.execute(
+            "DELETE FROM observation_triage WHERE status = 'processing'"
+        )
+        self.connection.commit()
+        return cursor.rowcount
+
     def recover_writing_rows(self) -> tuple[int, int]:
         recovered = 0
         failed = 0

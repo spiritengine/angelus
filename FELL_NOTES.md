@@ -730,3 +730,184 @@ per-direction snapshot assertion — confirming the rejection arm
 itself, separately from the per-direction guards.
 
 Each inversion reverted; all three parametrized cases pass.
+
+---
+
+## M2 slice 4 — rate-limit overflow end-to-end
+
+### Verdict: NO BUG (end-to-end rehearsal of shipped overflow protocol).
+
+### What was measured
+The Section 5b Q1 rescope dropped the cz9x `deferred_alerts` table
+noun and locked the bar at the shipped overflow + `suppress_pipe_item_to`
++ `suppressed_findings_since` protocol. Slice 4 exercises that
+protocol end-to-end with the source/triager write surface a
+production source would use:
+
+* Lodging: `scheduled/canary` source, `canary` triager
+  (`run_python_triager` subprocess emitting 4 high-severity findings
+  to `target_pipes: ['now']`), `now` pipe with
+  `rate_limit: { per_channel: 2/hr, overflow: daily }`, `daily`
+  digest pipe with a `rate-limit-callout` structured preamble.
+* The four findings are written through `Catalog.write_finding`
+  via `_run_triager`, NOT pre-staged into the catalog.
+* `pipe_drains["now"].drain_once()` dispatches via the mocked
+  `send_push` (channel command `'true'`).
+* `pipe_drains["daily"].drain_once()` runs the structured preamble
+  template against `suppressed_findings_since(None)` and the
+  (mocked) `_render_llm_body` against `_structured_inputs`.
+
+Observed:
+
+      dispatches(now, sent)      = 2          # findings 1+2
+      pipe_queues now/finding 1+2= 'dispatched'
+      pipe_queues now/finding 3+4= 'suppressed'
+      pipe_queues daily/3+4      = 'pending' (via suppress_pipe_item_to)
+      suppressed_findings_since  = [{e2, high}, {e3, high}]
+      daily_message preamble     = "2 alert(s) suppressed by rate limit:
+                                    - [high] e2
+                                    - [high] e3"
+
+### Discriminating test
+`tests/test_m1_integration.py::test_rate_limit_overflow_routes_excess_to_daily_and_renders_suppressed_callout`
+
+The test splits into four independently-discriminating axes (one
+per property of the overflow protocol):
+
+* axis A (send rail): `len([d for d in now_dispatches if d == ('push',
+  'sent')]) == 2` AND `len(push_sends) == 3` (2 now + 1 daily).
+* axis B (suppress rail): full `pipe_queues` snapshot equality on now
+  AND daily, naming exactly which finding rows are dispatched /
+  suppressed / pending.
+* axis C (digest callout): the dispatched daily message contains
+  "2 alert(s) suppressed by rate limit" AND the suppressed entity
+  names; the structured LLM input has the matching
+  `suppressed_findings` list.
+* axis D (severity preservation): `suppressed_findings_since`
+  returns severity='high' for each row AND the rendered preamble
+  contains "[high] e2" / "[high] e3" AND does NOT contain
+  "informational".
+
+### Discrimination evidence
+Three inversions performed in the worktree, observed, reverted:
+
+* Invert `_over_rate_limit` in `angelus/pipes/runner.py` to
+  `return False` -> the cap never triggers, all 4 findings dispatch
+  as 'sent'. Axis A fails first at `assert len(now_sent) == 2`
+  with `[('push','sent'), ('push','sent'), ('push','sent'), ('push','sent')]`.
+* Replace the `suppress_pipe_item_to(...); continue` lines in
+  `_drain_immediate` (`angelus/pipes/runner.py`) with bare
+  `continue` -> the cap triggers (axis A still holds: only 2 send)
+  but the suppressed findings stay at status='pending' on `now` and
+  never reach `daily`. Axis B fails at the now-queue snapshot
+  equality: `(3, 'pending') != (3, 'suppressed')`.
+* Append `for it in items: it["severity"] = "informational"` to
+  `Catalog.suppressed_findings_since` in
+  `angelus/storage/catalog.py` (post-`_finding_dict`) -> the
+  suppressed-rows reader downcasts severity on its way out, so the
+  digest reads 'informational' rows even though `findings.severity`
+  is still 'high'. Axes A/B/C still pass; axis D fails first at
+  `assert state["suppressed_findings"] == [{"entity": "e2",
+  "severity": "high"}, ...]` (got
+  `{"entity": "e2", "severity": "informational"}` at index 0).
+  The downstream `[high] e2` / `informational not in daily_msg`
+  assertions would also have failed had pytest continued, since
+  the same downcast feeds the daily template's
+  `suppressed_findings` list.
+
+All three inversions reverted; the test passes deterministically
+(the test runs in ~0.6s with no real subprocess on `send_push` due
+to the monkeypatch).
+
+---
+
+## M2 slice 5 — SIGKILL-mid-drain recovery
+
+### Verdict: BUG FIXED (small startup-clear addition for orphan triage rows).
+
+### What was measured
+Round 5 of the M1 integration fell locked the orphan
+`observation_triage` 'processing' row class on the
+graceful-cancellation axis (`_triage_under_semaphore`'s
+`CancelledError` arm calls `clear_triage_processing`). SIGKILL
+bypasses Python's exception handlers, so that arm never fires --
+the same orphan class remains open on the hard-exit axis. cz9x
+Item 3 / Section 6 slice 5 asks for the explicit SIGKILL-mid-drain
+harness and three-axis discrimination on the recovery property.
+
+Phase A of the test spawns a real angelus daemon as an OS
+subprocess (the same `_spawn_daemon_subprocess` shape
+`tests/test_belfry.py:_spawn_daemon` uses for slice 6, with
+`start_new_session=True` per Risk-3 subprocess hardening), waits
+for at least one dispatch to land, then `os.kill(pid, SIGKILL)`s
+the daemon. Phase B pre-seeds three deterministic recovery
+artifacts via `Catalog`:
+
+* a 'writing' finding row with `body_ref` pointing at a real file
+  (the recoverable variant from `tests/test_slice1.py:84`);
+* an orphan `observation_triage` 'processing' row on a fresh
+  observation (simulating a SIGKILL caught during in-flight
+  triage);
+* a forced half-state for axis 3: a finding that was already
+  'sent' in phase A is forced back to `pipe_queues.status='pending'`
+  (mimics what a broken record_dispatch atomic-commit would
+  produce on a SIGKILL between the dispatches INSERT and the
+  pipe_queues UPDATE).
+
+Phase C spawns a fresh daemon, sleeps 4s (long enough for
+startup recovery + a handful of drain iterations + re-triage of
+the orphaned observation), then SIGTERMs the daemon for a clean
+shutdown.
+
+Observed (production code):
+
+      findings(status='writing')       = 0    # axis 1: recovered
+      observation_triage(='processing')= 0    # axis 2: cleared
+      orphan observation row triage    = 'success'  # re-triaged
+      dispatches per finding (sent)    = 1 each, except the forced
+                                         half-state finding -> 2
+
+### Product change (small)
+The brief's three-axis discrimination requires an
+`observation_triage` 'processing' clear "on startup or however
+it's wired". The shipped graceful-cancel arm covers SIGTERM but
+not SIGKILL; without a startup-time clear, `ready_observations_for`
+excludes the orphan forever. Two additions, mirroring the existing
+`recover_writing_rows` / `clear_channel_health` startup-recovery
+pattern:
+
+* `Catalog.recover_triage_processing_rows()` -- bounded
+  `DELETE FROM observation_triage WHERE status = 'processing'`,
+  self-committing. Docstring is by-intent (hard-kill axis vs.
+  host crash) per the rounds 6/7/8 lesson, no caller-name
+  enumeration.
+* `AngelusDaemon.run()` calls it after `recover_writing_rows`
+  and before the triage loop spins up, so there is no
+  concurrency to race against.
+
+### Discriminating test
+`tests/test_m1_integration.py::test_sigkill_mid_drain_recovery_three_axis`
+
+### Discrimination evidence
+Three inversions performed in the worktree, observed, reverted:
+
+* Invert `Catalog.recover_writing_rows` to `return (0, 0)` -> the
+  pre-seeded 'writing' finding row never transitions. Axis 1
+  fails at:
+        assert writing_status["status"] == "ready"
+        # got 'writing'
+* Invert `Catalog.recover_triage_processing_rows` to `return 0` ->
+  the pre-seeded orphan 'processing' row remains. Axis 2 fails at:
+        assert processing_count == 0
+        # got 1
+* Invert `Catalog.record_dispatch`'s `pipe_queues` UPDATE by
+  gating it with `... and False` -> every dispatched finding's
+  queue row stays 'pending' across phase A and is re-dispatched
+  by phase C's fresh daemon. Axis 3 fails at:
+        assert offenders == expected_offender
+        # offenders inflated: {1: 5, 2: 4, 4: 3, 5: 3, 6: 2}
+        # expected: {1: 2} (only the forced half-state finding)
+
+All three inversions reverted; the test passes deterministically
+(~5s end-to-end, dominated by the 4s post-daemon-B sleep that
+gives recovery + drain time to settle).
