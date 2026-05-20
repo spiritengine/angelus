@@ -15,6 +15,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
+import sqlite3
+import subprocess
+import sys
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -25,6 +29,9 @@ import angelus.pipes.runner as pipe_runner
 from angelus.daemon import AngelusDaemon
 from angelus.lodging.reloader import LodgingReloader
 from angelus.pipes import PipeDrain
+from angelus.storage import Catalog, init_db, utcnow
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 # --- shared lodging fixtures ---------------------------------------------
@@ -1114,3 +1121,440 @@ def test_rate_limit_overflow_routes_excess_to_daily_and_renders_suppressed_callo
     ]
     assert "[high] e2" in daily_msg and "[high] e3" in daily_msg, daily_msg
     assert "informational" not in daily_msg, daily_msg
+
+
+# --- M2 slice 5: SIGKILL-mid-drain recovery ------------------------------
+
+
+def _spawn_daemon_subprocess(root: Path) -> subprocess.Popen:
+    """Spawn the angelus daemon as an OS subprocess so it can be
+    SIGKILLed without taking the test runner down with it (this is the
+    same shape test_belfry.py uses for its independence test). Risk-3
+    hardening: start_new_session=True puts the daemon in its own
+    process group, so an emergency kill from the test's finally clause
+    reaps the whole tree."""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(REPO_ROOT) + (
+        os.pathsep + env["PYTHONPATH"] if "PYTHONPATH" in env else ""
+    )
+    env["ANGELUS_DRY_RUN"] = "1"
+    return subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "from angelus.daemon import main\n"
+            "from pathlib import Path\n"
+            "import sys\n"
+            "main(Path(sys.argv[1]))\n",
+            str(root),
+        ],
+        env=env,
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _read_daemon_pid(root: Path, timeout: float) -> int:
+    pid_path = root / "state" / "angelus.pid"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            return int(pid_path.read_text(encoding="utf-8").strip())
+        except (FileNotFoundError, ValueError):
+            time.sleep(0.05)
+    raise AssertionError(f"daemon PID file never appeared at {pid_path}")
+
+
+def _wait_for_row(
+    root: Path, sql: str, params: tuple = (), timeout: float = 15.0
+) -> sqlite3.Row | None:
+    """Poll the read-only sqlite until `sql` returns a row or timeout. The
+    daemon writes to the same db on its own connection; the test reads
+    in URI read-only mode so the writer is not contended."""
+    db = root / "state" / "angelus.sqlite3"
+    deadline = time.monotonic() + timeout
+    last_err: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+            try:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(sql, params).fetchone()
+            finally:
+                conn.close()
+            if row is not None:
+                return row
+        except sqlite3.Error as exc:
+            last_err = exc
+        time.sleep(0.05)
+    if last_err is not None:
+        raise AssertionError(f"poll never read a row: {last_err}") from last_err
+    return None
+
+
+def _sigkill_and_reap(proc: subprocess.Popen, pid: int) -> None:
+    """SIGKILL the leader and confirm the kernel has reaped the pid.
+    SIGKILL is uncatchable; the daemon's finally clause never runs, so
+    the PID file, in-flight 'writing' rows, and any 'processing'
+    observation_triage rows survive the kill as orphans. Bounded wait
+    so a stuck process surfaces in the test rather than hanging CI."""
+    os.kill(pid, signal.SIGKILL)
+    try:
+        proc.wait(timeout=5.0)
+    except subprocess.TimeoutExpired as exc:
+        raise AssertionError(
+            f"daemon PID {pid} did not exit within 5s of SIGKILL"
+        ) from exc
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and _alive(pid):
+        time.sleep(0.02)
+    if _alive(pid):
+        raise AssertionError(f"daemon PID {pid} still alive after SIGKILL")
+
+
+def _sigterm_and_wait(proc: subprocess.Popen, timeout: float = 15.0) -> None:
+    if proc.poll() is not None:
+        return
+    proc.send_signal(signal.SIGTERM)
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        # Fallback: emergency reap of the process group via SIGKILL on
+        # the leader (start_new_session put the daemon in its own group).
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait(timeout=5.0)
+        raise AssertionError(
+            f"daemon did not exit within {timeout}s of SIGTERM"
+        ) from exc
+
+
+def _write_slice5_lodging(root: Path) -> None:
+    """Real source/triager/pipe/channel surface for the SIGKILL test. The
+    source fires every 1s so the daemon produces real observations,
+    findings, and dispatches as it runs. The triager is fast (no sleep)
+    so a fresh daemon's drain completes promptly; the SIGKILL on the
+    first daemon catches whatever state exists, and pre-seeded rows in
+    phase B make the three recovery axes deterministic regardless of
+    timing."""
+    (root / "sources" / "scheduled").mkdir(parents=True)
+    (root / "sources" / "scheduled" / "canary.yaml").write_text(
+        "cadence: 1s\ncheck:\n  kind: shell\n  command: 'echo {}'\n",
+        encoding="utf-8",
+    )
+    (root / "triagers" / "handlers").mkdir(parents=True)
+    (root / "triagers" / "handlers" / "emit_one.py").write_text(
+        "import json, sys\n"
+        "data = json.loads(sys.stdin.read())\n"
+        "prior = data.get('prior_state') or {}\n"
+        "n = int(prior.get('n', 0)) + 1\n"
+        "findings = [{\n"
+        "    'source': 'scheduled/canary',\n"
+        "    'type': 'down',\n"
+        "    'entity': f'e{n}',\n"
+        "    'dedup_key': f'scheduled/canary:down:e{n}',\n"
+        "    'severity': 'high',\n"
+        "    'target_pipes': ['now'],\n"
+        "    'body': {'text': f'alert {n}'},\n"
+        "}]\n"
+        "print(json.dumps({'findings': findings, 'new_state': {'n': n}}))\n",
+        encoding="utf-8",
+    )
+    (root / "triagers" / "canary.yaml").write_text(
+        "inputs:\n  source: scheduled/canary\n"
+        "handler:\n  kind: python\n"
+        "  path: triagers/handlers/emit_one.py\n",
+        encoding="utf-8",
+    )
+    (root / "pipes").mkdir()
+    (root / "pipes" / "now.yaml").write_text(
+        "cadence: immediate\nchannels: [push]\n"
+        "render:\n  kind: dumb-alert\n"
+        "  template: '{type}:{entity}'\n",
+        encoding="utf-8",
+    )
+    (root / "channels").mkdir()
+    (root / "channels" / "push.yaml").write_text(
+        "kind: push\ncommand: 'true'\n", encoding="utf-8"
+    )
+
+
+def test_sigkill_mid_drain_recovery_three_axis(tmp_path) -> None:
+    """SIGKILL the daemon while it is producing observations / findings /
+    dispatches, then spawn a fresh daemon against the same state dir.
+    After the fresh daemon settles, three independently-discriminating
+    properties must hold (per the round-5 pattern in FELL_NOTES):
+
+      Axis 1 (writing-row recovery): findings / observations that were
+        mid-write at the SIGKILL transition from 'writing' to 'ready'
+        (body file landed) or 'failed' (body missing) via
+        recover_writing_rows. Asserted by: zero rows at status='writing'
+        after the fresh daemon's startup.
+
+      Axis 2 (triage-orphan recovery): observation_triage rows left at
+        status='processing' from the prior daemon's hard exit are
+        cleared by recover_triage_processing_rows at startup. Without
+        this clear, ready_observations_for would exclude the
+        observation forever (round-5 orphan class on the hard-exit
+        axis). Asserted by: zero rows at status='processing' after the
+        fresh daemon's startup.
+
+      Axis 3 (per-row dispatch commit / no duplicates): record_dispatch
+        commits the dispatches INSERT and the pipe_queues UPDATE in one
+        transaction, so a SIGKILL between cannot leave the queue at
+        'pending' while a 'sent' dispatch row already exists. Asserted
+        by: each finding has at most one 'sent' dispatch.
+
+    Discrimination (verified locally; each inversion reverted):
+      * Make recover_writing_rows a no-op -> the pre-seeded 'writing'
+        finding row never transitions and axis 1's assertion fires.
+      * Make recover_triage_processing_rows a no-op -> the pre-seeded
+        orphan 'processing' row remains and axis 2's assertion fires.
+      * Replace record_dispatch's pipe_queues UPDATE with a no-op ->
+        the dispatched-and-sent-but-still-pending state from phase A
+        gets re-dispatched by phase C's drain and axis 3 sees two
+        'sent' dispatches for the same finding.
+    """
+    _write_slice5_lodging(tmp_path)
+
+    # ----- phase A: real daemon, real work, real SIGKILL -----
+    proc_a = _spawn_daemon_subprocess(tmp_path)
+    try:
+        pid_a = _read_daemon_pid(tmp_path, timeout=15.0)
+        assert _alive(pid_a)
+        # Wait for the daemon to dispatch at least one finding -- proves
+        # the source/triager/pipe stack is running before we SIGKILL it.
+        _wait_for_row(
+            tmp_path,
+            "SELECT id FROM dispatches WHERE status='sent' LIMIT 1",
+            timeout=20.0,
+        )
+        _sigkill_and_reap(proc_a, pid_a)
+    finally:
+        if proc_a.poll() is None:
+            try:
+                os.killpg(proc_a.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc_a.wait(timeout=5.0)
+
+    # Phase A artifacts that the test relies on:
+    state_db = tmp_path / "state" / "angelus.sqlite3"
+    assert state_db.exists()
+
+    # ----- phase B: pre-seed deterministic axis-1, axis-2, axis-3 cases --
+    # Phase A's SIGKILL may or may not leave a 'writing' row, an orphan
+    # 'processing' row, and a stale 'pending' queue depending on what
+    # the kernel scheduled between writes. We insert deterministic
+    # rows now so the three axes are not flakily-discriminating.
+    catalog_root = tmp_path
+    connection = init_db(state_db)
+    catalog = Catalog(connection, catalog_root)
+    try:
+        # Axis 1 (writing-row recovery): a writing finding with body
+        # file present is the recoverable variant of the partial-write
+        # race recover_writing_rows is built for (tests/test_slice1.py:84
+        # is the unit-level shape).
+        body_dir = catalog_root / "findings" / "2026-05-20" / "recoverable"
+        body_dir.mkdir(parents=True)
+        body_path = body_dir / "body.json"
+        body_path.write_text(json.dumps({"text": "recoverable"}), encoding="utf-8")
+        cursor = connection.execute(
+            """
+            INSERT INTO findings (
+                observation_id, source, type, entity, dedup_key,
+                target_pipes, status, severity, occurred_at, body_ref
+            )
+            VALUES (NULL, ?, ?, ?, ?, ?, 'writing', 'high', ?, ?)
+            """,
+            (
+                "scheduled/canary",
+                "down",
+                "recoverable",
+                "scheduled/canary:down:recoverable",
+                json.dumps(["now"]),
+                utcnow(),
+                str(body_path.relative_to(catalog_root)),
+            ),
+        )
+        writing_finding_id = int(cursor.lastrowid)
+        connection.commit()
+
+        # Axis 2 (triage-orphan recovery): orphan 'processing' row on a
+        # fresh observation with no real triage outcome. The fresh
+        # daemon's startup must clear this row OR ready_observations_for
+        # excludes the observation forever.
+        orphan_obs_id = catalog.write_observation(
+            "scheduled/canary",
+            {"orphaned": True},
+            {"source": "scheduled/canary", "check": "test-fixture"},
+        )
+        connection.execute(
+            """
+            INSERT INTO observation_triage (observation_id, triager_name, status)
+            VALUES (?, ?, 'processing')
+            """,
+            (orphan_obs_id, "canary"),
+        )
+        connection.commit()
+
+        # Axis 3 (no duplicate dispatch): if any finding from phase A
+        # was 'sent' on now AND its pipe_queue row is still 'pending'
+        # (the half-state record_dispatch's atomic commit rules out --
+        # but the inversion that breaks the atomicity would introduce),
+        # the fresh daemon's drain re-dispatches it.
+        # Construction here: take an existing 'sent' dispatch from
+        # phase A and force its pipe_queue row back to 'pending'.
+        sent_row = connection.execute(
+            """
+            SELECT finding_ids
+            FROM dispatches
+            WHERE pipe='now' AND status='sent'
+            ORDER BY id LIMIT 1
+            """
+        ).fetchone()
+        assert sent_row, "phase A produced no sent now-dispatches"
+        sent_ids = json.loads(sent_row["finding_ids"])
+        assert sent_ids, sent_row["finding_ids"]
+        duplicate_candidate_id = int(sent_ids[0])
+        # Revert the queue row to 'pending' -- mimics what would happen
+        # if record_dispatch's atomic commit were broken into two
+        # separate transactions and SIGKILL landed between them.
+        connection.execute(
+            """
+            UPDATE pipe_queues
+            SET status = 'pending', dispatched_at = NULL, updated_at = ?
+            WHERE finding_id = ? AND pipe = 'now'
+            """,
+            (utcnow(), duplicate_candidate_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    # ----- phase C: fresh daemon, recovery + drain -----
+    # Run the fresh daemon long enough to perform startup recovery
+    # (recover_writing_rows + recover_triage_processing_rows) AND a
+    # handful of drain iterations (so the forced half-state queue row
+    # gets re-dispatched, and the orphan observation gets re-triaged
+    # to 'success'). Bounded wait so a stuck fresh daemon surfaces in
+    # the test rather than hanging CI; the bound is generous because
+    # the source cadence is 1s and triage + drain each are ~100ms in
+    # this test's lodging.
+    proc_b = _spawn_daemon_subprocess(tmp_path)
+    try:
+        _read_daemon_pid(tmp_path, timeout=15.0)
+        time.sleep(4.0)
+    finally:
+        _sigterm_and_wait(proc_b, timeout=15.0)
+
+    # ----- phase D: assertions (final post-mortem on the state db) -----
+    conn = sqlite3.connect(str(state_db))
+    conn.row_factory = sqlite3.Row
+    try:
+        # --- axis 1: writing-row recovery ---
+        # The pre-seeded 'writing' finding has body_ref pointing at a
+        # real file (recoverable path), so recover_writing_rows must
+        # transition it to 'ready'. Inversion: recover_writing_rows
+        # no-op -> this assertion fires (row still 'writing').
+        writing_status = conn.execute(
+            "SELECT status FROM findings WHERE id = ?",
+            (writing_finding_id,),
+        ).fetchone()
+        assert writing_status is not None
+        assert writing_status["status"] == "ready", (
+            f"axis 1: writing finding did not recover; status="
+            f"{writing_status['status']}"
+        )
+        # Belt: no writing rows anywhere.
+        writing_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM findings WHERE status='writing'"
+        ).fetchone()["n"]
+        assert writing_count == 0, f"axis 1: {writing_count} writing rows remain"
+
+        # --- axis 2: triage-orphan recovery ---
+        # The pre-seeded orphan row was at status='processing'; the
+        # fresh daemon's recover_triage_processing_rows must delete it.
+        # Inversion: skip the startup call -> this assertion fires
+        # (orphan row still 'processing'). Also: ready_observations_for
+        # would re-surface the orphan_obs_id for the 'canary' triager
+        # ONLY if the orphan row is gone; the fresh daemon then runs
+        # triage on it and the row transitions to 'success'. We assert
+        # both the "no processing rows" property and the "orphan
+        # observation was re-triaged" property.
+        processing_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM observation_triage WHERE status='processing'"
+        ).fetchone()["n"]
+        assert processing_count == 0, (
+            f"axis 2: {processing_count} processing rows remain"
+        )
+        orphan_after = conn.execute(
+            """
+            SELECT status FROM observation_triage
+            WHERE observation_id = ? AND triager_name = 'canary'
+            """,
+            (orphan_obs_id,),
+        ).fetchone()
+        # The fresh daemon re-triages the orphan observation (because
+        # the processing row was cleared); the new row should be
+        # 'success' once triage completes. Inversion of the startup
+        # clear would leave it at 'processing' -- the row would still
+        # exist but with the old status.
+        assert orphan_after is not None
+        assert orphan_after["status"] == "success", (
+            f"axis 2: orphan observation was not re-triaged "
+            f"(status={orphan_after['status']})"
+        )
+
+        # --- axis 3: per-row dispatch commit / no duplicate dispatches --
+        # The pre-seeded pending row gets re-dispatched (intentional
+        # under-construction: simulates the half-state a broken atomic
+        # commit would produce). Under the current production code's
+        # atomicity, that half-state would NEVER happen naturally, so
+        # the test's pre-seed step is the only way to introduce the
+        # condition. The 'no duplicate' property is then: any finding
+        # that was dispatched under the half-state has at most ONE
+        # 'sent' dispatch -- which would be FALSE here because the
+        # fresh daemon's drain saw 'pending' and dispatched again
+        # (count=2). The discrimination is at the inverse: in the
+        # production code with atomic record_dispatch, the half-state
+        # never arises in the first place, so duplicate_candidate_id
+        # has count=1.
+        #
+        # Concretely: this assertion CURRENTLY expects 2 'sent'
+        # dispatches for duplicate_candidate_id (because we forced
+        # the half-state), and asserts that no OTHER finding has
+        # more than one dispatch.
+        all_counts = list(
+            conn.execute(
+                """
+                SELECT json_extract(finding_ids, '$[0]') AS fid,
+                       COUNT(*) AS n
+                FROM dispatches
+                WHERE pipe = 'now' AND status = 'sent'
+                  AND json_array_length(finding_ids) = 1
+                GROUP BY fid
+                """
+            )
+        )
+        by_fid = {int(r["fid"]): int(r["n"]) for r in all_counts if r["fid"] is not None}
+        # Under the production code's atomic record_dispatch commit, the
+        # ONLY finding with >1 'sent' dispatch is duplicate_candidate_id
+        # (forced into the half-state by phase B). Every other finding
+        # has exactly one 'sent' dispatch.
+        # Under axis 3 inversion (record_dispatch skips the pipe_queues
+        # UPDATE so queue rows stay 'pending' even after the dispatches
+        # INSERT commits), every dispatched finding inflates -- the
+        # offenders dict below picks them up.
+        expected_offender = {duplicate_candidate_id: 2}
+        offenders = {fid: n for fid, n in by_fid.items() if n != 1}
+        assert offenders == expected_offender, (
+            f"axis 3: dispatches table not 1-per-finding except for the "
+            f"forced half-state finding {duplicate_candidate_id}; got "
+            f"counts={by_fid}"
+        )
+    finally:
+        conn.close()

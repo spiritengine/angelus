@@ -89,7 +89,20 @@ class AngelusDaemon:
             )
             self._install_signal_handlers()
             recovered, failed = self.catalog.recover_writing_rows()
-            LOGGER.info("startup recovery: %d ready, %d failed", recovered, failed)
+            # Same round-5 orphan class as the in-process graceful-cancel
+            # arm in _triage_under_semaphore, but for the hard-exit axis
+            # (SIGKILL / host crash bypass Python shutdown handlers, so
+            # the in-process arm never fires). Clears any
+            # observation_triage row left at 'processing' from the prior
+            # daemon. ready_observations_for would otherwise exclude the
+            # observation forever.
+            triage_orphans = self.catalog.recover_triage_processing_rows()
+            LOGGER.info(
+                "startup recovery: %d ready, %d failed, %d triage orphans cleared",
+                recovered,
+                failed,
+                triage_orphans,
+            )
             # Channels stay unhealthy only until daemon restart (slice 2 scope).
             self.catalog.clear_channel_health()
             # Same restart-scope for the per-channel digest attempt counter
