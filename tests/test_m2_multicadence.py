@@ -1,5 +1,8 @@
 """M2 slice 3: three-source / multi-cadence rig (brief-20260520-tqov §3.5,
 §6 slice 3; supersedes brief-20260513-cz9x Item 1 cadences per §5b Q6).
+Canary lodging uses cadence-agnostic names (canary-loose-a /
+canary-loose-b) so future cadence relaxations don't re-rot the
+filenames -- the current loose cadences (4h / 12h) live in the YAMLs.
 
 Three lodged sources at three distinct cadences exercise the production
 multi-source / multi-cadence surface. The two synthetic canaries lodged
@@ -8,13 +11,13 @@ below override those commands in tmp_path with controllable variants
 that read a JSON status fixture so the test can drive concrete up->down
 transitions deterministically. APScheduler is NOT real-cadence-driven
 in the tests: source fires are invoked directly via daemon._fire_source
-(the same code path APScheduler dispatches to), so a 1h / 4h production
-cadence runs in milliseconds here without faking time. The test
-cadences in tmp_path (1s / 2s / 3s) are merely distinct intervals; the
-production lodging cadences (1h / 4h / 15m) reflect operator urgency
-per Q6 -- iotaschool is closer to an archive than a going concern, so
-4h-late would be fine, which is exactly the slack the 1h / 4h tier
-gives the canaries.
+(the same code path APScheduler dispatches to), so the production
+cadences (4h / 4h / 12h) run in milliseconds here without faking time.
+The test cadences in tmp_path (1s / 2s / 3s) are merely distinct
+intervals; the production lodging cadences (4h / 4h / 12h) reflect the
+archive-class relaxation per Q6 -- iotaschool is closer to an archive
+than a going concern, so multi-hour-late would be fine, which is
+exactly the slack the loose canary tier gives.
 
 Discrimination: open incidents are upserted under the partial unique
 index idx_incidents_one_open_per_entity on (source, type, entity)
@@ -51,7 +54,8 @@ def _write_canary_lodging(root: Path) -> Path:
     test rewrites between fires to drive transitions; this is the
     simulated-time mechanism the brief calls for in §6 slice 3 (no
     real-sleep for the cadence interval). The production-cadence YAMLs
-    (1h / 4h) are checked into sources/scheduled/ separately; the tmp
+    (4h / 12h) live in sources/scheduled/ separately under the
+    cadence-agnostic canary-loose-a / canary-loose-b names; the tmp
     cadences (1s/2s/3s) are merely distinct intervals so each source is
     a separate APScheduler job -- no fire actually waits on them.
 
@@ -74,35 +78,35 @@ def _write_canary_lodging(root: Path) -> Path:
         encoding="utf-8",
     )
 
-    hourly_fixture = state_canary / "canary-hourly.json"
+    loose_a_fixture = state_canary / "canary-loose-a.json"
     _write_fixture(
-        hourly_fixture,
+        loose_a_fixture,
         {
-            "source_ref": "scheduled/canary-hourly",
+            "source_ref": "scheduled/canary-loose-a",
             "entity": "canary-pipeline",
             "url": "file:///dev/null",
             "status_code": 200,
         },
     )
-    (root / "sources" / "scheduled" / "canary-hourly.yaml").write_text(
+    (root / "sources" / "scheduled" / "canary-loose-a.yaml").write_text(
         "cadence: 2s\ncheck:\n  kind: shell\n"
-        f"  command: 'cat {hourly_fixture}'\n",
+        f"  command: 'cat {loose_a_fixture}'\n",
         encoding="utf-8",
     )
 
-    fourhour_fixture = state_canary / "canary-4hourly.json"
+    loose_b_fixture = state_canary / "canary-loose-b.json"
     _write_fixture(
-        fourhour_fixture,
+        loose_b_fixture,
         {
-            "source_ref": "scheduled/canary-4hourly",
+            "source_ref": "scheduled/canary-loose-b",
             "entity": "canary-pipeline",
             "url": "file:///dev/null",
             "status_code": 200,
         },
     )
-    (root / "sources" / "scheduled" / "canary-4hourly.yaml").write_text(
+    (root / "sources" / "scheduled" / "canary-loose-b.yaml").write_text(
         "cadence: 3s\ncheck:\n  kind: shell\n"
-        f"  command: 'cat {fourhour_fixture}'\n",
+        f"  command: 'cat {loose_b_fixture}'\n",
         encoding="utf-8",
     )
 
@@ -119,8 +123,8 @@ def _write_canary_lodging(root: Path) -> Path:
         )
     for triager_yaml in (
         "dead-link.yaml",
-        "canary-hourly-watch.yaml",
-        "canary-4hourly-watch.yaml",
+        "canary-loose-a-watch.yaml",
+        "canary-loose-b-watch.yaml",
     ):
         shutil.copy(
             PROJECT_ROOT / "triagers" / triager_yaml,
@@ -202,7 +206,7 @@ def test_three_source_multi_cadence_dedup_discriminates_on_source_ref(
     `len(canary_incidents) == 2` fails with len 1.
 
     Also pinned: within-source dedup via the triager state machine. A
-    repeat fire on canary-hourly with status_code still 503 sees
+    repeat fire on canary-loose-a with status_code still 503 sees
     prior_state.last_status == 503 and emits NO new finding -- no new
     incident, no new dispatch. (The catalog _upsert_incident's ON
     CONFLICT clause would update the existing incident even if the
@@ -235,8 +239,8 @@ def test_three_source_multi_cadence_dedup_discriminates_on_source_ref(
             # Tick 1: all three sources fire with status 200. The triager
             # for each records last_status = 200 in triager_state and
             # emits no findings (no transition).
-            await daemon._fire_source("scheduled/canary-hourly")
-            await daemon._fire_source("scheduled/canary-4hourly")
+            await daemon._fire_source("scheduled/canary-loose-a")
+            await daemon._fire_source("scheduled/canary-loose-b")
             await daemon._fire_source("scheduled/iotaschool-watch")
             triaged = await _drive_triage(daemon)
             assert triaged == 3, (
@@ -248,18 +252,18 @@ def test_three_source_multi_cadence_dedup_discriminates_on_source_ref(
 
             # Mutate the fixtures: all three sources go down.
             _write_fixture(
-                state_canary / "canary-hourly.json",
+                state_canary / "canary-loose-a.json",
                 {
-                    "source_ref": "scheduled/canary-hourly",
+                    "source_ref": "scheduled/canary-loose-a",
                     "entity": "canary-pipeline",
                     "url": "file:///dev/null",
                     "status_code": 503,
                 },
             )
             _write_fixture(
-                state_canary / "canary-4hourly.json",
+                state_canary / "canary-loose-b.json",
                 {
-                    "source_ref": "scheduled/canary-4hourly",
+                    "source_ref": "scheduled/canary-loose-b",
                     "entity": "canary-pipeline",
                     "url": "file:///dev/null",
                     "status_code": 503,
@@ -273,8 +277,8 @@ def test_three_source_multi_cadence_dedup_discriminates_on_source_ref(
             # Tick 2: all three sources fire with status 503. Each
             # triager sees its prior_state.last_status == 200 and emits
             # a down finding (one per source).
-            await daemon._fire_source("scheduled/canary-hourly")
-            await daemon._fire_source("scheduled/canary-4hourly")
+            await daemon._fire_source("scheduled/canary-loose-a")
+            await daemon._fire_source("scheduled/canary-loose-b")
             await daemon._fire_source("scheduled/iotaschool-watch")
             triaged = await _drive_triage(daemon)
             assert triaged == 3, (
@@ -300,8 +304,8 @@ def test_three_source_multi_cadence_dedup_discriminates_on_source_ref(
             )
             canary_sources = {i["source"] for i in canary_incidents}
             assert canary_sources == {
-                "scheduled/canary-hourly",
-                "scheduled/canary-4hourly",
+                "scheduled/canary-loose-a",
+                "scheduled/canary-loose-b",
             }
             iotaschool_incidents = [
                 i for i in incidents if i["entity"] == "iotaschool.com"
@@ -320,27 +324,27 @@ def test_three_source_multi_cadence_dedup_discriminates_on_source_ref(
             )
             sent_after_now = list(sent_push)
 
-            # Tick 3: canary-hourly fires AGAIN with status_code still
+            # Tick 3: canary-loose-a fires AGAIN with status_code still
             # 503. The triager sees prior_state.last_status == 503 and
             # emits NO new finding -- the within-source dedup property.
             # If the triager state machine were broken (always emitting
             # on a non-200), this would write a fresh finding and a
             # subsequent now-drain would push a 4th dispatch.
-            await daemon._fire_source("scheduled/canary-hourly")
+            await daemon._fire_source("scheduled/canary-loose-a")
             triaged = await _drive_triage(daemon)
             assert triaged == 1, (
-                "the third canary-hourly fire produces one observation"
+                "the third canary-loose-a fire produces one observation"
             )
 
-            canary_hourly_findings = list(daemon.connection.execute(
+            canary_loose_a_findings = list(daemon.connection.execute(
                 "SELECT id FROM findings WHERE source = ?",
-                ("scheduled/canary-hourly",),
+                ("scheduled/canary-loose-a",),
             ))
-            assert len(canary_hourly_findings) == 1, (
-                "within-source dedup: a second canary-hourly down-fire "
+            assert len(canary_loose_a_findings) == 1, (
+                "within-source dedup: a second canary-loose-a down-fire "
                 "must not write a new finding while the prior down is "
                 f"still the current state; got "
-                f"{len(canary_hourly_findings)} findings"
+                f"{len(canary_loose_a_findings)} findings"
             )
 
             # Drain now-pipe again: no new dispatches (no new findings
@@ -381,8 +385,8 @@ def test_three_source_multi_cadence_dedup_discriminates_on_source_ref(
             )
             sources_in_digest = {f["source"] for f in findings_in_digest}
             assert sources_in_digest == {
-                "scheduled/canary-hourly",
-                "scheduled/canary-4hourly",
+                "scheduled/canary-loose-a",
+                "scheduled/canary-loose-b",
             }, (
                 "digest must carry one finding per canary source -- "
                 f"got sources {sources_in_digest}"
