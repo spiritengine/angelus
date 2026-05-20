@@ -180,6 +180,18 @@ class AngelusDaemon:
                     "next_fire_at": next_fire,
                 }
             )
+        deps = self.catalog.all_dep_health()
+        for dep in deps:
+            if dep["status"] != "unhealthy":
+                continue
+            mute = self.catalog.active_mute_for(
+                f"internal/dep:dependency_unhealthy:{dep['dependency_name']}"
+            )
+            if mute is not None:
+                dep["mute"] = {
+                    "until": mute["expires_at"],
+                    "comment": mute["comment"],
+                }
         return {
             "daemon": {"running": True, "pid": os.getpid()},
             "sources": sources,
@@ -200,7 +212,15 @@ class AngelusDaemon:
             # dep_health's mandatory reader (slice 5c): every row the
             # dep_record write op upserts is surfaced here so a written dep
             # status is never dead config. Read-only SELECT.
-            "deps": self.catalog.all_dep_health(),
+            "deps": deps,
+            # Operator-facing channel rail: channel_health stays visible even
+            # if the corresponding internal/dispatch finding is muted on the
+            # now pipe, and the digest retry ladder is surfaced before the
+            # unhealthy threshold is crossed.
+            "channels": {
+                "health": self.catalog.all_channel_health(),
+                "attempts": self.catalog.digest_channel_attempts(),
+            },
         }
 
     async def _op_incident_list(self, _args: dict) -> dict:

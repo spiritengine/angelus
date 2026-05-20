@@ -1057,3 +1057,87 @@ reader) is named once in each side's docstring by architectural
 direction ("the angelus daemon reads this in `_op_health`" / "Belfry
 uses the same env var and default"), not by enumerating call sites
 that future refactors could rename out from under the comment.
+
+## M2 slice 9 — mute-aware deps, digest-attempts ladder, channel_unhealthy doc
+
+### Verdict: BUG FIXED (slice ships additive health-surface reads only).
+
+### What was measured
+Section 3.2 / 3.3 / 3.4 of brief-20260520-tqov left three
+operator-visibility gaps around `_op_health`:
+
+* unhealthy deps stayed visible through the Risk-5 saving rail, but
+  the health view gave no cue that the corresponding
+  `internal/dep:dependency_unhealthy:<dep>` finding was actively muted
+* the digest path's `digest_channel_attempts` ladder existed in
+  storage, but the in-flight state was invisible until threshold
+  crossed and `channel_health` flipped unhealthy
+* `channel_unhealthy` findings on `internal/dispatch` were muteable on
+  the now pipe, but there was no explicit doc-pass locking the
+  channel-health saving rail
+
+Slice 9 closes all three without adding any writes:
+
+* `angelus/storage/catalog.py`: three read-only helpers
+  `active_mute_for(dedup_key)`, `all_channel_health()`,
+  `digest_channel_attempts()`
+* `angelus/daemon.py`: `_op_health` enriches unhealthy dep rows with
+  `mute: {until, comment}` and adds
+  `channels: {health: [...], attempts: [...]}` to the response
+* `angelus/cli.py`: live and daemon-down `angelus health` render the
+  mute annotation, channel-health rows, and digest ladder rows
+* `INTEGRATION_FELL_CHANNEL_UNHEALTHY.md`: documents the muteability
+  collision and the health-surface saving rail
+
+Single-writer-to-sqlite remains intact: all slice-9 changes are plain
+SELECT readers over `mutes`, `channel_health`, and
+`digest_channel_attempts`.
+
+### Response-shape additions
+`_op_health` now returns:
+
+* `deps[*].mute` only when `deps[*].status == "unhealthy"` AND an
+  active mute exists for
+  `internal/dep:dependency_unhealthy:<dependency_name>`
+  Shape: `{"until": <iso8601-Z>, "comment": <str|None>}`
+* `channels.health`: every `channel_health` row as
+  `{"channel", "status", "last_error", "updated_at"}`
+* `channels.attempts`: every `digest_channel_attempts` row with
+  `attempts > 0` as
+  `{"pipe", "channel", "attempts", "last_error", "updated_at"}`
+
+Healthy deps stay unannotated by design.
+
+### Discriminating tests
+`tests/test_slice9_health_surface.py::test_health_surfaces_active_mute_on_unhealthy_dep`
+`tests/test_slice9_health_surface.py::test_health_leaves_healthy_dep_unannotated`
+`tests/test_slice9_health_surface.py::test_health_surfaces_digest_attempt_ladder_before_threshold`
+`tests/test_slice9_health_surface.py::test_muted_channel_unhealthy_is_silent_on_now_but_visible_in_health`
+`tests/test_slice9_health_surface.py::test_daemon_down_health_renders_new_dep_and_channel_surfaces`
+
+The new tests cover both sides of the mandatory-reader contract:
+daemon-side `_op_health` reads and the CLI render, including the
+daemon-down sqlite fallback.
+
+### Discrimination evidence
+Three independent inversions performed in the worktree, observed,
+reverted:
+
+* Inversion 1 -- make `active_mute_for()` always return `None`.
+  `test_health_surfaces_active_mute_on_unhealthy_dep` fires on
+  `deps["iotaschool"]["mute"]["until"]` / comment lookup, while
+  `test_health_leaves_healthy_dep_unannotated` stays green.
+* Inversion 2 -- make `digest_channel_attempts()` return `[]`.
+  `test_health_surfaces_digest_attempt_ladder_before_threshold`
+  fires on the missing `("daily", "email")` ladder row; the
+  channel-health rail test stays green because it asserts the separate
+  `channels.health` surface.
+* Inversion 3 -- mute-filter `channels.health` out of `_op_health`.
+  `test_muted_channel_unhealthy_is_silent_on_now_but_visible_in_health`
+  still sees the `dispatches.status == "muted"` product behavior, but
+  fires on the missing `email` row in `channels.health`.
+
+The CLI regression anchors the new surface on the operator path: if
+`_render_deps` drops the mute line or `_render_channels` is omitted
+from the health output, `test_daemon_down_health_renders_new_dep_and_channel_surfaces`
+fires on the missing text.
