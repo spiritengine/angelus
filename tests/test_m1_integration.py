@@ -626,11 +626,14 @@ def test_channel_rename_mid_pending_finding_is_rejected_at_cross_ref(
     Discrimination (recorded in FELL_NOTES): if the `if errors:
     self._reject_cross_ref(...) return` arm in
     LodgingReloader._apply_removal were removed, the push removal would
-    apply unchecked, lodging.channels would lose `push`, and no
-    cross_ref_broken finding would be written. The assertion
-    `"push" in daemon.lodging.channels` (and equally the
-    `cross_ref_broken`-finding presence assertion) fires under that
-    inversion.
+    apply unchecked and lodging.channels would lose `push`. The
+    subsequent telegram-add then sees a dangling pipes/now -> push
+    reference and fires its OWN cross_ref_broken finding, but for entity
+    `channels/telegram.yaml` -- so the presence assertion
+    `assert cross_ref` still HOLDS (the list is non-empty). The
+    assertions that DO fire under that inversion are the entity-match
+    `any(r["entity"] == "channels/push.yaml" for r in cross_ref)` and
+    the lodging-survival `"push" in daemon.lodging.channels`.
     """
     _base_lodging(tmp_path)
     daemon = AngelusDaemon(tmp_path)

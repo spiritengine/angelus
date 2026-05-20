@@ -622,3 +622,111 @@ adding another stale name without retiring the previous one.
 
 For future slice/cross-slice fells: when filing a docstring-rot
 finding, the fix MUST remove the enumeration, not patch it.
+
+## M2 slice 1 — channel rename rehearsal
+
+### Verdict: NO BUG (rehearsal of existing rejection behavior).
+
+### What was measured
+Renamed `channels/push.yaml` -> `channels/telegram.yaml` on disk
+while a finding was still pending in `pipe_queues` for the `now`
+pipe (which references `push`). Drove the watchdog-style delete
+event for the old path AND the create event for the new path into
+the reloader queue in that order, then awaited
+`LodgingReloader.process_pending_events()`.
+
+Observed:
+
+* The push-removal event was rejected at cross-ref time with an
+  internal/lodging `cross_ref_broken` finding for entity
+  `channels/push.yaml`.
+* `lodging.channels` still contains `push`; `pipes["now"].channels`
+  is still `["push"]`.
+* `pipe_queues` row for the original finding stayed at
+  `("now", "pending")` — not lost.
+* The unrelated `telegram` add applied in its own right
+  (`"telegram" in lodging.channels`).
+* A reversion (rename back to `push.yaml`) settles cleanly: the
+  push-add no-ops against the still-live `push` entry, the
+  telegram-remove applies, `reloader.rejected == {}`.
+
+### Discriminating test
+`tests/test_m1_integration.py::test_channel_rename_mid_pending_finding_is_rejected_at_cross_ref`
+
+### Discrimination evidence
+Inverted the `if errors: self._reject_cross_ref(...) return` arm
+in `LodgingReloader._apply_removal` (deleted the guard). Under the
+inversion:
+
+* Push removal applies unchecked; `lodging.channels` loses `push`.
+* The subsequent telegram-add now sees a dangling
+  `pipes/now -> push` reference and fires its OWN
+  `cross_ref_broken` finding, but for entity
+  `channels/telegram.yaml` — not `channels/push.yaml`.
+* The presence assertion `assert cross_ref` still HOLDS (list is
+  non-empty).
+* The entity-match assertion
+  `any(r["entity"] == "channels/push.yaml" for r in cross_ref)`
+  FAILS — no finding names the deleted file.
+* The lodging-survival assertion
+  `"push" in daemon.lodging.channels` also FAILS — `push` was
+  dropped.
+
+Reverted; the test passes.
+
+---
+
+## M2 slice 2 — cross-ref rehearsal at hot-reload
+
+### Verdict: NO BUG (parametrized rehearsal of `validate_cross_refs` guards).
+
+### What was measured
+Swept every cross-ref direction `validate_cross_refs` guards by
+writing a YAML edit on disk that introduces a dangling reference,
+then processing the event through `LodgingReloader`. Three
+parametrized directions:
+
+* `pipe_to_channel`: edit `pipes/now.yaml` to reference
+  `[push, missing_channel]`.
+* `triager_to_source`: edit `triagers/watch.yaml` to reference
+  `scheduled/missing_source`.
+* `pipe_to_overflow`: edit `pipes/now.yaml` to add
+  `rate_limit.overflow: missing_pipe`.
+
+For each, asserted that an internal/lodging `cross_ref_broken`
+finding was written for the edited file AND that the targeted
+lodging field stayed at its pre-edit snapshot (so a downstream
+drain or triage step that reads the field cannot see a dangling
+reference).
+
+### Discriminating test
+`tests/test_m1_integration.py::test_cross_ref_broken_at_hot_reload_emits_finding_and_keeps_state[pipe_to_channel]`
+`tests/test_m1_integration.py::test_cross_ref_broken_at_hot_reload_emits_finding_and_keeps_state[triager_to_source]`
+`tests/test_m1_integration.py::test_cross_ref_broken_at_hot_reload_emits_finding_and_keeps_state[pipe_to_overflow]`
+
+### Discrimination evidence
+Per-direction inversion: removing each guard loop in
+`angelus.lodging.config.validate_cross_refs` in turn makes
+exactly its parametrized case fail (the other two still pass,
+because their guards are untouched):
+
+* Remove the `for triager in lodging.triagers.values()` loop
+  (the `source_ref not in lodging.sources` check) ->
+  `triager_to_source` fails at `assert cross_ref` and at the
+  snapshot-stable assertion
+  `triagers["watch"].source_ref == "scheduled/watch"`.
+* Remove the inner `for channel in pipe.channels` loop in the
+  pipe sweep -> `pipe_to_channel` fails at `assert cross_ref`
+  and at `pipes["now"].channels == ["push"]`.
+* Remove the overflow check
+  (`overflow is not None and overflow not in lodging.pipes`) ->
+  `pipe_to_overflow` fails at `assert cross_ref` and at
+  `pipes["now"].rate_limit == {}`.
+
+A coarser whole-rejection inversion at the caller site (
+`if False and errors:` in `LodgingReloader._handle_path`'s edit
+arm) fails all three cases at `assert cross_ref` and at each
+per-direction snapshot assertion — confirming the rejection arm
+itself, separately from the per-direction guards.
+
+Each inversion reverted; all three parametrized cases pass.
