@@ -405,6 +405,7 @@ def _render_health(result: dict[str, Any]) -> None:
         click.echo(f"  {pipe}: {pending[pipe]}")
     _render_belfry(result["belfry"])
     _render_deps(result.get("deps") or [])
+    _render_channels(result.get("channels") or {})
 
 
 def _render_belfry(belfry: dict[str, Any] | None) -> None:
@@ -434,6 +435,48 @@ def _render_deps(deps: list[dict[str, Any]]) -> None:
         )
         if dep["status"] == "unhealthy" and dep.get("detail"):
             click.echo(f"    detail: {dep['detail']}")
+        mute = dep.get("mute")
+        if dep["status"] == "unhealthy" and mute:
+            comment = f" ({mute['comment']})" if mute.get("comment") else ""
+            click.echo(f"    muted until: {mute['until']}{comment}")
+
+
+def _deps_with_active_mutes(catalog: Catalog) -> list[dict[str, Any]]:
+    """Dep health rows enriched with the effective active mute, if any."""
+    deps = catalog.all_dep_health()
+    for dep in deps:
+        if dep["status"] != "unhealthy":
+            continue
+        mute = catalog.active_mute_for(
+            f"internal/dep:dependency_unhealthy:{dep['dependency_name']}"
+        )
+        if mute is not None:
+            dep["mute"] = {"until": mute["expires_at"], "comment": mute["comment"]}
+    return deps
+
+
+def _render_channels(channels: dict[str, Any]) -> None:
+    """Plain text channel health + digest attempt ladder."""
+    click.echo("channels:")
+    channel_health = channels.get("health") or []
+    attempts = channels.get("attempts") or []
+    if not channel_health and not attempts:
+        click.echo("  none")
+        return
+    if channel_health:
+        click.echo("  health:")
+        for row in channel_health:
+            click.echo(f"    {row['channel']}: {row['status']}")
+            if row.get("last_error"):
+                click.echo(f"      error: {row['last_error']}")
+    if attempts:
+        click.echo("  digest attempts:")
+        for row in attempts:
+            click.echo(
+                f"    {row['pipe']}/{row['channel']}: {row['attempts']} attempts"
+            )
+            if row.get("last_error"):
+                click.echo(f"      last error: {row['last_error']}")
 
 
 def _render_health_fallback(root: Path) -> None:
@@ -466,7 +509,13 @@ def _render_health_fallback(root: Path) -> None:
             click.echo(f"  {pipe}: {pending[pipe]}")
         # dep_health is a plain table read; surface it in the daemon-down
         # path too (read-only), so dep status is visible without the daemon.
-        _render_deps(catalog.all_dep_health())
+        _render_deps(_deps_with_active_mutes(catalog))
+        _render_channels(
+            {
+                "health": catalog.all_channel_health(),
+                "attempts": catalog.digest_channel_attempts(),
+            }
+        )
     finally:
         connection.close()
     _render_belfry(_belfry_status(root))

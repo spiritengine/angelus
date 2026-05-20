@@ -914,6 +914,58 @@ class Catalog:
         )
         return [dict(row) for row in rows]
 
+    def active_mute_for(self, dedup_key: str) -> dict[str, Any] | None:
+        """The effective active mute for one dedup key, if any. Read-only.
+
+        Overlapping mute rows are legal. For the operator-facing health
+        surface the load-bearing question is "until when is this muted
+        right now?", so we surface the farthest-future active row.
+        """
+        row = self.connection.execute(
+            """
+            SELECT expires_at, created_at, comment
+            FROM mutes
+            WHERE dedup_key = ? AND expires_at > ?
+            ORDER BY expires_at DESC, id DESC
+            LIMIT 1
+            """,
+            (dedup_key, utcnow()),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def all_channel_health(self) -> list[dict[str, Any]]:
+        """Every channel_health row, channel-ordered. Read-only.
+
+        This is the unfiltered operator rail for a channel marked
+        unhealthy, regardless of whether the corresponding
+        internal/dispatch finding is muted on the now pipe.
+        """
+        rows = self.connection.execute(
+            """
+            SELECT channel, status, last_error, updated_at
+            FROM channel_health
+            ORDER BY channel
+            """
+        )
+        return [dict(row) for row in rows]
+
+    def digest_channel_attempts(self) -> list[dict[str, Any]]:
+        """Digest channel attempt ladder rows with attempts > 0. Read-only.
+
+        The digest path's in-flight retry state is its own operator
+        surface: attempts accumulate before channel_health flips, so this
+        reader makes the ladder visible before threshold.
+        """
+        rows = self.connection.execute(
+            """
+            SELECT pipe, channel, attempts, last_error, updated_at
+            FROM digest_channel_attempts
+            WHERE attempts > 0
+            ORDER BY pipe, channel
+            """
+        )
+        return [dict(row) for row in rows]
+
     def close_incident(
         self, incident_id: int, comment: str | None
     ) -> str:
