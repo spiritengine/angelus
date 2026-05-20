@@ -165,21 +165,6 @@ class AngelusDaemon:
         next-fire times off the live APScheduler (only the daemon knows
         these -- this is why health goes through the socket)."""
         last_fires = self.catalog.latest_source_fires()
-        sources = []
-        for ref in sorted(self.lodging.sources):
-            job = self.scheduler.get_job(ref)
-            next_fire = (
-                job.next_run_time.isoformat()
-                if job is not None and job.next_run_time is not None
-                else None
-            )
-            sources.append(
-                {
-                    "name": ref,
-                    "last_fire_at": last_fires.get(ref),
-                    "next_fire_at": next_fire,
-                }
-            )
         deps = self.catalog.all_dep_health()
         for dep in deps:
             if dep["status"] != "unhealthy":
@@ -192,6 +177,31 @@ class AngelusDaemon:
                     "until": mute["expires_at"],
                     "comment": mute["comment"],
                 }
+        unhealthy_deps = {
+            dep["dependency_name"] for dep in deps if dep["status"] == "unhealthy"
+        }
+        sources = []
+        for ref in sorted(self.lodging.sources):
+            source = self.lodging.sources[ref]
+            job = self.scheduler.get_job(ref)
+            next_fire = (
+                job.next_run_time.isoformat()
+                if job is not None and job.next_run_time is not None
+                else None
+            )
+            blocked_by = [
+                dependency_name
+                for dependency_name in source.depends_on
+                if dependency_name in unhealthy_deps
+            ]
+            sources.append(
+                {
+                    "name": ref,
+                    "last_fire_at": last_fires.get(ref),
+                    "next_fire_at": next_fire,
+                    "blocked_by_unhealthy_deps": blocked_by,
+                }
+            )
         return {
             "daemon": {"running": True, "pid": os.getpid()},
             "sources": sources,

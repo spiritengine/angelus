@@ -1157,3 +1157,66 @@ What did NOT ship:
 * no lodged dependency check
 * no angelus/belfry code change
 * no new product surface beyond deploy/docs guidance
+
+## M2 slice 7 — blocked sources from unhealthy lodged deps
+
+### Verdict: BUG FIXED (slice ships an additive lodged-dependency read).
+
+### What was measured
+Section 6 slice 7 of brief-20260520-tqov originally framed Q4 in terms
+of source overdue-ness, but finding-20260520-ewun recorded that this
+surface is non-functional under the actual APScheduler behavior:
+`max_instances=1` jobs can keep a future-facing `next_run_time` even
+through repeated failures, so "overdue" does not reliably answer "this
+source is blocked by a dead prerequisite." Patrick's correction was to
+derive the operator signal from lodged dependency health instead.
+
+Master at `2e99ee3` had the reader half ready (`_op_health["deps"]`
+already surfaces dependency health) but was missing the source-side
+linkage entirely: `ScheduledSource` had no lodged dependency list, and
+`sources/scheduled/*.yaml` had no parsed `depends_on` field. This slice
+therefore adds the minimal prerequisite lodging shape and uses it only
+as a read:
+
+* `angelus/lodging/config.py`: `ScheduledSource.depends_on: list[str]`,
+  parsed from optional `depends_on: [...]`, with cross-reference
+  validation against `lodging.dependencies`
+* `angelus/daemon.py`: `_op_health` now cross-references each source's
+  lodged `depends_on` list against the already-computed `deps` block and
+  emits `sources[*].blocked_by_unhealthy_deps: [<dep>, ...]`
+* `angelus/cli.py`: `angelus health` prints `blocked by: dep-a, dep-b`
+  when that list is non-empty
+
+No new storage and no new writes: the signal is pure derivation from
+lodged source metadata plus the existing `dep_health` reader.
+
+### Discriminating test
+`tests/test_slice7_blocked_sources.py::test_op_health_surfaces_sources_blocked_by_unhealthy_lodged_deps`
+
+The test lodges two scheduled sources:
+
+* `scheduled/chain-check` with `depends_on: [mill-wheel]`
+* `scheduled/healthy-check` with `depends_on: [skein]`
+
+Then it records `mill-wheel` unhealthy and `skein` healthy through the
+existing dep-health path, calls `_op_health({})`, and asserts:
+
+* `scheduled/chain-check["blocked_by_unhealthy_deps"] == ["mill-wheel"]`
+* `scheduled/healthy-check["blocked_by_unhealthy_deps"] == []`
+
+It also renders the same result through `_render_health` and asserts the
+operator-facing line `blocked by: mill-wheel` is present.
+
+### Discrimination evidence
+Performed the slice's required inversion by forcing the cross-reference
+dead: set `_op_health`'s blocked-dependency computation to always return
+`[]`. Both assertions fired independently:
+
+* the blocked source failed on expected `["mill-wheel"]` vs actual `[]`
+* the CLI render assertion failed on the missing `blocked by:
+  mill-wheel` line
+
+The healthy-source assertion stayed as the counterexample axis: it
+already expects `[]`, so the test only goes green when the blocked and
+unblocked cases are both distinguished correctly. Inversion reverted;
+test passes.

@@ -393,6 +393,9 @@ def _render_health(result: dict[str, Any]) -> None:
         click.echo(f"  {source['name']}")
         click.echo(f"    last fire: {source['last_fire_at'] or 'never'}")
         click.echo(f"    next fire: {source['next_fire_at'] or 'unknown'}")
+        blocked_by = source.get("blocked_by_unhealthy_deps") or []
+        if blocked_by:
+            click.echo(f"    blocked by: {', '.join(blocked_by)}")
     queues = result["queues"]
     click.echo(
         f"observations pending triage: {queues['observations_pending_triage']}"

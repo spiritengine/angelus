@@ -30,6 +30,7 @@ class ScheduledSource:
     cadence: str
     command: str
     timeout_seconds: float = 30.0
+    depends_on: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -98,6 +99,14 @@ def load_lodging(root: Path) -> Lodging:
 def validate_cross_refs(lodging: Lodging) -> list[str]:
     """Return a list of cross-reference errors. Empty list means consistent."""
     errors: list[str] = []
+    for source in lodging.sources.values():
+        for dependency_name in source.depends_on:
+            if dependency_name not in lodging.dependencies:
+                errors.append(
+                    "source "
+                    f"{source.source_ref} references missing dependency "
+                    f"{dependency_name}"
+                )
     for triager in lodging.triagers.values():
         if triager.source_ref not in lodging.sources:
             errors.append(
@@ -130,6 +139,7 @@ def parse_source(path: Path) -> ScheduledSource:
         cadence=_required_str(data, "cadence", path),
         command=_required_str(check, "command", path),
         timeout_seconds=_optional_timeout(check, path, 30.0),
+        depends_on=_optional_str_list(data, "depends_on", path),
     )
 
 
@@ -295,6 +305,24 @@ def _required_str(data: dict[str, Any], key: str, path: Path) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{path}: expected non-empty string {key}")
     return value
+
+
+def _optional_str_list(data: dict[str, Any], key: str, path: Path) -> list[str]:
+    value = data.get(key)
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"{path}: expected {key} to be a list of strings")
+    seen: set[str] = set()
+    parsed: list[str] = []
+    for entry in value:
+        if not isinstance(entry, str) or not entry:
+            raise ValueError(f"{path}: expected {key} entries to be non-empty strings")
+        if entry in seen:
+            raise ValueError(f"{path}: duplicate {key} entry {entry!r}")
+        seen.add(entry)
+        parsed.append(entry)
+    return parsed
 
 
 def _validate_digest_body(body: dict[str, Any], path: Path) -> None:
