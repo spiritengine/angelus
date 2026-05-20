@@ -24,6 +24,7 @@ import pytest
 import angelus.pipes.runner as pipe_runner
 from angelus.daemon import AngelusDaemon
 from angelus.lodging.reloader import LodgingReloader
+from angelus.pipes import PipeDrain
 
 
 # --- shared lodging fixtures ---------------------------------------------
@@ -832,3 +833,284 @@ def test_cross_ref_broken_at_hot_reload_emits_finding_and_keeps_state(
             daemon.connection.close()
 
     asyncio.run(driver())
+
+
+# --- M2 slice 4: rate-limit overflow end-to-end --------------------------
+
+
+def test_rate_limit_overflow_routes_excess_to_daily_and_renders_suppressed_callout(
+    tmp_path, monkeypatch,
+) -> None:
+    """End-to-end rate-limit overflow: cap push at 2/hr on `now`, drive 4
+    findings through the source/triager write surface, drain `now` then
+    `daily`. Four independently discriminating axes are pinned -- one for
+    each property the rate-limit/overflow protocol exists to provide:
+
+      A. send-rail: exactly 2 findings make it through the now-channel cap.
+      B. suppress-rail: exactly 2 findings are re-routed via
+         suppress_pipe_item_to into the daily pipe's queue (the existing
+         overflow + suppressed_findings_since protocol -- Section 5b Q1
+         dropped the deferred_alerts table noun).
+      C. digest-callout: the daily digest's preamble renders the
+         "N alert(s) suppressed by rate limit" line over the overflow
+         findings.
+      D. severity-preservation: the suppressed `high` findings remain
+         tagged `high` in the findings table AND surface as `high` in the
+         digest preamble; the overflow protocol does NOT relabel them
+         informational.
+
+    Discrimination (recorded in FELL_NOTES):
+
+      * Invert _over_rate_limit (force False) -- the cap never triggers,
+        all 4 findings dispatch as sent. Axis A fails (3 not 5 in
+        push_sends), axis B fails (no suppressed rows), axis C fails (no
+        "alert(s) suppressed by rate limit" substring in the digest body).
+      * Invert suppress_pipe_item_to to a no-op (skip the call, just
+        `continue`) -- the cap triggers but findings 3+4 stay pending on
+        now's queue and never reach daily's queue. Axis B fails (now-pq
+        rows still pending, daily-pq rows missing); axis C fails (daily's
+        suppressed_findings_since returns empty so the preamble renders
+        empty).
+      * Strip severity off the suppressed findings (e.g. cast to
+        'informational' inside suppressed_findings_since) -- axis D fails
+        on the digest substring and on the findings-row check.
+    """
+    # --- lodging: source -> triager -> now(rate_limit per_channel) -> daily
+    (tmp_path / "sources" / "scheduled").mkdir(parents=True)
+    (tmp_path / "sources" / "scheduled" / "canary.yaml").write_text(
+        # 1h cadence so APScheduler does not auto-fire in the test window;
+        # the test drives the source/triager path explicitly by writing
+        # one observation and calling _run_triager once.
+        "cadence: 1h\ncheck:\n  kind: shell\n  command: 'echo {}'\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "triagers" / "handlers").mkdir(parents=True)
+    (tmp_path / "triagers" / "handlers" / "emit_n.py").write_text(
+        # Real triager subprocess: reads the observation, emits N
+        # high-severity findings targeted at `now`. Run via
+        # run_python_triager from _run_triager -- the same write surface
+        # the daemon uses in production. Findings go through
+        # catalog.write_finding (NOT a direct test write), so dedup_key,
+        # incident-upsert, and pipe_queues insertion happen via the
+        # production code path.
+        "import json, sys\n"
+        "data = json.loads(sys.stdin.read())\n"
+        "obs = data['observation']\n"
+        "n = int(obs.get('n', 0))\n"
+        "findings = []\n"
+        "for i in range(n):\n"
+        "    findings.append({\n"
+        "        'source': 'scheduled/canary',\n"
+        "        'type': 'down',\n"
+        "        'entity': f'e{i}',\n"
+        "        'dedup_key': f'scheduled/canary:down:e{i}',\n"
+        "        'severity': 'high',\n"
+        "        'target_pipes': ['now'],\n"
+        "        'body': {'text': f'alert {i}'},\n"
+        "    })\n"
+        "print(json.dumps({'findings': findings, 'new_state': {}}))\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "triagers" / "canary.yaml").write_text(
+        "inputs:\n  source: scheduled/canary\n"
+        "handler:\n  kind: python\n"
+        "  path: triagers/handlers/emit_n.py\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "pipes").mkdir()
+    (tmp_path / "pipes" / "now.yaml").write_text(
+        # Cap per_channel at 2/hr with overflow into daily. This is the
+        # rescoped Section 5b Q1 shape: lodging carries overflow:<pipe>,
+        # _drain_immediate routes excess through suppress_pipe_item_to,
+        # the digest reads the routed rows via suppressed_findings_since.
+        "cadence: immediate\nchannels: [push]\n"
+        "rate_limit:\n  per_channel: 2/hr\n  overflow: daily\n"
+        "render:\n  kind: dumb-alert\n"
+        "  template: '{severity}/{type}:{entity}:{body}'\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "pipes" / "daily.yaml").write_text(
+        "cadence: '0 8 * * *'\nchannels: [push]\n"
+        "render:\n"
+        "  preamble:\n"
+        "    - kind: structured\n      template: rate-limit-callout\n"
+        "  body:\n    kind: llm\n    mantle: chronicler\n"
+        "    inputs:\n      - findings_since_last_drain\n"
+        "      - suppressed_findings\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "channels").mkdir()
+    (tmp_path / "channels" / "push.yaml").write_text(
+        "kind: push\ncommand: 'true'\n", encoding="utf-8"
+    )
+    (tmp_path / "render-templates").mkdir()
+    (tmp_path / "render-templates" / "rate-limit-callout.j2").write_text(
+        # "N alert(s) suppressed by rate limit" line plus per-finding
+        # severity+entity rows. The severity rendering is what pins axis
+        # D against an inversion that downgrades suppressed findings: if
+        # severity were dropped or rewritten to 'informational', the
+        # substring "[high]" would not appear in the digest message.
+        "{% if suppressed_findings %}"
+        "{{ suppressed_findings | length }} alert(s) suppressed by rate limit:\n"
+        "{% for finding in suppressed_findings %}"
+        "  - [{{ finding.severity }}] {{ finding.entity }}\n"
+        "{% endfor %}"
+        "{% endif %}",
+        encoding="utf-8",
+    )
+
+    daemon = AngelusDaemon(tmp_path)
+
+    # send_push is mocked to record every dispatched message so we can
+    # discriminate the send rail (axis A) and the digest callout (axis C)
+    # by message content. The push channel command is 'true' but we never
+    # reach the real subprocess because of this monkeypatch -- which also
+    # keeps the test off the file-system DRY_RUN log code path.
+    push_sends: list[str] = []
+
+    async def fake_push(_channel, message: str, _workdir: Path) -> None:
+        push_sends.append(message)
+
+    monkeypatch.setattr(pipe_runner, "send_push", fake_push)
+
+    # The digest LLM body is unrelated to the rate-limit axes; mock it to
+    # avoid spawning a `horizon` subprocess in the test. The mocked body
+    # captures the `structured` inputs so axis C can also be asserted
+    # against the structured suppressed_findings list seen by the LLM.
+    captured_llm_inputs: list[dict] = []
+
+    async def fake_llm(_self, _pipe, structured):
+        captured_llm_inputs.append(structured)
+        return "body text.", None
+
+    monkeypatch.setattr(PipeDrain, "_render_llm_body", fake_llm)
+
+    state: dict[str, object] = {}
+
+    async def driver() -> None:
+        try:
+            # Real source-path write: observation lands as a 'ready' row
+            # with the production schema. Triage will pick it up next.
+            obs_id = daemon.catalog.write_observation(
+                "scheduled/canary",
+                {"n": 4},
+                {"source": "scheduled/canary", "check": "shell"},
+            )
+            triager = daemon.lodging.triagers["canary"]
+            rows = daemon.catalog.ready_observations_for(
+                triager.name, triager.source_ref
+            )
+            assert [int(r["id"]) for r in rows] == [obs_id], rows
+            # Mark processing the same way _triage_loop's body does, so
+            # _run_triager sees the production preconditions.
+            daemon.catalog.mark_triage_processing(rows[0]["id"], triager.name)
+            await daemon._run_triager(rows[0], triager.name)
+
+            findings = list(
+                daemon.connection.execute(
+                    "SELECT id, severity, entity FROM findings "
+                    "WHERE source='scheduled/canary' ORDER BY id"
+                )
+            )
+            assert [f["entity"] for f in findings] == ["e0", "e1", "e2", "e3"]
+            assert all(f["severity"] == "high" for f in findings)
+            state["finding_ids"] = [int(f["id"]) for f in findings]
+
+            # Drain `now`: cap is 2/hr per channel, so finding 1+2 send,
+            # finding 3+4 cross the cap and get suppressed into daily.
+            await daemon.pipe_drains["now"].drain_once()
+
+            # Snapshot the state the digest will read BEFORE draining it,
+            # so a regression on suppress_pipe_item_to is named explicitly
+            # by the snapshot assertions rather than only being implied by
+            # the rendered preamble.
+            state["now_queue"] = [
+                (r["finding_id"], r["status"])
+                for r in daemon.connection.execute(
+                    "SELECT finding_id, status FROM pipe_queues "
+                    "WHERE pipe = 'now' ORDER BY finding_id"
+                )
+            ]
+            state["daily_queue"] = [
+                (r["finding_id"], r["status"])
+                for r in daemon.connection.execute(
+                    "SELECT finding_id, status FROM pipe_queues "
+                    "WHERE pipe = 'daily' ORDER BY finding_id"
+                )
+            ]
+            state["now_dispatches"] = [
+                (r["channel"], r["status"])
+                for r in daemon.connection.execute(
+                    "SELECT channel, status FROM dispatches "
+                    "WHERE pipe = 'now' ORDER BY id"
+                )
+            ]
+            state["suppressed_findings"] = [
+                {"entity": s["entity"], "severity": s["severity"]}
+                for s in daemon.catalog.suppressed_findings_since(None)
+            ]
+
+            await daemon.pipe_drains["daily"].drain_once()
+            state["daily_message"] = push_sends[-1]
+        finally:
+            daemon.connection.close()
+
+    asyncio.run(driver())
+
+    # --- axis A: send rail -- exactly 2 findings made it through `now` ---
+    # `true` succeeded on both, recorded as 'sent' dispatches against the
+    # `push` channel. push_sends carries 3 messages total (2 now + 1 daily
+    # digest).
+    now_sent = [d for d in state["now_dispatches"] if d == ("push", "sent")]
+    assert len(now_sent) == 2, state["now_dispatches"]
+    # axis A is also pinned by the count of immediate dispatches in
+    # push_sends (the daily digest message is the 3rd).
+    assert len(push_sends) == 3, push_sends
+
+    # --- axis B: suppress rail -- 2 finding rows re-routed to daily ----
+    # Findings 1+2 dispatched on `now`; findings 3+4 transitioned to
+    # 'suppressed' on `now` AND have a 'pending' row on `daily` written
+    # by suppress_pipe_item_to. (The first two findings have NO `daily`
+    # row -- target_pipes=['now'] only -- so the daily pending rows for
+    # finding 3+4 EXIST exclusively because of the suppress call.)
+    fid1, fid2, fid3, fid4 = state["finding_ids"]  # type: ignore[misc]
+    assert state["now_queue"] == [
+        (fid1, "dispatched"),
+        (fid2, "dispatched"),
+        (fid3, "suppressed"),
+        (fid4, "suppressed"),
+    ]
+    assert state["daily_queue"] == [
+        # Pre-drain snapshot: the two suppressed rows are pending on daily;
+        # after the daily drain they would be 'dispatched'. The snapshot
+        # is taken BEFORE the daily drain so the suppress-rail evidence
+        # is unambiguous (axis B is about routing, not digest dispatch).
+        (fid3, "pending"),
+        (fid4, "pending"),
+    ]
+
+    # --- axis C: digest callout -- the preamble names how many were
+    # suppressed and lists the suppressed entities. The number is the
+    # `length` Jinja filter over suppressed_findings; if axis B fails the
+    # list is empty and "alert(s) suppressed by rate limit" disappears.
+    daily_msg = str(state["daily_message"])
+    assert "2 alert(s) suppressed by rate limit" in daily_msg, daily_msg
+    assert "e2" in daily_msg and "e3" in daily_msg, daily_msg
+    # The structured input the LLM receives carries both suppressed rows
+    # too -- axis C also discriminates at the structured-input boundary.
+    assert captured_llm_inputs, "digest _render_llm_body was not invoked"
+    assert [
+        item["entity"] for item in captured_llm_inputs[0]["suppressed_findings"]
+    ] == ["e2", "e3"]
+
+    # --- axis D: severity preservation -- the rows the digest reads keep
+    # their original 'high' severity. The protocol routes through
+    # pipe_queues + suppressed_findings_since, NOT through any rewrite.
+    # Inverting the suppressed_findings_since join to cast severity to
+    # 'informational' would fail both lines below.
+    assert state["suppressed_findings"] == [
+        {"entity": "e2", "severity": "high"},
+        {"entity": "e3", "severity": "high"},
+    ]
+    assert "[high] e2" in daily_msg and "[high] e3" in daily_msg, daily_msg
+    assert "informational" not in daily_msg, daily_msg
