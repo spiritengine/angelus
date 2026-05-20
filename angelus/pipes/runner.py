@@ -321,6 +321,14 @@ class PipeDrain:
                 str(mantle),
                 "--message",
                 prompt,
+                # Without --json the cast stdout has a preamble ("New strand
+                # created: ...", three help lines about cast --omlet) and a
+                # footer block (Omlet: / Strand: / Status: / Bearing: /
+                # Duration: lines) wrapped around a "Result: ..." line. The
+                # whole envelope leaks into the digest body. --json returns
+                # a structured object whose `result` field is the unwrapped
+                # model output -- no preamble, no footer, no Result: prefix.
+                "--json",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 # Own process group so a timeout/cancel SIGKILLs the whole
@@ -343,10 +351,18 @@ class PipeDrain:
             # non-reaped scheduled-source timeout. Reap the group, re-raise.
             await _kill_and_reap(process)
             raise
-        output = stdout.decode("utf-8", errors="replace").strip()
+        raw = stdout.decode("utf-8", errors="replace").strip()
         if process.returncode != 0:
             error = stderr.decode("utf-8", errors="replace").strip()
             return None, f"chronicler exited {process.returncode}: {error}"
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            return None, f"chronicler --json output unparseable: {exc}"
+        result = payload.get("result")
+        if not isinstance(result, str):
+            return None, "chronicler --json missing string `result`"
+        output = result.strip()
         if len(output) < 20:
             return None, "chronicler output was empty or too short"
         return output, None
