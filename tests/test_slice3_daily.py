@@ -1167,3 +1167,132 @@ def test_digest_body_kind_must_be_llm(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="body.kind must be 'llm'"):
         load_lodging(tmp_path)
+
+
+def test_llm_body_unwraps_horizon_cast_envelope(tmp_path, monkeypatch) -> None:
+    # `horizon cast` stdout wraps the model output in a CLI envelope:
+    # a "New strand created: ..." preamble, three help lines about
+    # `cast --omlet`, a "Result: ..." line carrying the actual body,
+    # and a footer block (Omlet:/Strand:/Status:/Bearing:/Duration:).
+    # Pre-fix the runner returned the entire envelope as the digest
+    # body; the friction-20260514-hxpb gap. This test pins that
+    # `_render_llm_body` strictly returns the unwrapped model output.
+    #
+    # The stub branches on argv: with `--json`, it returns the
+    # structured payload exactly as real `horizon cast --json` does;
+    # without `--json`, it returns the legacy text envelope. This
+    # makes the fix's choice of envelope discriminating both ways:
+    #
+    #   * dropping `--json` from the runner's argv -> stub emits
+    #     legacy text -> json.loads fails -> fallback footer dispatched
+    #     instead of the clean body -> this test fails.
+    #   * keeping `--json` but skipping the parse and returning raw
+    #     stdout -> body is the JSON blob (braces, escape codes) ->
+    #     contains "result" / "omlet" markers -> this test fails.
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    _write_templates(tmp_path)
+    horizon = tmp_path / "horizon"
+    horizon.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "argv = sys.argv\n"
+        "clean = (\n"
+        "    'Digest body: nothing urgent across the watched surface. '\n"
+        "    'One closure noted, otherwise quiet.'\n"
+        ")\n"
+        "if '--json' in argv:\n"
+        "    sys.stdout.write(json.dumps({\n"
+        "        'omlet': 'api_2026-05-20_00-00-00-000@agent-aaaa@turn-1',\n"
+        "        'status': 'complete',\n"
+        "        'result': clean,\n"
+        "        'bearing': 'chronicler digest',\n"
+        "        'duration': 1.23,\n"
+        "        'tokens': None,\n"
+        "        'actions': None,\n"
+        "        'is_new_strand': True,\n"
+        "    }))\n"
+        "else:\n"
+        "    sys.stdout.write(\n"
+        "        'New strand created: api_2026-05-20_00-00-00-000\\n'\n"
+        "        '\\n'\n"
+        "        'Use cast --omlet <strand id> to talk to the latest version'\n"
+        "        ' of this agent at any time in the future\\n'\n"
+        "        'Use cast --omlet <full omlet ref> to resume this conversation'\n"
+        "        ' from this exact point at any time in the future\\n'\n"
+        "        'Prefer to use cast --omlet <strand> for normal'\n"
+        "        ' conversational flow\\n'\n"
+        "        '\\n'\n"
+        "        f'Result: {clean}\\n'\n"
+        "        '\\n'\n"
+        "        'Omlet: api_2026-05-20_00-00-00-000@agent-aaaa@turn-1\\n'\n"
+        "        'Strand: api_2026-05-20_00-00-00-000\\n'\n"
+        "        'Status: complete\\n'\n"
+        "        'Bearing: chronicler digest\\n'\n"
+        "        'Duration: 1.23s\\n'\n"
+        "    )\n",
+        encoding="utf-8",
+    )
+    horizon.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    sent: list[str] = []
+
+    async def fake_push(_channel, message: str, _workdir: Path) -> None:
+        sent.append(message)
+
+    monkeypatch.setattr(pipe_runner, "send_push", fake_push)
+    drain = PipeDrain(
+        catalog,
+        _daily_pipe(),
+        {"push": Channel(name="push", kind="push", command="notify-pat")},
+        tmp_path,
+        {"now", "daily"},
+    )
+
+    try:
+        catalog.write_finding(
+            None,
+            {
+                "source": "scheduled/test",
+                "type": "down",
+                "entity": "site",
+                "severity": "high",
+                "target_pipes": ["daily"],
+            },
+            {"daily"},
+        )
+        asyncio.run(drain.drain_once())
+        internal = connection.execute(
+            "SELECT type FROM findings WHERE source = 'internal/render'"
+        ).fetchone()
+    finally:
+        connection.close()
+
+    assert internal is None, "clean digest must not emit an internal/render finding"
+    assert sent, "digest must dispatch when the chronicler returns a body"
+    body = sent[0]
+    clean = (
+        "Digest body: nothing urgent across the watched surface. "
+        "One closure noted, otherwise quiet."
+    )
+    assert clean in body
+    for leak in (
+        # Legacy text-envelope markers (inversion: drop --json from argv,
+        # stub emits text, body contains the whole envelope).
+        "New strand created:",
+        "Use cast --omlet",
+        "Result:",
+        "Omlet:",
+        "Strand:",
+        "Status: complete",
+        "Bearing:",
+        "Duration:",
+        # JSON-envelope markers (inversion: keep --json but skip parsing,
+        # body contains the raw JSON blob with these keys).
+        '"omlet"',
+        '"result"',
+        '"bearing"',
+        '"duration"',
+        '"is_new_strand"',
+    ):
+        assert leak not in body, f"{leak!r} leaked into digest body"
