@@ -106,7 +106,11 @@ def test_health_round_trip(tmp_path) -> None:
         assert {s["name"] for s in result["sources"]} == {"scheduled/watch"}
         assert "observations_pending_triage" in result["queues"]
         assert "findings_pending_dispatch" in result["queues"]
-        assert result["belfry"] is None
+        # Belfry never ran in this test root -> never-pinged shape, the
+        # most-stale state. The dict shape (not bare None) is the slice-8
+        # contract; CLI render branches on the boolean without first
+        # guarding the outer value.
+        assert result["belfry"] == {"last_pinged_at": None, "stale": True}
 
     asyncio.run(driver())
 

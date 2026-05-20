@@ -440,3 +440,200 @@ def test_belfry_independence_against_sigkilled_daemon(
     # And in practice the tick is interactive-fast (no network, mocked
     # subprocess); 5s is a generous CI ceiling.
     assert elapsed < 5.0, f"belfry tick took {elapsed:.2f}s (unexpectedly slow)"
+
+
+# --- M2 slice 8: belfry liveness sentinel ---------------------------------
+#
+# Two units pinned here: the sentinel is touched on EVERY tick (success
+# AND failure paths) and the path resolves to <root>/state/belfry-pinged-at
+# by default with ANGELUS_BELFRY_SENTINEL_PATH overriding. The "every
+# tick" choice is the slice's semantic decision -- liveness of belfry is
+# distinct from health of angelus, so a tick that finds angelus down
+# still proves belfry itself fired on schedule.
+
+
+def _sentinel_mtime(path: Path) -> float:
+    return path.stat().st_mtime
+
+
+def test_sentinel_touched_on_success_tick(tmp_path, monkeypatch) -> None:
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "angelus.pid").write_text(
+        str(os.getpid()), encoding="utf-8"
+    )
+    _write_source_fire(tmp_path, datetime.now(UTC))
+
+    monkeypatch.setattr(
+        belfry.urllib.request,
+        "urlopen",
+        lambda url, timeout: _Response(),
+    )
+    monkeypatch.setattr(
+        belfry.subprocess,
+        "run",
+        lambda args, check: subprocess.CompletedProcess(args, 0),
+    )
+
+    sentinel = tmp_path / "state" / "belfry-pinged-at"
+    assert not sentinel.exists()
+    before = time.time()
+    assert belfry.main([str(tmp_path)]) == 0
+    after = time.time()
+    assert sentinel.exists(), "sentinel must be created on a successful tick"
+    mtime = _sentinel_mtime(sentinel)
+    # The mtime is bracketed by wall-clock before/after of the belfry tick.
+    # Both bounds are necessary: a frozen mtime (e.g. write to wrong path)
+    # would fail the lower bound; a future mtime would fail the upper.
+    assert before - 1 <= mtime <= after + 1, (
+        f"sentinel mtime {mtime} outside [{before}, {after}]"
+    )
+
+
+def test_sentinel_touched_on_failure_tick(tmp_path, monkeypatch) -> None:
+    """Discrimination axis: 'every tick, not only success.' Belfry on a
+    daemon-down tick still fires the sentinel. Under the inversion 'touch
+    only on success path' (move the touch_sentinel call below the
+    dead/wedge bail-out), this assertion fires."""
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    (tmp_path / "state").mkdir()
+    # Dead-PID setup: PID 999999 is not running on any sane test host.
+    (tmp_path / "state" / "angelus.pid").write_text("999999", encoding="utf-8")
+
+    monkeypatch.setattr(
+        belfry.urllib.request,
+        "urlopen",
+        lambda url, timeout: _Response(),
+    )
+    monkeypatch.setattr(
+        belfry.subprocess,
+        "run",
+        lambda args, check: subprocess.CompletedProcess(args, 0),
+    )
+
+    sentinel = tmp_path / "state" / "belfry-pinged-at"
+    before = time.time()
+    rc = belfry.main([str(tmp_path)])
+    after = time.time()
+    assert rc == 1, "expected DOWN-escalation exit"
+    assert sentinel.exists(), (
+        "sentinel must be touched on the failure-tick path too -- belfry "
+        "liveness is the question, not angelus health"
+    )
+    mtime = _sentinel_mtime(sentinel)
+    assert before - 1 <= mtime <= after + 1
+
+
+def test_sentinel_touch_updates_existing_mtime(tmp_path, monkeypatch) -> None:
+    """A pre-existing sentinel file gets its mtime advanced. Without an
+    explicit os.utime, Path.touch(exist_ok=True) on most filesystems does
+    bump mtime, but the explicit utime guards against subtle differences
+    on tmpfs / network filesystems and makes the contract local to the
+    function."""
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "angelus.pid").write_text(
+        str(os.getpid()), encoding="utf-8"
+    )
+    _write_source_fire(tmp_path, datetime.now(UTC))
+
+    monkeypatch.setattr(
+        belfry.urllib.request,
+        "urlopen",
+        lambda url, timeout: _Response(),
+    )
+    monkeypatch.setattr(
+        belfry.subprocess,
+        "run",
+        lambda args, check: subprocess.CompletedProcess(args, 0),
+    )
+
+    sentinel = tmp_path / "state" / "belfry-pinged-at"
+    # Pre-create with an mtime well in the past so the after-tick mtime
+    # must be visibly greater.
+    sentinel.touch()
+    old_time = time.time() - 3600
+    os.utime(sentinel, (old_time, old_time))
+    assert _sentinel_mtime(sentinel) == old_time
+
+    assert belfry.main([str(tmp_path)]) == 0
+    new_mtime = _sentinel_mtime(sentinel)
+    assert new_mtime > old_time + 60, (
+        f"sentinel mtime did not advance: {new_mtime} vs {old_time}"
+    )
+
+
+def test_sentinel_path_override_honored(tmp_path, monkeypatch) -> None:
+    """ANGELUS_BELFRY_SENTINEL_PATH overrides the default. Discrimination:
+    under the inversion 'ignore the env var, always use the default path,'
+    the default file would be touched and the override would not -- both
+    assertions below flip."""
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "angelus.pid").write_text(
+        str(os.getpid()), encoding="utf-8"
+    )
+    _write_source_fire(tmp_path, datetime.now(UTC))
+
+    override = tmp_path / "custom-belfry-sentinel"
+    monkeypatch.setenv("ANGELUS_BELFRY_SENTINEL_PATH", str(override))
+
+    monkeypatch.setattr(
+        belfry.urllib.request,
+        "urlopen",
+        lambda url, timeout: _Response(),
+    )
+    monkeypatch.setattr(
+        belfry.subprocess,
+        "run",
+        lambda args, check: subprocess.CompletedProcess(args, 0),
+    )
+
+    assert belfry.main([str(tmp_path)]) == 0
+    assert override.exists(), "override path was not touched"
+    assert not (tmp_path / "state" / "belfry-pinged-at").exists(), (
+        "default path was touched despite override env var being set"
+    )
+
+
+def test_sentinel_touch_swallows_oserror(tmp_path, monkeypatch, capsys) -> None:
+    """A broken sentinel filesystem must not stop belfry from running its
+    angelus-health pings on this tick. Sentinel is a liveness signal, not
+    a correctness gate -- failures are logged and swallowed.
+
+    Under the inversion 'let OSError propagate from touch_sentinel,' the
+    belfry tick would bail before pinging the SUCCESS URL, so the
+    pings == [success_url] assertion below would fail."""
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "angelus.pid").write_text(
+        str(os.getpid()), encoding="utf-8"
+    )
+    _write_source_fire(tmp_path, datetime.now(UTC))
+
+    def boom(self: Path, *args, **kwargs):
+        raise OSError("simulated EIO from test")
+
+    monkeypatch.setattr(belfry.Path, "touch", boom)
+    pings: list[str] = []
+    monkeypatch.setattr(
+        belfry.urllib.request,
+        "urlopen",
+        lambda url, timeout: pings.append(url) or _Response(),
+    )
+    monkeypatch.setattr(
+        belfry.subprocess,
+        "run",
+        lambda args, check: subprocess.CompletedProcess(args, 0),
+    )
+
+    rc = belfry.main([str(tmp_path)])
+    assert rc == 0
+    assert pings == ["https://hc.example/success"]
+    err = capsys.readouterr().err
+    assert "failed to touch sentinel" in err
