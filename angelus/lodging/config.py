@@ -76,6 +76,12 @@ class Lodging:
 
 
 def load_lodging(root: Path) -> Lodging:
+    # Parse and cross-ref failures here raise ValueError, which crashes
+    # daemon startup. The runtime reload path (LodgingReloader) instead
+    # emits an internal/lodging finding to the `now` pipe and keeps the
+    # prior state. The asymmetry is deliberate: at startup the catalog
+    # and now-pipe haven't been constructed yet, so a finding has no
+    # surface to land on -- raising is the only available signal.
     lodging = Lodging(
         sources=_load_sources(root),
         triagers=_load_triagers(root),
