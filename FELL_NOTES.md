@@ -1141,3 +1141,19 @@ The CLI regression anchors the new surface on the operator path: if
 `_render_deps` drops the mute line or `_render_channels` is omitted
 from the health output, `test_daemon_down_health_renders_new_dep_and_channel_surfaces`
 fires on the missing text.
+
+## M2 slice 10 -- boots advisory disposition
+
+Section 3.6 / Section 6 slice 10 of brief-20260520-tqov, plus
+Patrick's Section 5b Q5 decision, keep the boots layer advisory.
+
+What shipped:
+
+* `deploy/boots-watchdog.sh` as the canonical outer watchdog snippet
+* README guidance pointing operators at that file and its crontab line
+
+What did NOT ship:
+
+* no lodged dependency check
+* no angelus/belfry code change
+* no new product surface beyond deploy/docs guidance
