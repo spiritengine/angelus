@@ -436,3 +436,51 @@ def test_startup_clears_channel_health(tmp_path) -> None:
         connection.close()
 
     assert rows == []
+
+
+def test_startup_clears_digest_channel_attempts(tmp_path) -> None:
+    _write_trust_lodging(tmp_path)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    connection = init_db(state_dir / "angelus.sqlite3")
+    # Seed the per-channel digest attempt counter at one below the threshold
+    # (MAX_RETRY_ATTEMPTS = 5, so attempts = 4). If startup leaves these rows
+    # in place while wiping channel_health, the next digest failure on either
+    # row crosses the ladder immediately on the fresh daemon generation --
+    # breaking the operator-restart-re-enables-a-channel contract.
+    connection.execute(
+        """
+        INSERT INTO digest_channel_attempts (pipe, channel, attempts, last_error)
+        VALUES ('daily', 'email', 4, 'smtp refused')
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO digest_channel_attempts (pipe, channel, attempts, last_error)
+        VALUES ('weekly', 'push', 4, 'pushd hung')
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    angelus = AngelusDaemon(tmp_path)
+
+    async def run_briefly() -> None:
+        run_task = asyncio.create_task(angelus.run())
+        await asyncio.sleep(0.05)
+        angelus.request_stop()
+        await asyncio.wait_for(run_task, timeout=2.0)
+
+    asyncio.run(run_briefly())
+
+    connection = init_db(state_dir / "angelus.sqlite3")
+    try:
+        rows = list(
+            connection.execute(
+                "SELECT pipe, channel, attempts FROM digest_channel_attempts"
+            )
+        )
+    finally:
+        connection.close()
+
+    assert rows == []
