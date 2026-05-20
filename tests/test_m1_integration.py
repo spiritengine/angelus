@@ -19,6 +19,8 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 import angelus.pipes.runner as pipe_runner
 from angelus.daemon import AngelusDaemon
 from angelus.lodging.reloader import LodgingReloader
@@ -709,6 +711,120 @@ def test_channel_rename_mid_pending_finding_is_rejected_at_cross_ref(
             assert "push" in daemon.lodging.channels
             assert "telegram" not in daemon.lodging.channels
             assert reloader.rejected == {}, reloader.rejected
+        finally:
+            daemon.connection.close()
+
+    asyncio.run(driver())
+
+
+# --- M2 slice 2: cross-ref rehearsal at hot-reload -----------------------
+
+
+@pytest.mark.parametrize(
+    "direction",
+    ["pipe_to_channel", "triager_to_source", "pipe_to_overflow"],
+)
+def test_cross_ref_broken_at_hot_reload_emits_finding_and_keeps_state(
+    tmp_path, direction,
+) -> None:
+    """Sweep every cross-ref direction validate_cross_refs guards
+    (pipe -> channel, triager -> source, pipe -> overflow-pipe) and
+    assert that introducing a dangling reference via a YAML edit at
+    hot-reload time emits an internal/lodging cross_ref_broken finding
+    for the edited file and leaves live lodging unchanged.
+
+    Discrimination (recorded in FELL_NOTES): stripping
+    validate_cross_refs (or its caller in
+    LodgingReloader._handle_path's edit arm) lets the broken edit
+    apply. The per-direction snapshot-stable assertion below names
+    which assertion fires under that inversion:
+      * pipe_to_channel    -> `pipes["now"].channels == ["push"]`
+      * triager_to_source  -> `triagers["watch"].source_ref ==
+                               "scheduled/watch"`
+      * pipe_to_overflow   -> `pipes["now"].rate_limit == {}`
+    The cross_ref_broken-finding presence assertion fails under the
+    same inversion (no rejection arm => no finding written).
+    """
+    _base_lodging(tmp_path)
+    if direction == "triager_to_source":
+        # parse_triager validates the handler path on disk: a missing
+        # handler raises ValueError and would route through load_failed
+        # rather than cross_ref_broken, so the handler must exist for
+        # the edit to reach validate_cross_refs.
+        (tmp_path / "triagers" / "handlers").mkdir(parents=True)
+        (tmp_path / "triagers" / "handlers" / "noop.py").write_text(
+            "import json\n"
+            "print(json.dumps({'findings': [], 'new_state': {}}))\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "triagers" / "watch.yaml").write_text(
+            "inputs:\n  source: scheduled/watch\n"
+            "handler:\n  kind: python\n"
+            "  path: triagers/handlers/noop.py\n",
+            encoding="utf-8",
+        )
+
+    daemon = AngelusDaemon(tmp_path)
+    reloader = LodgingReloader(daemon, tmp_path, debounce_seconds=0.0)
+
+    if direction == "pipe_to_channel":
+        changed_rel = "pipes/now.yaml"
+        snapshot_before = list(daemon.lodging.pipes["now"].channels)
+        new_yaml = (
+            "cadence: immediate\nchannels: [push, missing_channel]\n"
+            "render:\n  kind: dumb-alert\n"
+            "  template: '{type}:{entity}:{body}'\n"
+        )
+    elif direction == "triager_to_source":
+        changed_rel = "triagers/watch.yaml"
+        snapshot_before = daemon.lodging.triagers["watch"].source_ref
+        new_yaml = (
+            "inputs:\n  source: scheduled/missing_source\n"
+            "handler:\n  kind: python\n"
+            "  path: triagers/handlers/noop.py\n"
+        )
+    else:  # pipe_to_overflow
+        changed_rel = "pipes/now.yaml"
+        snapshot_before = dict(daemon.lodging.pipes["now"].rate_limit)
+        new_yaml = (
+            "cadence: immediate\nchannels: [push]\n"
+            "rate_limit:\n  overflow: missing_pipe\n"
+            "render:\n  kind: dumb-alert\n"
+            "  template: '{type}:{entity}:{body}'\n"
+        )
+
+    changed_path = tmp_path / changed_rel
+
+    async def driver() -> None:
+        try:
+            changed_path.write_text(new_yaml, encoding="utf-8")
+            reloader.event_queue.put(str(changed_path))
+            await reloader.process_pending_events()
+
+            cross_ref = [
+                dict(r) for r in daemon.connection.execute(
+                    "SELECT type, entity FROM findings "
+                    "WHERE source = 'internal/lodging' "
+                    "AND type = 'cross_ref_broken'"
+                )
+            ]
+            assert cross_ref, "expected a cross_ref_broken finding"
+            assert any(r["entity"] == changed_rel for r in cross_ref), (
+                f"no cross_ref_broken for {changed_rel}; got {cross_ref}"
+            )
+
+            # The rejection left lodging unchanged on the field the edit
+            # targeted -- so a downstream drain / triage step that reads
+            # the field cannot see a dangling reference.
+            if direction == "pipe_to_channel":
+                assert daemon.lodging.pipes["now"].channels == snapshot_before
+            elif direction == "triager_to_source":
+                assert (
+                    daemon.lodging.triagers["watch"].source_ref
+                    == snapshot_before
+                )
+            else:
+                assert daemon.lodging.pipes["now"].rate_limit == snapshot_before
         finally:
             daemon.connection.close()
 
