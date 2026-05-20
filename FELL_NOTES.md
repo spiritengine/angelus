@@ -1043,9 +1043,10 @@ Four inversions performed in the worktree, observed, reverted:
 
 All four inversions reverted; the 17 new tests pass deterministically
 in ~2.5s (no real subprocess, no real network -- urllib and
-Adding `pythonpath = ["."]` to `pyproject.toml` also resolved the shard-worktree quirk where bare `pytest` imported the installed `angelus` package instead of the worktree copy.
 subprocess.run monkeypatched throughout). Baseline was 140 tests,
 post-slice 157.
+
+Adding `pythonpath = ["."]` to `pyproject.toml` also resolved the shard-worktree quirk where bare `pytest` imported the installed `angelus` package instead of the worktree copy.
 
 ### Docstring-by-intent (rounds 6-7-8 lesson)
 Helper docstrings on this slice (`sentinel_path`, `touch_sentinel`,
