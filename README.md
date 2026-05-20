@@ -73,8 +73,17 @@ Setup:
 The default wedge threshold is 10 minutes. Override it with
 `ANGELUS_BELFRY_WEDGE_THRESHOLD_SEC` if your source cadence needs more slack.
 
-Optional boots layer: add a system crontab check for the watcher itself, such as
-`*/30 * * * * test $(find /path/to/angelus/state/belfry.log -mmin -1440 | wc -l) -eq 1 || echo "angelus belfry stale" | mail -s "angelus belfry stale" you@example.com`.
+Optional boots layer: keep it advisory. The canonical watchdog lives in
+`deploy/boots-watchdog.sh` and watches the same belfry sentinel file
+(`state/belfry-pinged-at` by default, or `ANGELUS_BELFRY_SENTINEL_PATH` if
+overridden). Install it from system cron or systemd, for example:
+
+`*/10 * * * * ANGELUS_ROOT=/opt/angelus ANGELUS_BOOTS_NOTIFY='mail -s "angelus boots alert" you@example.com' /opt/angelus/deploy/boots-watchdog.sh`
+
+The script alerts when the sentinel is missing or older than
+`ANGELUS_BOOTS_STALE_MINUTES` (default `30`). It does not add a lodged
+dependency check or any new angelus product behavior; the operator owns the
+outermost watchdog wiring.
 
 ## Storage
 
