@@ -911,3 +911,147 @@ Three inversions performed in the worktree, observed, reverted:
 All three inversions reverted; the test passes deterministically
 (~5s end-to-end, dominated by the 4s post-daemon-B sleep that
 gives recovery + drain time to settle).
+
+---
+
+## M2 slice 8 — belfry liveness via sentinel file
+
+### Verdict: BUG FIXED (slice ships small product change on both sides).
+
+### What was measured
+Section 3.1 of brief-20260520-tqov flagged that belfry pings
+healthchecks.io and reads `source_fires` read-only but writes no
+liveness timestamp angelus can surface; `_op_health` hardcoded the
+`belfry` field to `None`. Patrick's Section 5b Q2 decision
+superseded the brief's original `belfry_pings` sqlite-table shape
+with a sentinel-file shape: belfry touches a sentinel file on each
+cron tick, the daemon reads its mtime in `_op_health`. This keeps
+the daemon-as-sole-writer-to-sqlite invariant intact -- no new
+sqlite writer is introduced.
+
+Slice 8 ships:
+
+* `belfry/belfry.py`: `touch_sentinel(path)` + `sentinel_path(state_dir)`
+  helpers, called at the top of `main()` BEFORE the pid/wedge checks
+  so every tick (success and failure) updates the sentinel. The
+  question this answers is belfry-liveness ("is belfry firing on
+  schedule?"), not angelus-health, so the touch precedes any branch
+  that could short-circuit the function. Touch failures are
+  swallowed with a stderr log -- the sentinel is a liveness signal,
+  not a correctness gate, and a transient EIO must not stop belfry
+  from issuing its angelus-health pings on this tick.
+* `angelus/daemon.py`: module-level `_belfry_status(root)` returns
+  `{"last_pinged_at": <iso8601-Z>|None, "stale": <bool>}`, called
+  inside `_op_health` to fill the previously-`None` field. Missing
+  sentinel -> `{"last_pinged_at": None, "stale": True}` (the
+  most-stale state, never-pinged). Stale threshold is
+  `ANGELUS_BELFRY_STALE_AFTER_SEC` (default 1200s = ~2x belfry's
+  typical 5-15min cron cadence; one skipped tick stays "fresh", two
+  flip "stale"). The dict shape (never bare `None`) is deliberate
+  so the CLI render can branch on the boolean without first
+  guarding the outer value -- same pattern `deps` and `sources`
+  use.
+* `angelus/cli.py`: `_render_belfry` consumes the dict shape (two
+  plain lines: timestamp + freshness). `_render_health_fallback`
+  (daemon-down path) calls `_belfry_status` too -- the whole point
+  of belfry is to be useful when angelus is down, so "is belfry
+  alive too?" must answer in that path.
+
+Both sides read `ANGELUS_BELFRY_SENTINEL_PATH` with the same
+default (`<root>/state/belfry-pinged-at`), so a drift on one side
+would surface as permanent "never pinged" -- the integration test
+below catches that drift.
+
+### Product change (small, by-design)
+Two new helpers per side, four env-var conventions
+(`ANGELUS_BELFRY_SENTINEL_PATH`, `ANGELUS_BELFRY_STALE_AFTER_SEC`),
+no schema change, no new sqlite writer. The
+mandatory-reader contract (FELL_NOTES.md Risk 2) is honored: belfry
+(writer) and daemon (reader) land in the same slice, and the
+integration test below proves the round-trip end-to-end.
+
+### Touch semantics: every tick, success AND failure
+The brief offered two options: touch only on success ticks or touch
+on every tick. Slice 8 ships every-tick. Reasoning: the sentinel
+answers "is belfry alive?", not "is angelus healthy?"; those are
+two independent signals already surfaced through different
+channels (the down/success URL ping covers the latter). A
+success-only touch would conflate them, hiding "belfry is on cron
+and reporting that angelus is dead" -- exactly the case the
+operator most needs to verify after a host issue.
+
+### Discriminating tests
+`tests/test_belfry.py::test_sentinel_touched_on_success_tick`
+`tests/test_belfry.py::test_sentinel_touched_on_failure_tick`
+`tests/test_belfry.py::test_sentinel_touch_updates_existing_mtime`
+`tests/test_belfry.py::test_sentinel_path_override_honored`
+`tests/test_belfry.py::test_sentinel_touch_swallows_oserror`
+`tests/test_slice8_belfry_liveness.py::test_sentinel_path_default`
+`tests/test_slice8_belfry_liveness.py::test_sentinel_path_override`
+`tests/test_slice8_belfry_liveness.py::test_stale_threshold_default`
+`tests/test_slice8_belfry_liveness.py::test_stale_threshold_override`
+`tests/test_slice8_belfry_liveness.py::test_stale_threshold_falls_back_on_invalid`
+`tests/test_slice8_belfry_liveness.py::test_stale_threshold_falls_back_on_non_positive`
+`tests/test_slice8_belfry_liveness.py::test_belfry_status_missing_sentinel`
+`tests/test_slice8_belfry_liveness.py::test_belfry_status_fresh_sentinel`
+`tests/test_slice8_belfry_liveness.py::test_belfry_status_stale_sentinel`
+`tests/test_slice8_belfry_liveness.py::test_belfry_status_override_path_honored`
+`tests/test_slice8_belfry_liveness.py::test_op_health_surfaces_belfry_after_real_belfry_tick`
+`tests/test_slice8_belfry_liveness.py::test_op_health_stale_sentinel_after_passing_threshold`
+
+The end-to-end test (`test_op_health_surfaces_belfry_after_real_belfry_tick`)
+is the mandatory-reader anchor: drive `belfry.main()` directly,
+then construct an `AngelusDaemon` and call its `_op_health` (full
+op-handler surface, not a short-circuit to `_belfry_status`),
+asserting the sentinel mtime belfry wrote is what the daemon
+surfaces.
+
+### Discrimination evidence
+Four inversions performed in the worktree, observed, reverted:
+
+* Inversion 1 -- remove the `touch_sentinel(...)` call from
+  `belfry/belfry.py:main` (comment it out). The sentinel never
+  exists. Six assertions across belfry unit tests fire on
+  `sentinel.exists()`; the integration test fires on the same
+  `sentinel.exists()` precondition.
+* Inversion 2 -- move the touch BELOW the dead/wedge bail-out, so
+  it only runs on the success path. Success-tick test still
+  passes (rightly), but the failure-tick test
+  (`test_sentinel_touched_on_failure_tick`) fires at
+  `assert sentinel.exists()` after a daemon-dead path, and the
+  integration test fires at the same assertion (the integration
+  drives a failure-tick to avoid the source_fires-schema collision
+  with `init_db`).
+* Inversion 3 -- hardcode `_op_health`'s belfry field back to
+  `None` (pre-slice-8 surface). Three tests fire:
+  `test_op_health_surfaces_belfry_after_real_belfry_tick` and
+  `test_op_health_stale_sentinel_after_passing_threshold` fail
+  on `isinstance(result["belfry"], dict)`; the existing
+  `tests/test_slice5b1_control_socket.py::test_health_round_trip`
+  updated for slice 8 fails on the dict-equality assertion.
+* Inversion 4 -- wire the threshold incorrectly: multiply
+  `_belfry_stale_after_seconds()` by 1000 in `_belfry_status`'s
+  comparison so age-in-seconds is compared against
+  threshold-in-something-else. The two stale-axis assertions
+  (`test_belfry_status_stale_sentinel`,
+  `test_op_health_stale_sentinel_after_passing_threshold`) fire
+  on `belfry_field["stale"] is True` (got False). The
+  fresh-sentinel test does NOT fire under this inversion (it
+  expects `stale is False` already), which is the right
+  three-way discrimination: the fresh-vs-stale axis is wired
+  correctly only when both directions hold.
+
+All four inversions reverted; the 17 new tests pass deterministically
+in ~2.5s (no real subprocess, no real network -- urllib and
+subprocess.run monkeypatched throughout). Baseline was 140 tests,
+post-slice 157.
+
+### Docstring-by-intent (rounds 6-7-8 lesson)
+Helper docstrings on this slice (`sentinel_path`, `touch_sentinel`,
+`_belfry_sentinel_path`, `_belfry_stale_after_seconds`,
+`_belfry_status`, `_render_belfry`) describe purpose and behavior,
+not callers. The cross-side coupling (belfry writer vs. daemon
+reader) is named once in each side's docstring by architectural
+direction ("the angelus daemon reads this in `_op_health`" / "Belfry
+uses the same env var and default"), not by enumerating call sites
+that future refactors could rename out from under the comment.
