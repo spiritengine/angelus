@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from angelus.lodging import load_lodging
+from angelus.storage import Catalog, init_db
 from angelus.triage import run_python_triager
 
 
@@ -252,10 +253,14 @@ def test_stale_pr_already_alerted_not_repeated() -> None:
     assert out["new_state"] == {"alerted_prs": [7, 9]}
 
 
-def test_stale_pr_closed_or_merged_emits_clearance() -> None:
-    """PR no longer in the open listing -> alerted_prs drops the number AND
-    a pr_recovered finding routes to the clearance pipe. The "loop closed"
-    visibility matters for the daily digest, not just bookkeeping."""
+def test_stale_pr_partial_recovery_no_finding_keeps_incident_open() -> None:
+    """One PR clears (merged/closed/refreshed) while another remains
+    stale. The (single, per-repo) stale_pr incident must stay open --
+    emitting a clearance here would close the incident prematurely
+    because the catalog close path closes ALL incidents on (source,
+    entity), not by dedup_key (storage/catalog.py:_close_incident).
+    State just drops the recovered PR silently; the chronicler still
+    has the original stale_pr finding in `findings_since_last_drain`."""
     observation = {
         "entity": "skein",
         "prs": [
@@ -273,19 +278,17 @@ def test_stale_pr_closed_or_merged_emits_clearance() -> None:
             "clearance_pipe": "daily",
         },
     )
-    findings = out["findings"]
-    assert len(findings) == 1
-    assert findings[0]["type"] == "pr_recovered"
-    assert "#7" in findings[0]["body"]["text"]
-    assert "merged or closed" in findings[0]["body"]["text"]
+    assert out["findings"] == []
     assert out["new_state"] == {"alerted_prs": [9]}
 
 
-def test_stale_pr_refreshed_activity_emits_clearance() -> None:
-    """An alerted PR that gets fresh activity (updatedAt moves forward,
-    no longer past the threshold) drops from alerted_prs and emits a
-    recovery -- so a comment on a stale PR closes the loop without
-    waiting for the PR itself to close."""
+def test_stale_pr_full_recovery_emits_single_clearance() -> None:
+    """When the LAST stale PR clears, emit one clearance finding (type
+    must be 'clearance' so storage.catalog._close_incident actually
+    closes the per-repo stale_pr incident -- fell-r1 BLOCK #1). The
+    body lists which PRs cleared, so the daily digest's recent_closures
+    section is informative without per-PR finding spam during partial
+    recoveries."""
     observation = {
         "entity": "skein",
         "prs": [
@@ -296,13 +299,47 @@ def test_stale_pr_refreshed_activity_emits_clearance() -> None:
         STALE_HANDLER,
         observation,
         {"alerted_prs": [7]},
+        {
+            "entity": "skein",
+            "severity": "low",
+            "target_pipe": "daily",
+            "clearance_pipe": "daily",
+        },
+    )
+    findings = out["findings"]
+    assert len(findings) == 1
+    assert findings[0]["type"] == "clearance"
+    assert findings[0]["severity"] == "info"
+    assert findings[0]["target_pipes"] == ["daily"]
+    assert "#7" in findings[0]["body"]["text"]
+    assert "cleared" in findings[0]["body"]["text"]
+    assert out["new_state"] == {"alerted_prs": []}
+
+
+def test_stale_pr_full_recovery_with_new_stale_emits_only_stale_finding() -> None:
+    """Old alerts cleared but a different PR is now stale: just emit
+    the new stale_pr finding, no clearance. The per-repo incident
+    stays open (now tracking the new stale PR). Without this guard a
+    clearance would fire and close the incident the same cycle the
+    new stale_pr finding reopens it -- a flapping (open, close) pair
+    that confuses the catalog's incident lifecycle."""
+    observation = {
+        "entity": "skein",
+        "prs": [
+            {"number": 14, "title": "newly stale", "updatedAt": _iso_days_ago(40)},
+        ],
+    }
+    out = _invoke(
+        STALE_HANDLER,
+        observation,
+        {"alerted_prs": [7]},
         {"entity": "skein", "severity": "low", "target_pipe": "daily"},
     )
     findings = out["findings"]
     assert len(findings) == 1
-    assert findings[0]["type"] == "pr_recovered"
-    assert "fresh activity" in findings[0]["body"]["text"]
-    assert out["new_state"] == {"alerted_prs": []}
+    assert findings[0]["type"] == "stale_pr"
+    assert "#14" in findings[0]["body"]["text"]
+    assert out["new_state"] == {"alerted_prs": [14]}
 
 
 def test_stale_pr_threshold_override_via_metadata() -> None:
@@ -342,17 +379,43 @@ def test_stale_pr_check_failed_no_change() -> None:
 
 
 def test_stale_pr_empty_listing_clears_old_alerts() -> None:
-    """A repo with no open PRs after previously having stale ones should
-    emit pr_recovered for the now-gone PRs and empty alerted_prs."""
+    """A repo with no open PRs after previously having stale ones emits
+    one clearance finding (the per-repo incident closes) and lists the
+    PR numbers in the body so the daily digest knows what cleared."""
     out = _invoke(
         STALE_HANDLER,
         {"entity": "skein", "prs": []},
         {"alerted_prs": [7, 9]},
         {"entity": "skein", "severity": "low", "target_pipe": "daily"},
     )
-    assert len(out["findings"]) == 2
-    assert all(f["type"] == "pr_recovered" for f in out["findings"])
+    findings = out["findings"]
+    assert len(findings) == 1
+    assert findings[0]["type"] == "clearance"
+    assert "#7" in findings[0]["body"]["text"]
+    assert "#9" in findings[0]["body"]["text"]
     assert out["new_state"] == {"alerted_prs": []}
+
+
+def test_stale_pr_null_updated_at_preserves_alerted_state() -> None:
+    """Defensive: a PR with null/unparseable updatedAt that's already
+    alerted stays in alerted_prs so a transient field-shape change
+    doesn't flap an alert open->closed. gh always populates updatedAt
+    today, but the alternative behavior (silent drop, then re-alert
+    next cycle) would corrupt the per-repo incident lifecycle."""
+    observation = {
+        "entity": "skein",
+        "prs": [
+            {"number": 7, "title": "missing updated", "updatedAt": None},
+        ],
+    }
+    out = _invoke(
+        STALE_HANDLER,
+        observation,
+        {"alerted_prs": [7]},
+        {"entity": "skein", "severity": "low", "target_pipe": "daily"},
+    )
+    assert out["findings"] == []
+    assert out["new_state"] == {"alerted_prs": [7]}
 
 
 # --- End-to-end: load_lodging fans out per repo + substitution works --------
@@ -427,25 +490,29 @@ def test_repo_handler_through_runner(tmp_path: Path) -> None:
     assert findings[0]["target_pipes"] == ["now"]
 
 
-def test_repo_watch_command_round_trips_through_jq_on_empty_runs() -> None:
-    """Confirm the brace-escaping in the watch YAML actually produces a
+def _extract_jq_filter(command: str) -> str:
+    """Pull the single-quoted --jq filter out of a rendered watch command."""
+    jq_start = command.find("--jq")
+    assert jq_start != -1, f"no --jq in command: {command!r}"
+    rest = command[jq_start + len("--jq"):].strip()
+    assert rest.startswith("'"), f"expected single-quoted jq filter: {rest!r}"
+    end = rest.find("'", 1)
+    assert end != -1, f"unterminated single-quoted jq filter: {rest!r}"
+    return rest[1:end]
+
+
+def test_ci_watch_command_round_trips_through_jq_on_empty_runs() -> None:
+    """Confirm the brace-escaping in ci-failing-on-main.yaml produces a
     jq expression that yields a valid JSON object even when the upstream
     array is empty -- the failure mode is "we render `{entity: ...}`
     that jq parses as malformed because of leftover python braces", and
     that would silently break every repo with no CI runs.
 
-    Uses a local `echo` to feed jq the empty array, avoiding a live gh
-    call (which would flake on network problems and rate limits)."""
+    Uses a local jq invocation rather than a live gh call so the test
+    doesn't depend on network or auth state."""
     lodging = load_lodging(REPO_ROOT)
     source = lodging.sources["scheduled/ci-failing-on-main__skein"]
-    # Replace the gh invocation with `echo '[]'` so the jq part of the
-    # pipeline is exercised against an empty array without hitting GH.
-    jq_start = source.command.find("--jq")
-    assert jq_start != -1
-    jq_filter = source.command[jq_start + len("--jq"):].strip()
-    # Strip surrounding quotes the way bash would.
-    if jq_filter.startswith("'") and jq_filter.endswith("'"):
-        jq_filter = jq_filter[1:-1]
+    jq_filter = _extract_jq_filter(source.command)
     result = subprocess.run(
         ["jq", "-c", jq_filter],
         input=b"[]",
@@ -461,6 +528,117 @@ def test_repo_watch_command_round_trips_through_jq_on_empty_runs() -> None:
         "sha": None,
         "workflow": None,
     }
+
+
+def test_stale_pr_watch_command_round_trips_through_jq() -> None:
+    """Parallel coverage for stale-pr.yaml. The brace-escaping mistake
+    would render `{entity: "{entity}", prs: .}` with the outer braces
+    missing -- and jq would parse `entity: ..., prs: .` as a syntax
+    error. Feed both empty and populated arrays so the wrapping
+    behavior is verified end-to-end."""
+    lodging = load_lodging(REPO_ROOT)
+    source = lodging.sources["scheduled/stale-pr__skein"]
+    jq_filter = _extract_jq_filter(source.command)
+
+    empty = subprocess.run(
+        ["jq", "-c", jq_filter],
+        input=b"[]",
+        capture_output=True,
+        check=True,
+    )
+    assert json.loads(empty.stdout) == {"entity": "skein", "prs": []}
+
+    populated_in = json.dumps(
+        [{"number": 7, "title": "demo", "updatedAt": "2026-01-01T00:00:00Z"}]
+    ).encode("utf-8")
+    populated = subprocess.run(
+        ["jq", "-c", jq_filter],
+        input=populated_in,
+        capture_output=True,
+        check=True,
+    )
+    payload = json.loads(populated.stdout)
+    assert payload["entity"] == "skein"
+    assert payload["prs"][0]["number"] == 7
+
+
+def test_stale_pr_incident_lifecycle_through_catalog(tmp_path: Path) -> None:
+    """Drive the stale_pr -> clearance findings through the live catalog
+    and assert the per-repo incident actually closes. This pins
+    fell-r1 BLOCK #1: `pr_recovered` did not close the incident
+    because catalog.write_finding only closes on type=='clearance'
+    (storage/catalog.py:296). Tests the actual sqlite write path
+    rather than just the handler's emitted finding shape."""
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    try:
+        # First stale_pr finding opens the per-repo incident.
+        catalog.write_finding(
+            None,
+            {
+                "source": "scheduled/stale-pr__skein",
+                "type": "stale_pr",
+                "entity": "skein",
+                "severity": "low",
+                "target_pipes": ["daily"],
+                "body": {"text": "skein PR #7 stale"},
+            },
+            known_pipes={"daily"},
+        )
+        # Second stale_pr finding for a different PR upserts into the
+        # same incident (the catalog enforces UNIQUE source/type/entity
+        # on open rows).
+        catalog.write_finding(
+            None,
+            {
+                "source": "scheduled/stale-pr__skein",
+                "type": "stale_pr",
+                "entity": "skein",
+                "severity": "low",
+                "target_pipes": ["daily"],
+                "body": {"text": "skein PR #9 stale"},
+            },
+            known_pipes={"daily"},
+        )
+        open_after_open = [
+            i for i in catalog.open_incidents() if i["entity"] == "skein"
+        ]
+        assert len(open_after_open) == 1, (
+            "two stale_pr findings on one repo must coalesce into ONE open "
+            f"incident; got {open_after_open}"
+        )
+        assert open_after_open[0]["type"] == "stale_pr"
+
+        # Clearance finding closes the incident. This is what BLOCK #1
+        # broke: type='pr_recovered' would create a new open incident
+        # instead of closing the existing one.
+        catalog.write_finding(
+            None,
+            {
+                "source": "scheduled/stale-pr__skein",
+                "type": "clearance",
+                "entity": "skein",
+                "severity": "info",
+                "target_pipes": ["daily"],
+                "body": {"text": "skein stale PRs all cleared"},
+            },
+            known_pipes={"daily"},
+        )
+        open_after_clear = [
+            i for i in catalog.open_incidents() if i["entity"] == "skein"
+        ]
+        assert open_after_clear == [], (
+            "clearance finding must close the per-repo stale_pr incident; "
+            f"got still-open: {open_after_clear}"
+        )
+
+        # And recent_closures (which feeds the daily digest's
+        # `recent_closures` chronicler input) sees the clearance finding.
+        closures = catalog.clearance_findings_since(None)
+        skein_closures = [c for c in closures if c["entity"] == "skein"]
+        assert len(skein_closures) == 1
+    finally:
+        connection.close()
 
 
 @pytest.mark.parametrize(
