@@ -562,81 +562,104 @@ def test_stale_pr_watch_command_round_trips_through_jq() -> None:
     assert payload["prs"][0]["number"] == 7
 
 
-def test_stale_pr_incident_lifecycle_through_catalog(tmp_path: Path) -> None:
-    """Drive the stale_pr -> clearance findings through the live catalog
-    and assert the per-repo incident actually closes. This pins
-    fell-r1 BLOCK #1: `pr_recovered` did not close the incident
-    because catalog.write_finding only closes on type=='clearance'
-    (storage/catalog.py:296). Tests the actual sqlite write path
-    rather than just the handler's emitted finding shape."""
+def test_stale_pr_incident_lifecycle_through_handler_and_catalog(
+    tmp_path: Path,
+) -> None:
+    """Pins fell-r1 BLOCK #1 by driving the handler's actual emitted
+    findings through the live catalog. Reverting `\"type\": \"clearance\"`
+    back to `\"type\": \"pr_recovered\"` in gh_stale_pr.py must make this
+    test fail -- the round-1 docstring claimed this property but the
+    earlier version of the test wrote findings to the catalog directly
+    with hardcoded type='clearance', so a handler regression slipped
+    past (fell-r2 NIT #1).
+
+    Run sequence: handler emits stale_pr findings (cycle 1) -> writes
+    them to catalog -> handler emits clearance (cycle 2) -> writes to
+    catalog -> assert open_incidents drops to zero and
+    clearance_findings_since reports the recovery."""
     connection = init_db(tmp_path / "angelus.sqlite3")
     catalog = Catalog(connection, tmp_path)
+    source_ref = "scheduled/stale-pr__skein"
+    metadata = {
+        "entity": "skein",
+        "severity": "low",
+        "target_pipe": "daily",
+        "clearance_pipe": "daily",
+    }
     try:
-        # First stale_pr finding opens the per-repo incident.
-        catalog.write_finding(
-            None,
+        # Cycle 1: two PRs cross staleness threshold. Handler emits two
+        # stale_pr findings; we write each through the catalog. They
+        # upsert into ONE open incident (unique source/type/entity).
+        cycle1 = _invoke(
+            STALE_HANDLER,
             {
-                "source": "scheduled/stale-pr__skein",
-                "type": "stale_pr",
                 "entity": "skein",
-                "severity": "low",
-                "target_pipes": ["daily"],
-                "body": {"text": "skein PR #7 stale"},
+                "prs": [
+                    {
+                        "number": 7,
+                        "title": "stale alpha",
+                        "updatedAt": _iso_days_ago(45),
+                    },
+                    {
+                        "number": 9,
+                        "title": "stale beta",
+                        "updatedAt": _iso_days_ago(60),
+                    },
+                ],
             },
-            known_pipes={"daily"},
+            {},
+            metadata,
         )
-        # Second stale_pr finding for a different PR upserts into the
-        # same incident (the catalog enforces UNIQUE source/type/entity
-        # on open rows).
-        catalog.write_finding(
-            None,
-            {
-                "source": "scheduled/stale-pr__skein",
-                "type": "stale_pr",
-                "entity": "skein",
-                "severity": "low",
-                "target_pipes": ["daily"],
-                "body": {"text": "skein PR #9 stale"},
-            },
-            known_pipes={"daily"},
-        )
-        open_after_open = [
+        assert len(cycle1["findings"]) == 2
+        for finding in cycle1["findings"]:
+            finding.setdefault("source", source_ref)
+            catalog.write_finding(None, finding, known_pipes={"daily"})
+
+        open_after_stale = [
             i for i in catalog.open_incidents() if i["entity"] == "skein"
         ]
-        assert len(open_after_open) == 1, (
-            "two stale_pr findings on one repo must coalesce into ONE open "
-            f"incident; got {open_after_open}"
-        )
-        assert open_after_open[0]["type"] == "stale_pr"
+        assert len(open_after_stale) == 1
+        assert open_after_stale[0]["type"] == "stale_pr"
 
-        # Clearance finding closes the incident. This is what BLOCK #1
-        # broke: type='pr_recovered' would create a new open incident
-        # instead of closing the existing one.
-        catalog.write_finding(
-            None,
-            {
-                "source": "scheduled/stale-pr__skein",
-                "type": "clearance",
-                "entity": "skein",
-                "severity": "info",
-                "target_pipes": ["daily"],
-                "body": {"text": "skein stale PRs all cleared"},
-            },
-            known_pipes={"daily"},
+        # Cycle 2: both PRs recovered (no longer in listing). Handler
+        # emits one clearance finding; writing it through catalog must
+        # close the open incident. A regression to type='pr_recovered'
+        # here would land in the else-branch of write_finding and OPEN
+        # a new incident, leaving the stale_pr one open -- the test
+        # would see two opens and fail.
+        cycle2 = _invoke(
+            STALE_HANDLER,
+            {"entity": "skein", "prs": []},
+            cycle1["new_state"],
+            metadata,
         )
+        assert len(cycle2["findings"]) == 1
+        finding = cycle2["findings"][0]
+        finding.setdefault("source", source_ref)
+        # Explicit pin: the catalog only fires _close_incident on this
+        # exact type string. If the handler ever stops emitting it, the
+        # assertion below catches it before the catalog write.
+        assert finding["type"] == "clearance", (
+            "handler must emit type='clearance' so catalog._close_incident "
+            f"fires (got {finding['type']!r})"
+        )
+        catalog.write_finding(None, finding, known_pipes={"daily"})
+
         open_after_clear = [
             i for i in catalog.open_incidents() if i["entity"] == "skein"
         ]
         assert open_after_clear == [], (
-            "clearance finding must close the per-repo stale_pr incident; "
-            f"got still-open: {open_after_clear}"
+            "handler's clearance finding must close the per-repo stale_pr "
+            f"incident through the catalog; got still-open: {open_after_clear}"
         )
 
-        # And recent_closures (which feeds the daily digest's
-        # `recent_closures` chronicler input) sees the clearance finding.
         closures = catalog.clearance_findings_since(None)
         skein_closures = [c for c in closures if c["entity"] == "skein"]
-        assert len(skein_closures) == 1
+        assert len(skein_closures) == 1, (
+            "clearance must appear in clearance_findings_since (feeds the "
+            "chronicler's recent_closures input); a non-clearance type "
+            "would silently miss this filter"
+        )
     finally:
         connection.close()
 
