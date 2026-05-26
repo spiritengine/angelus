@@ -7,11 +7,14 @@ the rest of the live state without re-walking every directory.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+LOGGER = logging.getLogger(__name__)
 
 SUPPORTED_DIGEST_INPUTS = (
     "findings_since_last_drain",
@@ -39,6 +42,7 @@ class Triager:
     source_ref: str
     handler_path: Path
     timeout_seconds: float = 60.0
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -83,9 +87,47 @@ def load_lodging(root: Path) -> Lodging:
     # prior state. The asymmetry is deliberate: at startup the catalog
     # and now-pipe haven't been constructed yet, so a finding has no
     # surface to land on -- raising is the only available signal.
+    sources = _load_sources(root)
+    triagers = _load_triagers(root)
+    # Late import to avoid a config<->dynamic import cycle (dynamic.py
+    # imports several helpers from this module).
+    from angelus.lodging.dynamic import (
+        expand as _expand_watches,
+        load_entities,
+        load_watches,
+    )
+
+    entities = load_entities(root)
+    watches = load_watches(root)
+    synth_sources, synth_triagers = _expand_watches(entities, watches)
+    # Visibility for the missing-entities-dir failure mode: a deploy
+    # without entities/ or watch/ produces zero synthesized sources and
+    # the daemon goes dark on entity monitoring without otherwise
+    # complaining. Logging the count makes the regression visible in
+    # journal at every startup. See sonnet fell-r1 #3.
+    LOGGER.info(
+        "lodging entities=%d watches=%d -> synthesized sources=%d",
+        len(entities),
+        len(watches),
+        len(synth_sources),
+    )
+    for ref, source in synth_sources.items():
+        if ref in sources:
+            raise ValueError(
+                f"synthesized source {ref!r} collides with a hand-written "
+                f"sources/scheduled/ file; rename one"
+            )
+        sources[ref] = source
+    for name, triager in synth_triagers.items():
+        if name in triagers:
+            raise ValueError(
+                f"synthesized triager {name!r} collides with a hand-written "
+                f"triagers/ file; rename one"
+            )
+        triagers[name] = triager
     lodging = Lodging(
-        sources=_load_sources(root),
-        triagers=_load_triagers(root),
+        sources=sources,
+        triagers=triagers,
         pipes=_load_pipes(root),
         channels=_load_channels(root),
         dependencies=_load_dependencies(root),
@@ -112,6 +154,28 @@ def validate_cross_refs(lodging: Lodging) -> list[str]:
             errors.append(
                 f"triager {triager.name} references missing source {triager.source_ref}"
             )
+        # Validate pipe refs in triager.metadata. Synthesized triagers
+        # (entity+watch fan-out) carry target_pipe and clearance_pipe in
+        # metadata; the handler emits findings routed to those names.
+        # Without this check, a typo in watch/<x>.yaml (`target_pipe: nwo`)
+        # silently drops every finding from that watch because
+        # Catalog.write_finding skips unknown pipes. Same protection
+        # extends to hand-written triagers that opt into the same shape.
+        for key in ("target_pipe", "clearance_pipe"):
+            ref = triager.metadata.get(key)
+            if ref is None:
+                continue
+            if not isinstance(ref, str):
+                errors.append(
+                    f"triager {triager.name} metadata.{key} must be a string "
+                    f"(got {type(ref).__name__})"
+                )
+                continue
+            if ref not in lodging.pipes:
+                errors.append(
+                    f"triager {triager.name} metadata.{key} references "
+                    f"missing pipe {ref!r}"
+                )
     for pipe in lodging.pipes.values():
         for channel in pipe.channels:
             if channel not in lodging.channels:
@@ -153,11 +217,19 @@ def parse_triager(root: Path, path: Path) -> Triager:
     handler_path = root / _required_str(handler, "path", path)
     if not handler_path.exists():
         raise ValueError(f"{path}: handler path does not exist: {handler_path}")
+    metadata_raw = data.get("metadata")
+    if metadata_raw is None:
+        metadata: dict[str, Any] = {}
+    elif isinstance(metadata_raw, dict):
+        metadata = dict(metadata_raw)
+    else:
+        raise ValueError(f"{path}: metadata must be a mapping")
     return Triager(
         name=name,
         source_ref=_required_str(inputs, "source", path),
         handler_path=handler_path,
         timeout_seconds=_optional_timeout(handler, path, 60.0),
+        metadata=metadata,
     )
 
 

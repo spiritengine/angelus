@@ -17,20 +17,31 @@ from angelus.triage import run_python_triager
 def test_lodging_loads_cross_references() -> None:
     lodging = load_lodging(Path.cwd())
 
-    assert "scheduled/iotaschool-watch" in lodging.sources
-    assert lodging.triagers["dead-link"].source_ref == "scheduled/iotaschool-watch"
-    assert lodging.pipes["now"].channels == ["push"]
-    assert lodging.channels["push"].command == "notify-pat"
+    # iotaschool now arrives via the entities + watch expansion path:
+    # entities/iotaschool.com.yaml (kind: web, labels: [archive, ...]) is
+    # picked up by watch/web-archive.yaml's selector and synthesized as
+    # the source ref below.
+    assert "scheduled/web-archive__iotaschool.com" in lodging.sources
+    triager = lodging.triagers["web-archive__iotaschool.com"]
+    assert triager.source_ref == "scheduled/web-archive__iotaschool.com"
+    assert triager.metadata.get("entity") == "iotaschool.com"
+    assert triager.metadata.get("severity") == "medium"
+    assert lodging.pipes["now"].channels == ["email"]
+    assert lodging.channels["email"].command.endswith("patbot-email")
 
 
-def test_dead_link_handler_emits_down_finding() -> None:
+def test_http_status_handler_emits_down_finding() -> None:
     lodging = load_lodging(Path.cwd())
-    triager = lodging.triagers["dead-link"]
+    triager = lodging.triagers["web-archive__iotaschool.com"]
 
     findings, state = asyncio.run(
         run_python_triager(
             triager,
-            {"url": "https://example.invalid", "status_code": 503},
+            {
+                "entity": "iotaschool.com",
+                "url": "https://iotaschool.com",
+                "status_code": 503,
+            },
             {"last_status": 200},
         )
     )
@@ -38,6 +49,7 @@ def test_dead_link_handler_emits_down_finding() -> None:
     assert state == {"last_status": 503}
     assert findings[0]["type"] == "down"
     assert findings[0]["entity"] == "iotaschool.com"
+    assert findings[0]["severity"] == "medium"
     assert findings[0]["target_pipes"] == ["now"]
 
 

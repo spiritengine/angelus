@@ -70,7 +70,11 @@ def _write_canary_lodging(root: Path) -> Path:
     iotaschool_fixture = state_canary / "iotaschool.json"
     _write_fixture(
         iotaschool_fixture,
-        {"url": "https://iotaschool.com", "status_code": 200},
+        {
+            "entity": "iotaschool.com",
+            "url": "https://iotaschool.com",
+            "status_code": 200,
+        },
     )
     (root / "sources" / "scheduled" / "iotaschool-watch.yaml").write_text(
         "cadence: 1s\ncheck:\n  kind: shell\n"
@@ -116,13 +120,28 @@ def _write_canary_lodging(root: Path) -> Path:
     # would leave the production handler unexercised.
     (root / "triagers").mkdir()
     (root / "triagers" / "handlers").mkdir()
-    for handler_name in ("canary_watch.py", "dead_link.py"):
+    for handler_name in ("canary_watch.py", "http_status.py"):
         shutil.copy(
             PROJECT_ROOT / "triagers" / "handlers" / handler_name,
             root / "triagers" / "handlers" / handler_name,
         )
+    # Synthesize an iotaschool dead-link triager YAML the same way a watch
+    # would; the metadata block carries entity/severity/target_pipe so the
+    # shared http_status.py handler routes correctly.
+    (root / "triagers" / "iotaschool-watch.yaml").write_text(
+        "inputs:\n"
+        "  source: scheduled/iotaschool-watch\n"
+        "handler:\n"
+        "  kind: python\n"
+        "  path: triagers/handlers/http_status.py\n"
+        "metadata:\n"
+        "  entity: iotaschool.com\n"
+        "  severity: medium\n"
+        "  target_pipe: now\n"
+        "  clearance_pipe: daily\n",
+        encoding="utf-8",
+    )
     for triager_yaml in (
-        "dead-link.yaml",
         "canary-loose-a-watch.yaml",
         "canary-loose-b-watch.yaml",
     ):

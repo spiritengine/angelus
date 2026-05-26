@@ -31,7 +31,15 @@ async def run_python_triager(
         start_new_session=True,
     )
     payload = json.dumps(
-        {"observation": observation, "prior_state": prior_state},
+        {
+            "observation": observation,
+            "prior_state": prior_state,
+            "triager": {
+                "name": triager.name,
+                "source_ref": triager.source_ref,
+                "metadata": triager.metadata,
+            },
+        },
         sort_keys=True,
     ).encode("utf-8")
     try:

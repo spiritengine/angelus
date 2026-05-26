@@ -204,6 +204,7 @@ def test_op_health_surfaces_belfry_after_real_belfry_tick(
     monkeypatch.delenv("ANGELUS_BELFRY_STALE_AFTER_SEC", raising=False)
     monkeypatch.setenv("ANGELUS_BELFRY_SUCCESS_URL", "https://hc.example/success")
     monkeypatch.setenv("ANGELUS_BELFRY_DOWN_URL", "https://hc.example/down")
+    monkeypatch.setenv("ANGELUS_EMAIL_TO", "test@example.com")
     # Belfry takes the DOWN path (no live PID file). The sentinel-touch
     # contract is "every tick, success OR failure," so the failure path
     # exercises exactly the same touch the test cares about, without

@@ -182,14 +182,25 @@ def ping_env(name: str) -> bool:
 
 def notify(reason: str) -> bool:
     message = f"angelus belfry alert: {reason}"
+    to = os.environ.get("ANGELUS_EMAIL_TO")
+    if not to:
+        print(
+            "angelus belfry: ANGELUS_EMAIL_TO is not set; skipping notify",
+            file=sys.stderr,
+        )
+        return False
+    command = os.environ.get("ANGELUS_BELFRY_NOTIFY_COMMAND", "patbot-email")
     try:
-        result = subprocess.run(["notify-pat", message], check=False)
+        result = subprocess.run(
+            [command, "send", to, "angelus belfry alert", "--body", message],
+            check=False,
+        )
     except OSError as exc:
-        print(f"angelus belfry: notify-pat failed to start: {exc}", file=sys.stderr)
+        print(f"angelus belfry: {command} failed to start: {exc}", file=sys.stderr)
         return False
     if result.returncode != 0:
         print(
-            f"angelus belfry: notify-pat exited {result.returncode}",
+            f"angelus belfry: {command} exited {result.returncode}",
             file=sys.stderr,
         )
         return False

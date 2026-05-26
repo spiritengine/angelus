@@ -1,7 +1,21 @@
 # Set these in the crontab environment or an env file sourced by cron:
-# PATH must include wherever notify-pat is installed; adjust for your machine.
+# PATH must include wherever your notification command is installed.
 # PATH=/home/you/.local/bin:/usr/local/bin:/usr/bin:/bin
 # ANGELUS_BELFRY_SUCCESS_URL=https://hc-ping.com/<angelus-belfry-ping-uuid>
 # ANGELUS_BELFRY_DOWN_URL=https://hc-ping.com/<angelus-daemon-down-uuid>
+#
+# Belfry's notify() sends to ANGELUS_EMAIL_TO via the command in
+# ANGELUS_BELFRY_NOTIFY_COMMAND (defaults to bare 'patbot-email' on PATH).
+# Both env vars must be set or notify() silently no-ops and the only
+# escalation channel left is the DOWN_URL healthcheck ping. Set the
+# command to an absolute path because cron PATH is usually stripped.
+# ANGELUS_EMAIL_TO=you@example.com
+# ANGELUS_BELFRY_NOTIFY_COMMAND=/absolute/path/to/patbot-email
+#
+# Optional: ANGELUS_BELFRY_WEDGE_THRESHOLD_SEC overrides the 600s default
+# wedge threshold. Should comfortably exceed your longest source cadence
+# so a routine quiet stretch isn't read as wedged (e.g. 18000 = 5h for
+# a deployment whose slowest source fires every 4h).
+# ANGELUS_BELFRY_WEDGE_THRESHOLD_SEC=18000
 
 */5 * * * * cd /path/to/angelus && /usr/bin/env python belfry/belfry.py >> state/belfry.log 2>&1

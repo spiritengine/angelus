@@ -65,6 +65,7 @@ def _write_source_fire(root: Path, fired_at: datetime) -> None:
 def _set_urls(monkeypatch) -> None:
     monkeypatch.setenv("ANGELUS_BELFRY_SUCCESS_URL", "https://hc.example/success")
     monkeypatch.setenv("ANGELUS_BELFRY_DOWN_URL", "https://hc.example/down")
+    monkeypatch.setenv("ANGELUS_EMAIL_TO", "test@example.com")
 
 
 def test_belfry_imports_no_angelus_modules() -> None:
@@ -100,7 +101,7 @@ def test_pid_dead_path_hits_down_and_escalates(tmp_path, monkeypatch) -> None:
     assert belfry.main([str(tmp_path)]) == 1
     assert pings == ["https://hc.example/down"]
     assert calls
-    assert "dead: PID 999999 is not running" in calls[0][1]
+    assert "dead: PID 999999 is not running" in " ".join(calls[0])
 
 
 def test_pid_missing_path_hits_down_and_escalates(tmp_path, monkeypatch) -> None:
@@ -125,7 +126,7 @@ def test_pid_missing_path_hits_down_and_escalates(tmp_path, monkeypatch) -> None
     assert belfry.main([str(tmp_path)]) == 1
     assert pings == ["https://hc.example/down"]
     assert calls
-    assert "missing PID file" in calls[0][1]
+    assert "missing PID file" in " ".join(calls[0])
 
 
 def test_pid_permission_error_is_treated_as_alive(tmp_path, monkeypatch, capsys) -> None:
@@ -166,7 +167,7 @@ def test_wedge_path_hits_down_and_escalates(tmp_path, monkeypatch) -> None:
     assert belfry.main([str(tmp_path)]) == 1
     assert pings == ["https://hc.example/down"]
     assert calls
-    assert "wedged: last source fire" in calls[0][1]
+    assert "wedged: last source fire" in " ".join(calls[0])
 
 
 def test_happy_path_hits_success_without_escalation(tmp_path, monkeypatch) -> None:

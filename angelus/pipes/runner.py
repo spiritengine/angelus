@@ -82,6 +82,7 @@ class PipeDrain:
         for row in rows:
             finding_id = int(row["id"])
             message = self._render(pipe, row)
+            subject = f"[angelus] {row['entity']}: {row['type']}"
             if self._over_rate_limit(pipe, row):
                 self.catalog.suppress_pipe_item_to(
                     finding_id,
@@ -129,7 +130,7 @@ class PipeDrain:
                     continue
                 channel = channels[channel_name]
                 try:
-                    await send_push(channel, message, self.workdir)
+                    await self._send_channel(channel, message, subject)
                 except Exception as exc:
                     exhausted = self.catalog.record_pipe_send_failure(
                         pipe.name,
