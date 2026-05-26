@@ -579,7 +579,6 @@ def test_stale_pr_incident_lifecycle_through_handler_and_catalog(
     clearance_findings_since reports the recovery."""
     connection = init_db(tmp_path / "angelus.sqlite3")
     catalog = Catalog(connection, tmp_path)
-    source_ref = "scheduled/stale-pr__skein"
     metadata = {
         "entity": "skein",
         "severity": "low",
@@ -612,7 +611,6 @@ def test_stale_pr_incident_lifecycle_through_handler_and_catalog(
         )
         assert len(cycle1["findings"]) == 2
         for finding in cycle1["findings"]:
-            finding.setdefault("source", source_ref)
             catalog.write_finding(None, finding, known_pipes={"daily"})
 
         open_after_stale = [
@@ -635,7 +633,6 @@ def test_stale_pr_incident_lifecycle_through_handler_and_catalog(
         )
         assert len(cycle2["findings"]) == 1
         finding = cycle2["findings"][0]
-        finding.setdefault("source", source_ref)
         # Explicit pin: the catalog only fires _close_incident on this
         # exact type string. If the handler ever stops emitting it, the
         # assertion below catches it before the catalog write.
