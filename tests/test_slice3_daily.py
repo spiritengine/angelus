@@ -1573,3 +1573,72 @@ def test_drain_message_body_synthesis_precedes_preamble(tmp_path, monkeypatch) -
     pre_marker_b = "Incidents:"  # from incident-status test stub
     assert message.index(body_marker) < message.index(pre_marker_a)
     assert message.index(body_marker) < message.index(pre_marker_b)
+
+
+def test_chronicler_quiet_day_short_reply_is_not_rejected(
+    tmp_path, monkeypatch
+) -> None:
+    """The chronicler prompt invites a one-sentence quiet-day reply.
+    The prior `< 20` length threshold rejected exactly that compliant
+    output and substituted the LLM_FALLBACK_FOOTER -- a false-failure.
+    The new floor of 5 accepts short compliant replies like
+    "All quiet." (10 chars) while still rejecting empty/<=4-char
+    outputs. fell-r2 NIT on missing coverage for the threshold.
+
+    Inverts to: revert the threshold to 20 and this test fails because
+    "All quiet." is then rejected and the message contains the fallback
+    footer instead."""
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    _write_templates(tmp_path)
+    drain = PipeDrain(
+        catalog,
+        _daily_pipe(),
+        {"push": Channel(name="push", kind="push", command="notify-pat")},
+        tmp_path,
+        {"now", "daily"},
+    )
+    catalog.write_finding(
+        None,
+        {
+            "source": "scheduled/test",
+            "type": "down",
+            "entity": "site",
+            "severity": "high",
+            "target_pipes": ["daily"],
+        },
+        {"daily"},
+    )
+    sent: list[str] = []
+
+    async def fake_push(_channel, message: str, _workdir: Path) -> None:
+        sent.append(message)
+
+    real_create = pipe_runner.asyncio.create_subprocess_exec
+
+    async def short_chronicler(*args, **kwargs):
+        return await real_create(
+            "sh",
+            "-c",
+            'echo \'{"result": "All quiet."}\'',
+            **kwargs,
+        )
+
+    monkeypatch.setattr(pipe_runner, "send_push", fake_push)
+    monkeypatch.setattr(
+        pipe_runner.asyncio, "create_subprocess_exec", short_chronicler
+    )
+
+    try:
+        asyncio.run(drain.drain_once())
+    finally:
+        connection.close()
+
+    assert sent, "digest must dispatch even with a short compliant body"
+    body = sent[0]
+    assert "All quiet." in body, (
+        f"compliant short reply must reach the digest; got: {body!r}"
+    )
+    assert "LLM digest body unavailable" not in body, (
+        "short compliant reply must NOT trigger the LLM fallback footer"
+    )

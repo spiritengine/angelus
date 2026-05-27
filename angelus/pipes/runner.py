@@ -431,10 +431,11 @@ class PipeDrain:
         # threshold of 20 rejected the latter as if it were a failure
         # and showed the operator the LLM_FALLBACK_FOOTER instead of
         # the actual compliant summary -- exactly the false-failure
-        # shape fell-r1 CONSIDER #7 flagged. The new floor of 5 still
-        # catches empty/whitespace/single-word output (which means the
-        # model genuinely produced nothing useful) but accepts the
-        # quiet-day case.
+        # shape fell-r1 CONSIDER #7 flagged. The new floor of 5 catches
+        # empty / whitespace-only / <=4-char output (which means the
+        # model genuinely produced nothing useful -- "ok", "yes.", etc.)
+        # but accepts the quiet-day case. A 5-char "quiet" passes; that
+        # is the intentionally degenerate compliant form.
         if len(output) < 5:
             return None, "chronicler output was empty or too short"
         return output, None
@@ -516,4 +517,9 @@ def _attach_local_timestamps(item: dict[str, Any]) -> None:
         except ValueError:
             continue
         local = dt_utc.astimezone()
-        item[f"{field}_local"] = local.strftime("%a %Y-%m-%d %H:%M %Z")
+        # rstrip handles the rare-but-real case where the resolved
+        # local TZ has no abbreviation -- %Z renders to "", leaving a
+        # trailing space (fell-r2 CONSIDER on the %Z edge). Linux boxes
+        # with proper tzdata always emit an abbreviation; the rstrip
+        # is cheap insurance for containerized deploys.
+        item[f"{field}_local"] = local.strftime("%a %Y-%m-%d %H:%M %Z").rstrip()

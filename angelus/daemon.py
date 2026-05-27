@@ -102,7 +102,10 @@ class AngelusDaemon:
             LOGGER.info(
                 "resolved display timezone: %s (current local: %s)",
                 _local_now.tzinfo,
-                _local_now.strftime("%Y-%m-%d %H:%M %Z"),
+                # rstrip in case the resolved TZ has no abbreviation
+                # (slim container without tzdata): %Z renders empty and
+                # would leave a trailing space in journalctl.
+                _local_now.strftime("%Y-%m-%d %H:%M %Z").rstrip(),
             )
             self._install_signal_handlers()
             recovered, failed = self.catalog.recover_writing_rows()
