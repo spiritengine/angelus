@@ -247,7 +247,11 @@ def test_two_zone_render_dispatches_preamble_then_llm_body(tmp_path, monkeypatch
         connection.close()
 
     assert sent
-    assert sent[0].index("Suppressed:") < sent[0].index("This is the chronicler body.")
+    # Body ordering reversed 2026-05-27: chronicler synthesis paragraph
+    # leads, structured preamble items follow. The preamble was the
+    # source of structured-data-twice-rendered messes; the llm is now
+    # constrained to a short paragraph and the preamble owns items.
+    assert sent[0].index("This is the chronicler body.") < sent[0].index("Suppressed:")
     assert "Incidents:" in sent[0]
 
 
@@ -367,8 +371,15 @@ def test_digest_partial_channel_failure_does_not_resend_success_channel(
     assert channel_health_rows == []
     assert [row["channel"] for row in sent_dispatches] == ["push"]
     assert email_subjects
-    today_utc = datetime.now(UTC).date().isoformat()
-    assert email_subjects[0] == f"Angelus daily digest {today_utc} UTC"
+    # Subject format changed 2026-05-27 to local-time, screen-reader
+    # friendly form: "Angelus Observances for <weekday> <month> <day>,
+    # <year>". The exact rendered date depends on the test machine's
+    # local TZ; assert against the prefix and the year.
+    today_local = datetime.now().astimezone()
+    expected_subject = (
+        f"Angelus Observances for {today_local.strftime('%A %B %-d, %Y')}"
+    )
+    assert email_subjects[0] == expected_subject
 
 
 def test_suppressed_overflow_stays_out_of_llm_inputs(tmp_path, monkeypatch) -> None:
@@ -1023,7 +1034,12 @@ def test_digest_body_inputs_filter_chronicler_payload(tmp_path, monkeypatch) -> 
 
     import json as _json
 
-    payload_json = captured["message"].split("\n\n", 1)[1]
+    # Chronicler prompt has a "Structured inputs (JSON):\n<json>" suffix.
+    # The JSON is the last block in the prompt; split on the marker so
+    # the test stays decoupled from the prose-rule list above.
+    message = captured["message"]
+    marker = "Structured inputs (JSON):\n"
+    payload_json = message.rsplit(marker, 1)[1]
     payload = _json.loads(payload_json)
     assert list(payload.keys()) == ["findings_since_last_drain"]
     assert "open_incidents" not in payload
@@ -1296,3 +1312,256 @@ def test_llm_body_unwraps_horizon_cast_envelope(tmp_path, monkeypatch) -> None:
         '"is_new_strand"',
     ):
         assert leak not in body, f"{leak!r} leaked into digest body"
+
+
+# --- email cleanup pass (2026-05-27) ---------------------------------------
+
+
+def test_digest_subject_is_local_time_date_only(tmp_path, monkeypatch) -> None:
+    """Subject was previously 'Angelus daily digest YYYY-MM-DD UTC'. Patrick
+    asked for a screen-reader-friendly local-time form with the project's
+    'Observances' vocabulary. Pins the exact format so an accidental
+    revert (or a future strftime locale change) fails one targeted test."""
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    _write_templates(tmp_path)
+    drain = PipeDrain(
+        catalog,
+        Pipe(
+            name="daily",
+            cadence="0 8 * * *",
+            render_kind="digest",
+            template=None,
+            channels=["email"],
+            render={
+                "preamble": [
+                    {"kind": "structured", "template": "rate-limit-callout"},
+                    {"kind": "structured", "template": "incident-status"},
+                ],
+                "body": {
+                    "kind": "llm",
+                    "mantle": "chronicler",
+                    "inputs": ["findings_since_last_drain", "open_incidents"],
+                },
+            },
+        ),
+        {"email": Channel(name="email", kind="email", command="true", to="x@y")},
+        tmp_path,
+        {"now", "daily"},
+    )
+    catalog.write_finding(
+        None,
+        {
+            "source": "scheduled/test",
+            "type": "down",
+            "entity": "site",
+            "severity": "high",
+            "target_pipes": ["daily"],
+        },
+        {"daily"},
+    )
+    subjects: list[str] = []
+
+    async def fake_email(_channel, subject: str, _body: str, _workdir: Path) -> None:
+        subjects.append(subject)
+
+    async def fake_llm(self, _pipe, _structured):
+        return "body paragraph here.", None
+
+    monkeypatch.setattr(pipe_runner, "send_email", fake_email)
+    monkeypatch.setattr(PipeDrain, "_render_llm_body", fake_llm)
+    try:
+        asyncio.run(drain.drain_once())
+    finally:
+        connection.close()
+
+    assert subjects, "digest must send to email"
+    subject = subjects[0]
+    assert subject.startswith("Angelus Observances for "), (
+        f"new format must start with the project-vocabulary phrase; got {subject!r}"
+    )
+    # Date components must match local 'today' rendered with the same
+    # format the code uses. Avoid asserting on TZ name (test runners
+    # can be in any TZ) -- just verify weekday/month/day/year match.
+    today_local = datetime.now().astimezone()
+    expected = f"Angelus Observances for {today_local.strftime('%A %B %-d, %Y')}"
+    assert subject == expected
+    # No time, no UTC label -- regressing toward those is the historical
+    # mess this test pins against.
+    assert "UTC" not in subject
+    # Pin "no clock time" by checking for ":" which would appear in any
+    # HH:MM time. The date itself has no colons in our format.
+    assert ":" not in subject
+
+
+def test_structured_inputs_attach_local_timestamp_siblings(tmp_path) -> None:
+    """Each finding/incident gets an `<field>_local` sibling for any
+    known UTC timestamp field, so templates and the chronicler prompt
+    can use human times without each renderer reimplementing
+    conversion. The UTC originals must be preserved (downstream code
+    and tests assume them)."""
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    drain = PipeDrain(
+        catalog,
+        _daily_pipe(),
+        {"push": Channel(name="push", kind="push", command="notify-pat")},
+        tmp_path,
+        {"now", "daily"},
+    )
+    catalog.write_finding(
+        None,
+        {
+            "source": "scheduled/test",
+            "type": "down",
+            "entity": "site",
+            "severity": "high",
+            "target_pipes": ["daily"],
+            "body": "hi",
+        },
+        {"daily"},
+    )
+    try:
+        structured = drain._structured_inputs(_daily_pipe(), None)
+    finally:
+        connection.close()
+
+    findings = structured["findings_since_last_drain"]
+    assert findings, "expected the test finding to be present"
+    f = findings[0]
+    assert "occurred_at" in f and isinstance(f["occurred_at"], str)
+    assert "occurred_at_local" in f, (
+        "missing _local sibling -- chronicler prompt expects these"
+    )
+    # The local string must look human-readable (weekday + date + clock).
+    assert ":" in f["occurred_at_local"], (
+        f"expected HH:MM in local timestamp; got {f['occurred_at_local']!r}"
+    )
+
+    incidents = structured["open_incidents"]
+    assert incidents, "expected an open incident from the down finding"
+    inc = incidents[0]
+    assert "opened_at" in inc
+    assert "opened_at_local" in inc
+
+
+def test_chronicler_prompt_constrains_output_to_plain_paragraph(
+    tmp_path, monkeypatch
+) -> None:
+    """The mess Patrick called out (markdown tables, headers, emoji in
+    text/plain) came from a loose chronicler prompt. The new prompt
+    explicitly forbids those constructs. Catch a future loosening of
+    the rules-list by asserting the load-bearing phrases stay."""
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    _write_templates(tmp_path)
+    drain = PipeDrain(
+        catalog,
+        _daily_pipe(),
+        {"push": Channel(name="push", kind="push", command="notify-pat")},
+        tmp_path,
+        {"now", "daily"},
+    )
+    captured: dict[str, str] = {}
+
+    real_create = pipe_runner.asyncio.create_subprocess_exec
+
+    async def capture_create(*args, **kwargs):
+        for idx, token in enumerate(args):
+            if token == "--message" and idx + 1 < len(args):
+                captured["message"] = args[idx + 1]
+        return await real_create(
+            "sh", "-c", 'echo \'{"result": "body paragraph here, several characters wide."}\'',
+            **kwargs,
+        )
+
+    async def fake_push(_channel, _message: str, _workdir: Path) -> None:
+        return None
+
+    monkeypatch.setattr(pipe_runner, "send_push", fake_push)
+    monkeypatch.setattr(
+        pipe_runner.asyncio, "create_subprocess_exec", capture_create
+    )
+
+    catalog.write_finding(
+        None,
+        {
+            "source": "scheduled/test",
+            "type": "down",
+            "entity": "site",
+            "severity": "high",
+            "target_pipes": ["daily"],
+        },
+        {"daily"},
+    )
+    try:
+        asyncio.run(drain.drain_once())
+    finally:
+        connection.close()
+
+    message = captured.get("message")
+    assert message is not None, "expected the chronicler prompt to be captured"
+    # Each of these must appear: they're the load-bearing constraints
+    # that produced the mess on regression last cycle.
+    for phrase in (
+        "single short paragraph",
+        "Plain text only",
+        "No markdown",
+        "no emoji",
+        "Do not enumerate every item",
+    ):
+        assert phrase in message, (
+            f"chronicler prompt missing constraint {phrase!r}"
+        )
+
+
+def test_drain_message_body_synthesis_precedes_preamble(tmp_path, monkeypatch) -> None:
+    """End-to-end ordering pin: the assembled message has the chronicler
+    synthesis paragraph FIRST and the structured preamble items SECOND.
+    Reverses the original (preamble, body) order; doc'd in
+    _drain_digest with the 'two-voice mess' rationale."""
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    _write_templates(tmp_path)
+    drain = PipeDrain(
+        catalog,
+        _daily_pipe(),
+        {"push": Channel(name="push", kind="push", command="notify-pat")},
+        tmp_path,
+        {"now", "daily"},
+    )
+    catalog.write_finding(
+        None,
+        {
+            "source": "scheduled/test",
+            "type": "down",
+            "entity": "site",
+            "severity": "high",
+            "target_pipes": ["daily"],
+            "body": "site went away",
+        },
+        {"daily"},
+    )
+    sent: list[str] = []
+
+    async def fake_push(_channel, message: str, _workdir: Path) -> None:
+        sent.append(message)
+
+    async def fake_llm(self, _pipe, _structured):
+        return "Synthesis: one site went down.", None
+
+    monkeypatch.setattr(pipe_runner, "send_push", fake_push)
+    monkeypatch.setattr(PipeDrain, "_render_llm_body", fake_llm)
+    try:
+        asyncio.run(drain.drain_once())
+    finally:
+        connection.close()
+
+    assert sent, "digest must dispatch"
+    message = sent[0]
+    # Synthesis paragraph must appear before any preamble marker.
+    body_marker = "Synthesis: one site went down."
+    pre_marker_a = "Suppressed:"  # from rate-limit-callout test stub
+    pre_marker_b = "Incidents:"  # from incident-status test stub
+    assert message.index(body_marker) < message.index(pre_marker_a)
+    assert message.index(body_marker) < message.index(pre_marker_b)
