@@ -456,11 +456,16 @@ def test_load_lodging_substitutes_repo_attrs_into_command() -> None:
 
 
 def test_load_lodging_repo_triager_metadata_has_entity_and_pipes() -> None:
+    """Both pipes route to `daily` -- broken CI is "review with morning
+    coffee" routing, not pants-on-fire. If a future change re-points
+    target_pipe at `now` without an explicit operator decision (i.e. a
+    real action lives behind the urgent path), this test forces the
+    decision to surface in the diff."""
     lodging = load_lodging(REPO_ROOT)
     triager = lodging.triagers["ci-failing-on-main__skein"]
     assert triager.metadata["entity"] == "skein"
     assert triager.metadata["entity_kind"] == "repo"
-    assert triager.metadata["target_pipe"] == "now"
+    assert triager.metadata["target_pipe"] == "daily"
     assert triager.metadata["clearance_pipe"] == "daily"
 
 
@@ -487,7 +492,28 @@ def test_repo_handler_through_runner(tmp_path: Path) -> None:
     assert len(findings) == 1
     assert findings[0]["entity"] == "skein"
     assert findings[0]["type"] == "down"
-    assert findings[0]["target_pipes"] == ["now"]
+    assert findings[0]["target_pipes"] == ["daily"]
+
+
+def test_every_synthesized_source_has_a_parseable_cadence() -> None:
+    """A cadence string like `1d` parses through load_lodging fine (it's
+    just a str) but BLOWS UP at daemon startup inside _make_trigger
+    because _cadence_seconds only knows s/m/h. This is exactly how the
+    initial stale-pr.yaml shipped with `cadence: 1d` -- tests passed,
+    daemon would have refused to start. Pin every cadence string in the
+    live lodging through _make_trigger so the next mistake fails one
+    fast targeted test."""
+    from angelus.daemon import _make_trigger
+
+    lodging = load_lodging(REPO_ROOT)
+    for ref, source in lodging.sources.items():
+        try:
+            _make_trigger(source.cadence)
+        except Exception as exc:  # pragma: no cover - exercised on regression
+            raise AssertionError(
+                f"source {ref!r} has unschedulable cadence "
+                f"{source.cadence!r}: {exc}"
+            ) from exc
 
 
 def _extract_jq_filter(command: str) -> str:
