@@ -377,7 +377,9 @@ def test_digest_partial_channel_failure_does_not_resend_success_channel(
     # local TZ; assert against the prefix and the year.
     today_local = datetime.now().astimezone()
     expected_subject = (
-        f"Angelus Observances for {today_local.strftime('%A %B %-d, %Y')}"
+        f"Angelus Observances for "
+        f"{today_local.strftime('%A %B')} "
+        f"{today_local.day}, {today_local.year}"
     )
     assert email_subjects[0] == expected_subject
 
@@ -469,7 +471,9 @@ def test_llm_nonzero_fallback_dispatches_and_emits_internal_finding(
     finally:
         connection.close()
 
-    assert "LLM digest body unavailable — see structured data above." in sent[0]
+    # Footer wording flipped from "above" to "below" when the body order
+    # reversed in the email cleanup pass (fell-r1 BLOCK #1).
+    assert "LLM digest body unavailable — see structured data below." in sent[0]
     assert internal["type"] == "llm_render_failed"
     assert internal["entity"] == "daily"
     assert queued["status"] == "pending"
@@ -1384,7 +1388,11 @@ def test_digest_subject_is_local_time_date_only(tmp_path, monkeypatch) -> None:
     # format the code uses. Avoid asserting on TZ name (test runners
     # can be in any TZ) -- just verify weekday/month/day/year match.
     today_local = datetime.now().astimezone()
-    expected = f"Angelus Observances for {today_local.strftime('%A %B %-d, %Y')}"
+    expected = (
+        f"Angelus Observances for "
+        f"{today_local.strftime('%A %B')} "
+        f"{today_local.day}, {today_local.year}"
+    )
     assert subject == expected
     # No time, no UTC label -- regressing toward those is the historical
     # mess this test pins against.

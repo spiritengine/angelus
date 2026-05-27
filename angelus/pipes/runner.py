@@ -15,7 +15,12 @@ from angelus.lodging import Channel, Pipe
 from angelus.sources.runner import _kill_and_reap
 from angelus.storage import Catalog, utcnow
 
-LLM_FALLBACK_FOOTER = "LLM digest body unavailable — see structured data above."
+# Prior wording said "see structured data above" -- correct under the
+# old (preamble, body) order. After the cleanup reversed to (body,
+# preamble), the structured data is BELOW the synthesis paragraph, so
+# this message points downward. If a future change re-reverses the
+# order, flip this string too. fell-r1 BLOCK #1.
+LLM_FALLBACK_FOOTER = "LLM digest body unavailable — see structured data below."
 
 
 class PipeDrain:
@@ -203,13 +208,20 @@ class PipeDrain:
         # the item rendering. See chronicler prompt below.
         message = "\n\n".join(part for part in (body, preamble) if part)
         # Local-time subject, screen-reader friendly, date-only (no time).
-        # `astimezone()` with no arg uses the system local TZ. Patrick's box
-        # is America/New_York. Multiple drains on the same UTC day get
-        # the same subject; the natural flow is one per day so that's fine.
-        # If a future operator-triggered ad-hoc drain becomes common, add
-        # a time component back here.
+        # `astimezone()` with no arg uses the system local TZ. Patrick's
+        # box is America/New_York; if the daemon ever runs in a container
+        # without TZ data the subject silently drifts to a different
+        # calendar day (fell-r1 CONSIDER #2). Multiple drains on the same
+        # UTC day get the same subject; the natural flow is one per day
+        # so that's fine. Day-of-month formatted via direct attribute
+        # access -- strftime %-d is a GNU extension that breaks on
+        # macOS/BSD/Windows (fell-r1 CONSIDER #3).
         local_now = datetime.now().astimezone()
-        subject = f"Angelus Observances for {local_now.strftime('%A %B %-d, %Y')}"
+        subject = (
+            f"Angelus Observances for "
+            f"{local_now.strftime('%A %B')} "
+            f"{local_now.day}, {local_now.year}"
+        )
 
         any_channel_succeeded = False
         for channel_name in pipe.channels:
@@ -412,7 +424,18 @@ class PipeDrain:
         if not isinstance(result, str):
             return None, "chronicler --json missing string `result`"
         output = result.strip()
-        if len(output) < 20:
+        # The chronicler prompt explicitly says "if nothing notable
+        # happened, say so in a single sentence." That can be a
+        # legitimately short reply like "All quiet since last digest."
+        # (29 chars) or, worse, "All quiet." (10 chars). The prior
+        # threshold of 20 rejected the latter as if it were a failure
+        # and showed the operator the LLM_FALLBACK_FOOTER instead of
+        # the actual compliant summary -- exactly the false-failure
+        # shape fell-r1 CONSIDER #7 flagged. The new floor of 5 still
+        # catches empty/whitespace/single-word output (which means the
+        # model genuinely produced nothing useful) but accepts the
+        # quiet-day case.
+        if len(output) < 5:
             return None, "chronicler output was empty or too short"
         return output, None
 
