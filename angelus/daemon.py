@@ -91,6 +91,22 @@ class AngelusDaemon:
                 len(self.lodging.pipes),
                 len(self.lodging.channels),
             )
+            # Log the resolved local TZ at startup. The digest subject and
+            # all rendered timestamps use `datetime.now().astimezone()`,
+            # which reads the system TZ. If the daemon ever runs in a
+            # container without tzdata or with `Environment=TZ=UTC`, the
+            # digest silently shifts a calendar day -- fell-r1 CONSIDER #2
+            # for the email-cleanup pass. A startup log line surfaces the
+            # misconfig in journalctl without adding a config knob.
+            _local_now = datetime.now().astimezone()
+            LOGGER.info(
+                "resolved display timezone: %s (current local: %s)",
+                _local_now.tzinfo,
+                # rstrip in case the resolved TZ has no abbreviation
+                # (slim container without tzdata): %Z renders empty and
+                # would leave a trailing space in journalctl.
+                _local_now.strftime("%Y-%m-%d %H:%M %Z").rstrip(),
+            )
             self._install_signal_handlers()
             recovered, failed = self.catalog.recover_writing_rows()
             # Same round-5 orphan class as the in-process graceful-cancel

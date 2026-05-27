@@ -15,7 +15,12 @@ from angelus.lodging import Channel, Pipe
 from angelus.sources.runner import _kill_and_reap
 from angelus.storage import Catalog, utcnow
 
-LLM_FALLBACK_FOOTER = "LLM digest body unavailable — see structured data above."
+# Prior wording said "see structured data above" -- correct under the
+# old (preamble, body) order. After the cleanup reversed to (body,
+# preamble), the structured data is BELOW the synthesis paragraph, so
+# this message points downward. If a future change re-reverses the
+# order, flip this string too. fell-r1 BLOCK #1.
+LLM_FALLBACK_FOOTER = "LLM digest body unavailable — see structured data below."
 
 
 class PipeDrain:
@@ -194,9 +199,28 @@ class PipeDrain:
                 llm_error,
                 known_pipes,
             )
-        message = "\n\n".join(part for part in (preamble, body) if part)
+        # Reversed from the original (preamble, body) order: Patrick wants
+        # a synthesis paragraph FIRST, then the structured item list. The
+        # llm body is the synthesis; the preamble is the items. The two
+        # voices used to interleave (preamble said "Open: <list>", then
+        # llm re-rendered the same list as a markdown table) -- now the
+        # llm writes only a short summary paragraph and the preamble owns
+        # the item rendering. See chronicler prompt below.
+        message = "\n\n".join(part for part in (body, preamble) if part)
+        # Local-time subject, screen-reader friendly, date-only (no time).
+        # `astimezone()` with no arg uses the system local TZ. Patrick's
+        # box is America/New_York; if the daemon ever runs in a container
+        # without TZ data the subject silently drifts to a different
+        # calendar day (fell-r1 CONSIDER #2). Multiple drains on the same
+        # UTC day get the same subject; the natural flow is one per day
+        # so that's fine. Day-of-month formatted via direct attribute
+        # access -- strftime %-d is a GNU extension that breaks on
+        # macOS/BSD/Windows (fell-r1 CONSIDER #3).
+        local_now = datetime.now().astimezone()
         subject = (
-            f"Angelus daily digest {datetime.now(UTC).date().isoformat()} UTC"
+            f"Angelus Observances for "
+            f"{local_now.strftime('%A %B')} "
+            f"{local_now.day}, {local_now.year}"
         )
 
         any_channel_succeeded = False
@@ -276,7 +300,7 @@ class PipeDrain:
 
     def _structured_inputs(self, pipe: Pipe, last_drain_at: str | None) -> dict[str, Any]:
         open_incidents = self.catalog.open_incidents()
-        return {
+        raw = {
             "findings_since_last_drain": self.catalog.findings_for_pipe_since(
                 pipe.name, last_drain_at, exclude_types=("clearance",)
             ),
@@ -284,6 +308,16 @@ class PipeDrain:
             "open_incidents": open_incidents,
             "recent_closures": self.catalog.clearance_findings_since(last_drain_at),
         }
+        # Add local-time strings alongside the UTC originals so both the
+        # jinja templates and the chronicler prompt can use human-readable
+        # timestamps without re-implementing the conversion. The UTC
+        # originals stay -- they're load-bearing for downstream catalog
+        # operations and for deterministic test assertions. The local
+        # `*_local` siblings are display-only.
+        for collection in raw.values():
+            for item in collection:
+                _attach_local_timestamps(item)
+        return raw
 
     def _render_preamble(self, pipe: Pipe, structured: dict[str, Any]) -> str:
         environment = Environment(
@@ -309,9 +343,35 @@ class PipeDrain:
             return None, "daily digest body missing mantle"
         input_names = body_config.get("inputs") or []
         inputs = {name: structured[name] for name in input_names}
+        # Tight constraints on the chronicler output: the preamble (jinja
+        # templates) owns the structured item rendering; the LLM owns ONLY
+        # a short synthesis paragraph at the top. Previous loose prompt
+        # produced markdown tables, headers, and emoji in a plain-text
+        # email -- mess Patrick called out. Asking for plain text in 2-4
+        # sentences forces the model to do the synthesis work (which is
+        # what an LLM is good for) rather than re-render the data (which
+        # the preamble already does, deterministically).
         prompt = (
-            "Render a concise Angelus daily digest body from the structured inputs. "
-            "Do not omit urgent operational facts.\n\n"
+            "You are writing the opening synthesis paragraph of a plain-text "
+            "ops digest email. Read the structured inputs and produce a single "
+            "short paragraph (2 to 4 sentences) that summarizes what changed "
+            "since the last digest.\n"
+            "\n"
+            "Strict rules:\n"
+            "- Plain text only. No markdown headers, no asterisks for bold, "
+            "no bulleted lists, no tables, no emoji, no horizontal rules.\n"
+            "- Do not enumerate every item. The reader sees a structured "
+            "list directly below your paragraph; do not duplicate it.\n"
+            "- Lead with the most severe or unusual item.\n"
+            "- Use entity names (e.g. 'speakbot', 'example.com') when "
+            "there are fewer than five things to mention; otherwise count "
+            "and summarize by category.\n"
+            "- Times in your prose should use local clock times when "
+            "*_local fields are present (e.g. 'since Tue 21:07 EDT'), not "
+            "the UTC originals.\n"
+            "- If nothing notable happened, say so in a single sentence.\n"
+            "\n"
+            "Structured inputs (JSON):\n"
             + json.dumps(inputs, sort_keys=True, default=str)
         )
         try:
@@ -364,7 +424,19 @@ class PipeDrain:
         if not isinstance(result, str):
             return None, "chronicler --json missing string `result`"
         output = result.strip()
-        if len(output) < 20:
+        # The chronicler prompt explicitly says "if nothing notable
+        # happened, say so in a single sentence." That can be a
+        # legitimately short reply like "All quiet since last digest."
+        # (29 chars) or, worse, "All quiet." (10 chars). The prior
+        # threshold of 20 rejected the latter as if it were a failure
+        # and showed the operator the LLM_FALLBACK_FOOTER instead of
+        # the actual compliant summary -- exactly the false-failure
+        # shape fell-r1 CONSIDER #7 flagged. The new floor of 5 catches
+        # empty / whitespace-only / <=4-char output (which means the
+        # model genuinely produced nothing useful -- "ok", "yes.", etc.)
+        # but accepts the quiet-day case. A 5-char "quiet" passes; that
+        # is the intentionally degenerate compliant form.
+        if len(output) < 5:
             return None, "chronicler output was empty or too short"
         return output, None
 
@@ -411,3 +483,43 @@ def _is_same_utc_day(left: str | None, right: str | None) -> bool:
 
 def _parse_utc(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+# Timestamp fields the catalog returns on findings + incidents. Listed
+# explicitly rather than "any field ending in _at" to avoid converting
+# something that isn't a UTC ISO string (e.g. a future field a future
+# operator names `created_label_at` for unrelated reasons).
+_LOCAL_TS_FIELDS = (
+    "occurred_at",
+    "created_at",
+    "updated_at",
+    "queued_at",
+    "opened_at",
+    "closed_at",
+)
+
+
+def _attach_local_timestamps(item: dict[str, Any]) -> None:
+    """For each known UTC-ISO timestamp field, add a sibling
+    `<field>_local` rendered in the system local timezone.
+
+    Mutates `item` in place. The UTC original is kept (the templates may
+    still want raw ISO for sorting/dedup, and downstream catalog code
+    reads UTC). Failures parse silently to None -- a malformed timestamp
+    shouldn't crash the whole digest render.
+    """
+    for field in _LOCAL_TS_FIELDS:
+        value = item.get(field)
+        if not isinstance(value, str) or not value:
+            continue
+        try:
+            dt_utc = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        local = dt_utc.astimezone()
+        # rstrip handles the rare-but-real case where the resolved
+        # local TZ has no abbreviation -- %Z renders to "", leaving a
+        # trailing space (fell-r2 CONSIDER on the %Z edge). Linux boxes
+        # with proper tzdata always emit an abbreviation; the rstrip
+        # is cheap insurance for containerized deploys.
+        item[f"{field}_local"] = local.strftime("%a %Y-%m-%d %H:%M %Z").rstrip()
