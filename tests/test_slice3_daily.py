@@ -1642,3 +1642,90 @@ def test_chronicler_quiet_day_short_reply_is_not_rejected(
     assert "LLM digest body unavailable" not in body, (
         "short compliant reply must NOT trigger the LLM fallback footer"
     )
+
+
+def test_shipped_jinja_templates_render_one_bullet_per_line() -> None:
+    """Regression for end-to-end review BLOCK #1 (2026-05-27): the shipped
+    incident-status.j2 and rate-limit-callout.j2 had {% endif %} as the
+    last tag on each body line. Combined with trim_blocks=True, that
+    consumes the per-iteration newline and collapses every bullet onto
+    a single line.
+
+    Existing tests stub their own templates (see _write_templates above),
+    so the shipped templates were never exercised. Tomorrow's 08:00 EDT
+    digest would have rendered four open-incident bullets as one line.
+
+    The fix uses inline `{{ ... if ... }}` expressions (which end with
+    `}}`, not a block tag) so the per-iteration newline survives.
+    """
+    from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+    repo_root = Path(__file__).resolve().parent.parent
+    env = Environment(
+        loader=FileSystemLoader(repo_root / "render-templates"),
+        autoescape=select_autoescape(enabled_extensions=()),
+        trim_blocks=True,
+        lstrip_blocks=True,
+    )
+
+    incident_tmpl = env.get_template("incident-status.j2")
+    out = incident_tmpl.render(
+        open_incidents=[
+            {
+                "severity": "medium",
+                "type": "down",
+                "entity": "a.com",
+                "opened_at_local": "Tue 2026-05-26 21:07 EDT",
+            },
+            {
+                "severity": "medium",
+                "type": "down",
+                "entity": "b.com",
+                "opened_at_local": "Tue 2026-05-26 21:07 EDT",
+            },
+            {
+                "severity": "low",
+                "type": "stale_pr",
+                "entity": "c",
+                "opened_at_local": "Wed 2026-05-27 03:00 EDT",
+            },
+        ],
+        recent_closures=[],
+        findings_since_last_drain=[],
+    )
+    bullet_lines = [line for line in out.splitlines() if line.startswith("- ")]
+    assert len(bullet_lines) == 3, (
+        "expected three bullets on separate lines; got rendered output "
+        f"with {len(bullet_lines)} bullet-starting lines.\n"
+        f"Rendered:\n{out!r}"
+    )
+
+    out2 = incident_tmpl.render(
+        open_incidents=[],
+        recent_closures=[
+            {"entity": "x", "body_text": "closed-x"},
+            {"entity": "y", "body_text": "closed-y"},
+        ],
+        findings_since_last_drain=[
+            {"severity": "low", "type": "stale_pr", "entity": "z", "body_text": "f-z"},
+            {"severity": "low", "type": "stale_pr", "entity": "w", "body_text": "f-w"},
+        ],
+    )
+    bullets2 = [line for line in out2.splitlines() if line.startswith("- ")]
+    assert len(bullets2) == 4, (
+        f"expected 2 closures + 2 findings = 4 bullets; got {len(bullets2)}.\n"
+        f"Rendered:\n{out2!r}"
+    )
+
+    rl_tmpl = env.get_template("rate-limit-callout.j2")
+    out3 = rl_tmpl.render(
+        suppressed_findings=[
+            {"severity": "high", "type": "down", "entity": "p", "body_text": "p-down"},
+            {"severity": "high", "type": "down", "entity": "q", "body_text": "q-down"},
+        ]
+    )
+    rl_lines = [line for line in out3.splitlines() if line.startswith("- ")]
+    assert len(rl_lines) == 2, (
+        f"expected two suppressed-finding bullets on separate lines; "
+        f"got {len(rl_lines)}.\nRendered:\n{out3!r}"
+    )
