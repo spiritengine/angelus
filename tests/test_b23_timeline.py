@@ -154,6 +154,65 @@ def test_timeline_rejects_since_and_window_together(tmp_path) -> None:
     assert "not both" in result.output
 
 
+def test_timeline_same_instant_tie_is_deterministic(tmp_path) -> None:
+    """Two events sharing an exact timestamp render in a fixed, deterministic
+    order (kind then id). Causality is not recoverable from the data at this
+    resolution -- this only pins that the order is stable, not that it is
+    causal. The dispatch-failure -> finding case is precisely where the static
+    kind order cannot reflect causality, so we assert the documented
+    deterministic order rather than a causal one."""
+    state = tmp_path / "state"
+    state.mkdir()
+    connection = init_db(state / "angelus.sqlite3")
+    collision = "2026-05-29T12:00:06.986Z"
+    # A failed dispatch and the channel_unhealthy finding it provokes land on
+    # the same millisecond. Seeded dispatch-first; the sort must still place
+    # finding (kind 2) before dispatch (kind 3) -- deterministic, not causal.
+    connection.execute(
+        "INSERT INTO dispatches (pipe, channel, finding_ids, status, attempts, "
+        "last_error, dispatched_at) VALUES (?, ?, ?, ?, 1, ?, ?)",
+        ("daily", "email", "[1]", "failed", "channel down", collision),
+    )
+    connection.execute(
+        "INSERT INTO findings (observation_id, source, type, entity, dedup_key, "
+        "target_pipes, status, severity, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            None,
+            "internal/dispatch",
+            "channel_unhealthy",
+            "email",
+            "internal/dispatch:channel_unhealthy:email",
+            "now",
+            "ready",
+            "high",
+            collision,
+        ),
+    )
+    connection.commit()
+    connection.close()
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "timeline",
+            "--since",
+            "2026-05-29T11:59:00Z",
+            "--until",
+            "2026-05-29T12:01:00Z",
+            "--root",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    event_lines = result.output.splitlines()[2:]
+    assert len(event_lines) == 2, event_lines
+    # Both share the timestamp; kind order (finding=2 before dispatch=3) decides.
+    assert "finding internal/dispatch channel_unhealthy email" in event_lines[0]
+    assert "dispatch daily/email failed: channel down" in event_lines[1]
+
+
 def test_timeline_empty_window_reports_none(tmp_path) -> None:
     _seed(tmp_path)
 

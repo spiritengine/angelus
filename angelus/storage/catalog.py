@@ -584,10 +584,15 @@ class Catalog:
         which sort correctly because every timestamp column uses the same
         '...Z' millisecond format.
 
-        Same-instant ties break by kind in causal order (fire, observation,
-        finding, dispatch) then by id, so a fire and the dispatch failure it
-        provoked read in the order they happened even when their timestamps
-        collide.
+        Same-instant ties break by kind (fire, observation, finding,
+        dispatch) then by id. This ordering is deterministic and stable,
+        NOT causal: on an exact millisecond collision the originating event
+        and the event it provoked cannot be told apart from the stored data
+        alone. A failing dispatch and the channel_unhealthy finding it
+        provokes can share a millisecond, and the static kind order would
+        then render the finding above its dispatch -- the reverse of what
+        happened. Sub-millisecond ordering therefore may not reflect causal
+        order; only the millisecond timestamps disambiguate when they differ.
         """
         events: list[dict[str, Any]] = []
         for row in self.connection.execute(
@@ -665,6 +670,7 @@ class Catalog:
                     "error": row["last_error"],
                 }
             )
+        # Deterministic, stable tie-break -- not causal (see docstring).
         kind_order = {"fire": 0, "observation": 1, "finding": 2, "dispatch": 3}
         events.sort(key=lambda e: (e["ts"], kind_order[e["kind"]], e["id"]))
         return events
