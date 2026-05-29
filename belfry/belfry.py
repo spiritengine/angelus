@@ -20,13 +20,54 @@ from pathlib import Path
 DEFAULT_WEDGE_THRESHOLD_SEC = 600
 DEFAULT_SENTINEL_FILENAME = "belfry-pinged-at"
 DEFAULT_FAILCHECK_FILENAME = "belfry-failcheck-at"
+DEFAULT_ENV_FILENAME = "angelus.env"
 FAILURE_DETAIL_LIMIT = 3
+
+
+def load_env_file(state: Path) -> dict[str, str]:
+    """Apply state/angelus.env into os.environ, non-override (B16).
+
+    The same non-secret config the daemon loads, so belfry and the daemon can't
+    diverge. Stdlib-only to keep belfry dependency-free. The belfry crontab
+    sources this file too (for PATH); loading it here as well means a belfry
+    launched any other way still sees the config. Non-override: a name already
+    in the environment wins over the file. Missing file is a no-op.
+    """
+    path = state / DEFAULT_ENV_FILENAME
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    applied: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export ") or line.startswith("export\t"):
+            line = line[len("export"):].lstrip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        os.environ[key] = value
+        applied[key] = value
+    return applied
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
     root = Path(argv[0] if argv else ".").resolve()
     state = root / "state"
+
+    # Load non-secret config before any env var is read (B16). Keeps belfry's
+    # view of ANGELUS_EMAIL_TO / healthcheck URLs / thresholds identical to the
+    # daemon's even when cron didn't source the file.
+    load_env_file(state)
 
     # Touch the liveness sentinel on every tick, success or failure. The
     # question this answers is "is belfry firing on schedule?" -- belfry's

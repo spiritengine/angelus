@@ -6,6 +6,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/angelus
+# Single source of truth for non-secret config (B16). The leading '-' makes a
+# missing file non-fatal; the daemon also loads it in code, so a hand-launch
+# (the 2026-05-29 drift) gets the same config. Precedence: an explicit
+# Environment= line below, or anything inherited, wins over this file.
+EnvironmentFile=-/opt/angelus/state/angelus.env
 ExecStart=/usr/bin/env angelus daemon
 Restart=on-failure
 RestartSec=5

@@ -16,6 +16,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from angelus.clock import Clock
 from angelus.control import ControlServer
+from angelus.envfile import load_env_file
 from angelus.lodging import Lodging, ScheduledSource, load_lodging
 from angelus.lodging.reloader import LodgingReloader
 from angelus.pipes import PipeDrain
@@ -816,4 +817,17 @@ def main(root: Path | None = None) -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    asyncio.run(AngelusDaemon(root or Path.cwd()).run())
+    root = root or Path.cwd()
+    # Load non-secret config from state/angelus.env (B16). systemd's
+    # EnvironmentFile= already does this for the managed unit; doing it in code
+    # too means a hand-launched daemon -- the 2026-05-29 incident -- inherits
+    # the same config instead of silently losing it. Non-override: anything
+    # already in the environment wins over the file.
+    applied = load_env_file(root)
+    if applied:
+        LOGGER.info(
+            "loaded %d var(s) from state/angelus.env: %s",
+            len(applied),
+            ", ".join(sorted(applied)),
+        )
+    asyncio.run(AngelusDaemon(root).run())

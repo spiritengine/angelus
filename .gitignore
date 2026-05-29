@@ -9,8 +9,10 @@ node_modules/
 *.egg-info/
 .pytest_cache/
 
-# Angelus runtime state
-state/
+# Angelus runtime state. Ignore everything under state/ (including the live,
+# secret-adjacent state/angelus.env) but keep the checked-in env template.
+state/*
+!state/angelus.env.example
 observations/
 findings/
 dispatches.log
