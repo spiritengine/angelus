@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+from angelus.clock import Clock
 
 TRUST_RETRY_DELAYS = (
     timedelta(minutes=1),
@@ -22,22 +24,23 @@ TRUST_RETRY_DELAYS = (
 MAX_RETRY_ATTEMPTS = 5
 
 
-def utcnow() -> str:
-    return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-
-
-def _utcnow_dt() -> datetime:
-    return datetime.now(UTC)
-
-
 def _format_time(value: datetime) -> str:
     return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 class Catalog:
-    def __init__(self, connection: sqlite3.Connection, root: Path) -> None:
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        root: Path,
+        clock: Clock | None = None,
+    ) -> None:
         self.connection = connection
         self.root = root
+        # Injectable time seam (B24). Defaults to the real wall clock so
+        # existing callers keep working; the daemon threads its shared clock
+        # in, and tests pass a FakeClock to control every timestamp/window.
+        self._clock = clock or Clock()
 
     def record_source_fire(
         self, source_name: str, scheduled_at: str | None, outcome: str
@@ -47,14 +50,14 @@ class Catalog:
             INSERT INTO source_fires (source_name, scheduled_at, fired_at, outcome)
             VALUES (?, ?, ?, ?)
             """,
-            (source_name, scheduled_at, utcnow(), outcome),
+            (source_name, scheduled_at, self._clock.now_iso(), outcome),
         )
         self.connection.commit()
 
     def write_observation(
         self, source_ref: str, payload: dict[str, Any], provenance: dict[str, Any]
     ) -> int:
-        now = utcnow()
+        now = self._clock.now_iso()
         cursor = self.connection.execute(
             """
             INSERT INTO observations (source, status, provenance, written_at)
@@ -71,13 +74,13 @@ class Catalog:
             SET status = 'ready', body_ref = ?, updated_at = ?
             WHERE id = ?
             """,
-            (body_ref, utcnow(), observation_id),
+            (body_ref, self._clock.now_iso(), observation_id),
         )
         self.connection.commit()
         return observation_id
 
     def ready_observations_for(self, triager_name: str, source_ref: str) -> list[sqlite3.Row]:
-        now = utcnow()
+        now = self._clock.now_iso()
         return list(
             self.connection.execute(
                 """
@@ -163,7 +166,7 @@ class Catalog:
                 updated_at = ?
             WHERE observation_id = ? AND triager_name = ?
             """,
-            (utcnow(), observation_id, triager_name),
+            (self._clock.now_iso(), observation_id, triager_name),
         )
         self.connection.commit()
 
@@ -179,7 +182,7 @@ class Catalog:
         ).fetchone()
         attempt = int(row["attempt"]) if row is not None else 1
         if attempt >= MAX_RETRY_ATTEMPTS:
-            now = utcnow()
+            now = self._clock.now_iso()
             self.connection.execute(
                 """
                 UPDATE observation_triage
@@ -204,7 +207,7 @@ class Catalog:
 
         next_attempt = attempt + 1
         next_attempt_at = _format_time(
-            _utcnow_dt() + TRUST_RETRY_DELAYS[attempt - 1]
+            self._clock.now() + TRUST_RETRY_DELAYS[attempt - 1]
         )
         self.connection.execute(
             """
@@ -216,7 +219,7 @@ class Catalog:
                 updated_at = ?
             WHERE observation_id = ? AND triager_name = ?
             """,
-            (next_attempt, next_attempt_at, error, utcnow(), observation_id, triager_name),
+            (next_attempt, next_attempt_at, error, self._clock.now_iso(), observation_id, triager_name),
         )
         self.connection.commit()
         return False
@@ -245,7 +248,7 @@ class Catalog:
                 state_blob = excluded.state_blob,
                 updated_at = excluded.updated_at
             """,
-            (triager_name, source_ref, json.dumps(state, sort_keys=True), utcnow()),
+            (triager_name, source_ref, json.dumps(state, sort_keys=True), self._clock.now_iso()),
         )
         self.connection.commit()
 
@@ -262,7 +265,7 @@ class Catalog:
         target_pipes = list(finding.get("target_pipes") or [])
         body = finding.get("body")
         body_obj = body if isinstance(body, dict) else {"text": body} if body else {}
-        now = utcnow()
+        now = self._clock.now_iso()
         cursor = self.connection.execute(
             """
             INSERT INTO findings (
@@ -291,7 +294,7 @@ class Catalog:
             SET status = 'ready', body_ref = ?, updated_at = ?
             WHERE id = ?
             """,
-            (body_ref, utcnow(), finding_id),
+            (body_ref, self._clock.now_iso(), finding_id),
         )
         if finding_type == "clearance":
             self._close_incident(source, entity, finding_id)
@@ -310,7 +313,7 @@ class Catalog:
         return finding_id
 
     def pending_pipe_items(self, pipe: str, limit: int | None = 20) -> list[sqlite3.Row]:
-        now = utcnow()
+        now = self._clock.now_iso()
         limit_sql = "" if limit is None else "LIMIT ?"
         params: tuple[Any, ...] = (pipe, now) if limit is None else (pipe, now, limit)
         return list(
@@ -345,7 +348,7 @@ class Catalog:
             )
             VALUES (?, ?, ?, ?, 1, ?, ?, ?)
             """,
-            (pipe, channel, json.dumps(finding_ids), status, error, utcnow(), source),
+            (pipe, channel, json.dumps(finding_ids), status, error, self._clock.now_iso(), source),
         )
         if status == "sent" and mark_queue:
             for finding_id in finding_ids:
@@ -355,12 +358,12 @@ class Catalog:
                     SET status = 'dispatched', dispatched_at = ?, updated_at = ?
                     WHERE finding_id = ? AND pipe = ?
                     """,
-                    (utcnow(), utcnow(), finding_id, pipe),
+                    (self._clock.now_iso(), self._clock.now_iso(), finding_id, pipe),
                 )
         self.connection.commit()
 
     def mark_pipe_items_dispatched(self, pipe: str, finding_ids: list[int]) -> None:
-        now = utcnow()
+        now = self._clock.now_iso()
         for finding_id in finding_ids:
             self.connection.execute(
                 """
@@ -397,7 +400,7 @@ class Catalog:
     def suppress_pipe_item_to(
         self, finding_id: int, source_pipe: str, target_pipe: str
     ) -> None:
-        now = utcnow()
+        now = self._clock.now_iso()
         self.connection.execute(
             """
             UPDATE pipe_queues
@@ -423,7 +426,7 @@ class Catalog:
         return None if row is None else row["last_drain_at"]
 
     def mark_pipe_drained(self, pipe_name: str, drained_at: str | None = None) -> str:
-        drained_at = drained_at or utcnow()
+        drained_at = drained_at or self._clock.now_iso()
         self.connection.execute(
             """
             INSERT INTO pipe_state (pipe_name, last_drain_at)
@@ -545,7 +548,7 @@ class Catalog:
     def recently_closed_incidents(self, days: int = 7) -> list[dict[str, Any]]:
         """Incidents closed within the last `days` days (default 7).
         Read-only; a plain SELECT, no write."""
-        cutoff = _format_time(_utcnow_dt() - timedelta(days=days))
+        cutoff = _format_time(self._clock.now() - timedelta(days=days))
         rows = self.connection.execute(
             """
             SELECT i.*, f.severity
@@ -588,7 +591,7 @@ class Catalog:
         attempts = int(row["attempts"]) if row is not None else 0
         next_attempt = attempts + 1
         if next_attempt >= MAX_RETRY_ATTEMPTS:
-            now = utcnow()
+            now = self._clock.now_iso()
             self.connection.execute(
                 """
                 UPDATE pipe_queues
@@ -606,7 +609,7 @@ class Catalog:
             return True
 
         next_attempt_at = _format_time(
-            _utcnow_dt() + TRUST_RETRY_DELAYS[next_attempt - 1]
+            self._clock.now() + TRUST_RETRY_DELAYS[next_attempt - 1]
         )
         self.connection.execute(
             """
@@ -617,7 +620,7 @@ class Catalog:
                 updated_at = ?
             WHERE finding_id = ? AND pipe = ?
             """,
-            (next_attempt, error, next_attempt_at, utcnow(), finding_id, pipe),
+            (next_attempt, error, next_attempt_at, self._clock.now_iso(), finding_id, pipe),
         )
         self.connection.commit()
         return False
@@ -632,7 +635,7 @@ class Catalog:
                 last_error = excluded.last_error,
                 updated_at = excluded.updated_at
             """,
-            (channel, error, utcnow()),
+            (channel, error, self._clock.now_iso()),
         )
 
     def is_channel_unhealthy(self, channel: str) -> bool:
@@ -665,7 +668,7 @@ class Catalog:
         the same MAX_RETRY_ATTEMPTS threshold so the two paths' ladders
         match.
         """
-        now = utcnow()
+        now = self._clock.now_iso()
         row = self.connection.execute(
             """
             SELECT attempts FROM digest_channel_attempts
@@ -788,13 +791,13 @@ class Catalog:
                     failed += 1
                 self.connection.execute(
                     f"UPDATE {table} SET status = ?, updated_at = ? WHERE id = ?",
-                    (status, utcnow(), row["id"]),
+                    (status, self._clock.now_iso(), row["id"]),
                 )
         self.connection.commit()
         return recovered, failed
 
     def _write_body(self, kind: str, row_id: int, body: dict[str, Any]) -> str:
-        date = utcnow()[:10]
+        date = self._clock.now_iso()[:10]
         directory = self.root / kind / date / str(row_id)
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / "body.json"
@@ -815,7 +818,7 @@ class Catalog:
     def _upsert_incident(
         self, source: str, finding_type: str, entity: str, dedup_key: str, finding_id: int
     ) -> None:
-        now = utcnow()
+        now = self._clock.now_iso()
         self.connection.execute(
             """
             INSERT INTO incidents (
@@ -831,7 +834,7 @@ class Catalog:
         )
 
     def _close_incident(self, source: str, entity: str, finding_id: int) -> None:
-        now = utcnow()
+        now = self._clock.now_iso()
         self.connection.execute(
             """
             UPDATE incidents
@@ -865,7 +868,7 @@ class Catalog:
         The same shape also makes "extend the mute" correct: a later,
         longer mute is just another row with a farther expires_at.
         """
-        now_dt = _utcnow_dt()
+        now_dt = self._clock.now()
         expires_at = _format_time(now_dt + timedelta(seconds=duration_seconds))
         self.connection.execute(
             """
@@ -880,14 +883,14 @@ class Catalog:
     def is_muted(self, dedup_key: str) -> bool:
         """True if an unexpired mute exists for dedup_key. Read-only.
 
-        expires_at and utcnow() are the same fixed-width ISO8601 UTC
-        format (millisecond precision, Z suffix), so the lexicographic
+        expires_at and the clock's now string are the same fixed-width ISO8601
+        UTC format (millisecond precision, Z suffix), so the lexicographic
         `expires_at > ?` comparison is a correct time comparison and an
         expired mute does not match -- no GC sweeper is needed.
         """
         row = self.connection.execute(
             "SELECT 1 FROM mutes WHERE dedup_key = ? AND expires_at > ? LIMIT 1",
-            (dedup_key, utcnow()),
+            (dedup_key, self._clock.now_iso()),
         ).fetchone()
         return row is not None
 
@@ -910,7 +913,7 @@ class Catalog:
             WHERE expires_at > ?
             ORDER BY expires_at ASC, id ASC
             """,
-            (utcnow(),),
+            (self._clock.now_iso(),),
         )
         return [dict(row) for row in rows]
 
@@ -929,7 +932,7 @@ class Catalog:
             ORDER BY expires_at DESC, id DESC
             LIMIT 1
             """,
-            (dedup_key, utcnow()),
+            (dedup_key, self._clock.now_iso()),
         ).fetchone()
         return dict(row) if row is not None else None
 
@@ -976,7 +979,7 @@ class Catalog:
         apply matches 0 rows and reports 'already_closed' with no
         double-effect (the original closed_at/close_comment are untouched).
         """
-        now = utcnow()
+        now = self._clock.now_iso()
         cursor = self.connection.execute(
             """
             UPDATE incidents
@@ -1049,7 +1052,7 @@ class Catalog:
                         updated_at = ?
                     WHERE finding_id = ? AND pipe = ? AND status != 'pending'
                     """,
-                    (utcnow(), finding_id, pipe),
+                    (self._clock.now_iso(), finding_id, pipe),
                 )
                 requeued.append(pipe)
             # else: already 'pending' -> the guard. Skip so a double
@@ -1132,7 +1135,7 @@ class Catalog:
                 detail = excluded.detail,
                 updated_at = excluded.updated_at
             """,
-            (dependency_name, status, last_check_at, detail, utcnow()),
+            (dependency_name, status, last_check_at, detail, self._clock.now_iso()),
         )
         self.connection.commit()
 

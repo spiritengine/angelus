@@ -27,9 +27,10 @@ import pytest
 
 import angelus.pipes.runner as pipe_runner
 from angelus.daemon import AngelusDaemon
+from angelus.clock import utcnow
 from angelus.lodging.reloader import LodgingReloader
 from angelus.pipes import PipeDrain
-from angelus.storage import Catalog, init_db, utcnow
+from angelus.storage import Catalog, init_db
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
