@@ -4,16 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from angelus.channels import send_email, send_push
+from angelus.clock import Clock
 from angelus.lodging import Channel, Pipe
 from angelus.sources.runner import _kill_and_reap
-from angelus.storage import Catalog, utcnow
+from angelus.storage import Catalog
 
 # Prior wording said "see structured data above" -- correct under the
 # old (preamble, body) order. After the cleanup reversed to (body,
@@ -31,8 +32,14 @@ class PipeDrain:
         channels: dict[str, Channel],
         workdir: Path,
         known_pipes: set[str],
+        clock: Clock | None = None,
     ) -> None:
         self.catalog = catalog
+        # Time seam (B24). Defaults to the catalog's clock so the runner's
+        # drain windows / subject date and the rows the catalog stamps share
+        # one notion of "now"; the daemon passes its shared clock explicitly
+        # and tests pass a FakeClock.
+        self._clock = clock or catalog._clock
         # `pipe`, `channels`, and `known_pipes` are mutated across hot-reloads
         # by AngelusDaemon.apply_lodging, which does NOT take self.lock --
         # so the lock is NOT what serialises a drain against a reload (it
@@ -181,7 +188,7 @@ class PipeDrain:
         channels: dict[str, Channel],
         known_pipes: set[str],
     ) -> None:
-        drained_at = utcnow()
+        drained_at = self._clock.now_iso()
         last_drain_at = self.catalog.last_pipe_drain_at(pipe.name)
         pending_rows = self.catalog.pending_pipe_items(pipe.name, limit=None)
         finding_ids = [int(row["id"]) for row in pending_rows]
@@ -216,7 +223,7 @@ class PipeDrain:
         # so that's fine. Day-of-month formatted via direct attribute
         # access -- strftime %-d is a GNU extension that breaks on
         # macOS/BSD/Windows (fell-r1 CONSIDER #3).
-        local_now = datetime.now().astimezone()
+        local_now = self._clock.now_local()
         subject = (
             f"Angelus Observances for "
             f"{local_now.strftime('%A %B')} "
@@ -443,7 +450,7 @@ class PipeDrain:
     def _over_rate_limit(self, pipe: Pipe, row) -> bool:
         if not pipe.rate_limit:
             return False
-        since = (datetime.now(UTC) - timedelta(hours=1)).isoformat(
+        since = (self._clock.now() - timedelta(hours=1)).isoformat(
             timespec="milliseconds"
         ).replace("+00:00", "Z")
         per_source = _parse_hourly_limit(pipe.rate_limit.get("per_source"))

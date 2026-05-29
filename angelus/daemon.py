@@ -14,12 +14,13 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
+from angelus.clock import Clock
 from angelus.control import ControlServer
 from angelus.lodging import Lodging, ScheduledSource, load_lodging
 from angelus.lodging.reloader import LodgingReloader
 from angelus.pipes import PipeDrain
 from angelus.sources import run_shell_source
-from angelus.storage import Catalog, init_db, utcnow
+from angelus.storage import Catalog, init_db
 from angelus.triage import run_python_triager
 
 LOGGER = logging.getLogger(__name__)
@@ -41,7 +42,13 @@ class AngelusDaemon:
         self.pid_file = state_dir / "angelus.pid"
         self.socket_path = state_dir / "angelus.sock"
         self.connection = init_db(state_dir / "angelus.sqlite3")
-        self.catalog = Catalog(self.connection, root)
+        # Single real clock for the process (B24). Threaded into the catalog
+        # and every PipeDrain so all timestamp/window logic shares one notion
+        # of "now"; a sim/test build swaps this for a FakeClock. apscheduler
+        # keeps real time (B25 handles forcing work without time-travelling
+        # the scheduler).
+        self.clock = Clock()
+        self.catalog = Catalog(self.connection, root, clock=self.clock)
         self.lodging: Lodging = load_lodging(root)
         self.scheduler = AsyncIOScheduler(timezone="UTC")
         self.scheduler_semaphore = asyncio.Semaphore(10)
@@ -56,7 +63,12 @@ class AngelusDaemon:
         self._pipe_loop_tasks: dict[str, asyncio.Task[None]] = {}
         self.pipe_drains: dict[str, PipeDrain] = {
             name: PipeDrain(
-                self.catalog, pipe, self.lodging.channels, root, set(self.lodging.pipes)
+                self.catalog,
+                pipe,
+                self.lodging.channels,
+                root,
+                set(self.lodging.pipes),
+                clock=self.clock,
             )
             for name, pipe in self.lodging.pipes.items()
         }
@@ -92,13 +104,13 @@ class AngelusDaemon:
                 len(self.lodging.channels),
             )
             # Log the resolved local TZ at startup. The digest subject and
-            # all rendered timestamps use `datetime.now().astimezone()`,
-            # which reads the system TZ. If the daemon ever runs in a
+            # all rendered timestamps use the clock's local-now (system TZ).
+            # If the daemon ever runs in a
             # container without tzdata or with `Environment=TZ=UTC`, the
             # digest silently shifts a calendar day -- fell-r1 CONSIDER #2
             # for the email-cleanup pass. A startup log line surfaces the
             # misconfig in journalctl without adding a config knob.
-            _local_now = datetime.now().astimezone()
+            _local_now = self.clock.now_local()
             LOGGER.info(
                 "resolved display timezone: %s (current local: %s)",
                 _local_now.tzinfo,
@@ -234,7 +246,7 @@ class AngelusDaemon:
             # cron tick belfry touches a sentinel file; the daemon reads its
             # mtime here. Missing file -> never-pinged shape. Per Section 5b
             # Q2 of brief-20260520-tqov.
-            "belfry": _belfry_status(self.root),
+            "belfry": _belfry_status(self.root, self.clock),
             # dep_health's mandatory reader (slice 5c): every row the
             # dep_record write op upserts is surfaced here so a written dep
             # status is never dead config. Read-only SELECT.
@@ -320,8 +332,8 @@ class AngelusDaemon:
         transaction open. The dep-check cron probe never writes sqlite --
         it sends this op and the daemon (single writer) does the upsert.
 
-        last_check_at is stamped here with utcnow() (the same ISO8601-UTC
-        format helper the rest of the schema uses): the probe sends the
+        last_check_at is stamped here off the injected clock (the same
+        ISO8601-UTC format the rest of the schema uses): the probe sends the
         result the instant its check finishes, so record time is the
         check time, and stamping daemon-side keeps one clock and avoids
         trusting a format from the unprivileged probe process.
@@ -343,7 +355,7 @@ class AngelusDaemon:
             )
         if detail is not None and not isinstance(detail, str):
             raise ValueError("dep_record detail must be a string")
-        self.catalog.record_dep_health(name, status, utcnow(), detail)
+        self.catalog.record_dep_health(name, status, self.clock.now_iso(), detail)
         if status == "unhealthy":
             self.catalog.write_internal_finding(
                 "internal/dep",
@@ -465,6 +477,7 @@ class AngelusDaemon:
                 new_lodging.channels,
                 self.root,
                 new_known,
+                clock=self.clock,
             )
             if new_pipe.cadence == "immediate":
                 self._spawn_pipe_loop(name)
@@ -694,7 +707,7 @@ def _belfry_stale_after_seconds() -> int:
     return seconds
 
 
-def _belfry_status(root: Path) -> dict:
+def _belfry_status(root: Path, clock: Clock | None = None) -> dict:
     """Liveness shape for the health op's belfry field.
 
     Returns {"last_pinged_at": <iso8601-Z>|None, "stale": <bool>}. The
@@ -714,7 +727,7 @@ def _belfry_status(root: Path) -> dict:
         LOGGER.warning("failed to stat belfry sentinel %s: %s", path, exc)
         return {"last_pinged_at": None, "stale": True}
     pinged_at = datetime.fromtimestamp(mtime, tz=UTC)
-    age_sec = (datetime.now(UTC) - pinged_at).total_seconds()
+    age_sec = ((clock or Clock()).now() - pinged_at).total_seconds()
     stale = age_sec > _belfry_stale_after_seconds()
     return {
         "last_pinged_at": pinged_at.isoformat().replace("+00:00", "Z"),
