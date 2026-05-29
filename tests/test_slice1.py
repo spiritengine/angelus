@@ -26,7 +26,10 @@ def test_lodging_loads_cross_references() -> None:
     assert triager.source_ref == "scheduled/web-archive__iotaschool.com"
     assert triager.metadata.get("entity") == "iotaschool.com"
     assert triager.metadata.get("severity") == "medium"
-    assert lodging.pipes["now"].channels == ["email"]
+    # The urgent `now` pipe rides push (notify-pat), not email -- urgent alerts
+    # must not share fate with the routine email digest. See B6 / README's
+    # "Transport separation" note.
+    assert lodging.pipes["now"].channels == ["push"]
     assert lodging.channels["email"].command.endswith("patbot-email")
 
 
