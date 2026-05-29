@@ -8,12 +8,15 @@ count is a simple indexed lookup instead of parsing finding_ids JSON.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from angelus.clock import Clock
+
+LOGGER = logging.getLogger(__name__)
 
 TRUST_RETRY_DELAYS = (
     timedelta(minutes=1),
@@ -727,6 +730,10 @@ class Catalog:
         return False
 
     def mark_channel_unhealthy(self, channel: str, error: str) -> None:
+        # Log only the healthy->unhealthy edge, not every re-affirmation of an
+        # already-unhealthy channel, so the log carries the transition once
+        # rather than once per failed drain (B22).
+        already_unhealthy = self.is_channel_unhealthy(channel)
         self.connection.execute(
             """
             INSERT INTO channel_health (channel, status, last_error, updated_at)
@@ -738,6 +745,10 @@ class Catalog:
             """,
             (channel, error, self._clock.now_iso()),
         )
+        if not already_unhealthy:
+            LOGGER.warning(
+                "channel %s marked unhealthy: %s", channel, error
+            )
 
     def is_channel_unhealthy(self, channel: str) -> bool:
         row = self.connection.execute(
