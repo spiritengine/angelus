@@ -82,8 +82,9 @@ Failed dispatches are edge-triggered off a last-seen-id bookmark
 (`state/belfry-failcheck-at` by default, or `ANGELUS_BELFRY_FAILCHECK_PATH`
 if overridden), so a transient failure pings once; open `internal/*`
 incidents are level-triggered and keep belfry red until they close. The
-check names no specific channel — it reads the schema the daemon already
-writes, so a live-but-not-delivering daemon (the 2026-05-29 silent-email
+check's detection logic names no specific channel — it reads the schema the
+daemon already writes (a channel name appears only as diagnostic detail in the
+alert text), so a live-but-not-delivering daemon (the 2026-05-29 silent-email
 failure mode) no longer reads as green.
 
 Setup:
