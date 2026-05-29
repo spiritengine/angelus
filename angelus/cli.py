@@ -33,6 +33,7 @@ from typing import Any
 
 import click
 
+from angelus.clock import SYSTEM_CLOCK
 from angelus.daemon import main as daemon_main
 from angelus.lodging.config import _load_dependencies
 from angelus.sources import run_dep_check
@@ -470,7 +471,7 @@ def timeline(
     if since is not None and window is not None:
         raise click.BadParameter("pass --since or --window, not both")
 
-    until_dt = _parse_instant(until) if until is not None else datetime.now(UTC)
+    until_dt = _parse_instant(until) if until is not None else SYSTEM_CLOCK.now()
     if since is not None:
         since_dt = _parse_instant(since)
     else:
