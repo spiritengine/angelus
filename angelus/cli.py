@@ -27,6 +27,7 @@ import os
 import socket
 import sqlite3
 import urllib.parse
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -46,6 +47,11 @@ _ROOT_OPTION = click.option(
 )
 
 _SOCKET_TIMEOUT = 5.0
+
+# Window duration units for `timeline --window`, mirroring the mute-duration
+# parser in daemon.py: a unit suffix is required so a bare integer can never
+# silently mean "some unit".
+_WINDOW_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 
 # Cap the response we will buffer from the daemon. The daemon caps inbound
 # requests at control.MAX_REQUEST_BYTES; this is the symmetric client-side
@@ -380,6 +386,146 @@ def dep_check(name: str, root: Path) -> None:
         "dep-check",
     )
     click.echo(f"{result['name']}: {result['status']} ({detail})")
+
+
+def _format_instant(value: datetime) -> str:
+    """Render a datetime in the same '...Z' millisecond format the storage
+    layer writes, so window bounds compare lexicographically against the
+    stored timestamps."""
+    return value.astimezone(UTC).isoformat(timespec="milliseconds").replace(
+        "+00:00", "Z"
+    )
+
+
+def _parse_window_seconds(window: str) -> int:
+    """Parse a window like '90s', '30m', '24h', '2d' into seconds.
+
+    A unit suffix (s/m/h/d) is required and the magnitude must be positive,
+    matching the mute-duration footgun guard: `--window 24` is rejected so it
+    cannot silently mean 24 of some unit."""
+    text = window.strip().lower()
+    for suffix, scale in _WINDOW_UNITS.items():
+        if text.endswith(suffix) and len(text) > len(suffix):
+            magnitude_text = text[: -len(suffix)].strip()
+            try:
+                magnitude = int(magnitude_text)
+            except ValueError:
+                raise click.BadParameter(
+                    f"invalid window {window!r}: expected <int><unit> (s, m, h, d)"
+                ) from None
+            if magnitude <= 0:
+                raise click.BadParameter(
+                    f"invalid window {window!r}: must be positive"
+                )
+            return magnitude * scale
+    raise click.BadParameter(
+        f"invalid window {window!r}: expected a unit suffix (s, m, h, d), "
+        "e.g. '24h'"
+    )
+
+
+def _parse_instant(value: str) -> datetime:
+    """Parse a user-supplied --since/--until bound into a UTC datetime.
+
+    Accepts a bare date ('2026-05-29'), a date+time, or a full ISO timestamp
+    with or without a trailing 'Z'. A value with no timezone is assumed UTC."""
+    text = value.strip()
+    normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        raise click.BadParameter(
+            f"invalid timestamp {value!r}: expected a date (2026-05-29) or "
+            "ISO timestamp (2026-05-29T12:00:00Z)"
+        ) from None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed
+
+
+@main.command()
+@click.option("--since", default=None, help="Window start (date or ISO timestamp).")
+@click.option("--until", default=None, help="Window end (date or ISO timestamp).")
+@click.option(
+    "--window",
+    default=None,
+    help="Look back this far from --until/now (e.g. 24h, 2d). "
+    "Mutually exclusive with --since.",
+)
+@_ROOT_OPTION
+def timeline(
+    since: str | None, until: str | None, window: str | None, root: Path
+) -> None:
+    """Reconstruct the ordered story for a time window.
+
+    Interleaves source fires, observations, findings, and dispatches
+    (including failures) by timestamp, one event per line, for fast
+    postmortems. Reads sqlite read-only; the daemon does not need to be
+    running.
+
+    The window is [since, until]. --until defaults to now. The start is
+    --since if given, else --until minus --window, else 24h before --until.
+    """
+    root = root.resolve()
+    if since is not None and window is not None:
+        raise click.BadParameter("pass --since or --window, not both")
+
+    until_dt = _parse_instant(until) if until is not None else datetime.now(UTC)
+    if since is not None:
+        since_dt = _parse_instant(since)
+    else:
+        seconds = _parse_window_seconds(window) if window is not None else 86400
+        since_dt = until_dt - timedelta(seconds=seconds)
+    if since_dt > until_dt:
+        raise click.BadParameter("--since is after --until")
+
+    since_str = _format_instant(since_dt)
+    until_str = _format_instant(until_dt)
+
+    connection = _ro_connect(root / "state" / "angelus.sqlite3")
+    if connection is None:
+        click.echo("sqlite: unavailable")
+        raise SystemExit(1)
+    try:
+        catalog = Catalog(connection, root)
+        events = catalog.timeline_events(since_str, until_str)
+    finally:
+        connection.close()
+    _render_timeline(since_str, until_str, events)
+
+
+def _render_timeline(
+    since: str, until: str, events: list[dict[str, Any]]
+) -> None:
+    """Plain text, one event per line; screen-reader friendly (no tables,
+    no columns). Each line is '<timestamp> <kind> <details>'."""
+    click.echo(f"timeline from {since} to {until}")
+    click.echo(f"events: {len(events)}")
+    if not events:
+        click.echo("  none")
+        return
+    for event in events:
+        click.echo(_format_timeline_event(event))
+
+
+def _format_timeline_event(event: dict[str, Any]) -> str:
+    ts = event["ts"]
+    kind = event["kind"]
+    if kind == "fire":
+        return f"{ts} fire {event['source']} {event['outcome']}"
+    if kind == "observation":
+        return f"{ts} observation {event['source']} ({event['status']})"
+    if kind == "finding":
+        severity = event.get("severity") or "none"
+        return (
+            f"{ts} finding {event['source']} {event['type']} "
+            f"{event['entity']} (severity {severity})"
+        )
+    # dispatch
+    line = f"{ts} dispatch {event['pipe']}/{event['channel']} {event['status']}"
+    if event.get("error"):
+        line += f": {event['error']}"
+    return line
 
 
 def _render_health(result: dict[str, Any]) -> None:
