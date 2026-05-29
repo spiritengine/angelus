@@ -19,6 +19,8 @@ from pathlib import Path
 
 DEFAULT_WEDGE_THRESHOLD_SEC = 600
 DEFAULT_SENTINEL_FILENAME = "belfry-pinged-at"
+DEFAULT_FAILCHECK_FILENAME = "belfry-failcheck-at"
+FAILURE_DETAIL_LIMIT = 3
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -38,11 +40,29 @@ def main(argv: list[str] | None = None) -> int:
     # untouched here).
     touch_sentinel(sentinel_path(state))
 
+    # The checks below answer three distinct questions about angelus, in
+    # descending order of "can we even read the rest": is the process
+    # alive (pid), is it firing sources (wedge), and is it self-reporting
+    # delivery failures (failure-surface). A dead process short-circuits
+    # the latter two -- with no daemon, a stale sqlite tells us nothing
+    # useful and would only manufacture confusing reasons. Otherwise we
+    # gather every reason so a single DOWN ping names all of them.
     dead_reason = pid_failure(state / "angelus.pid")
-    wedge_reason = None if dead_reason else wedge_failure(state / "angelus.sqlite3")
+    if dead_reason:
+        reasons = [dead_reason]
+    else:
+        reasons = []
+        wedge_reason = wedge_failure(state / "angelus.sqlite3")
+        if wedge_reason:
+            reasons.append(wedge_reason)
+        failure_reason = failure_surface(
+            state / "angelus.sqlite3", failcheck_path(state)
+        )
+        if failure_reason:
+            reasons.append(failure_reason)
 
-    if dead_reason or wedge_reason:
-        reason = dead_reason or wedge_reason
+    if reasons:
+        reason = "; ".join(reasons)
         ok = ping_env("ANGELUS_BELFRY_DOWN_URL")
         ok = notify(reason) and ok
         print(f"angelus belfry: DOWN: {reason}", file=sys.stderr)
@@ -86,6 +106,153 @@ def touch_sentinel(path: Path) -> None:
             f"angelus belfry: failed to touch sentinel {path}: {exc}",
             file=sys.stderr,
         )
+
+
+def failcheck_path(state_dir: Path) -> Path:
+    """Resolve the belfry failure-surface watermark path.
+
+    ANGELUS_BELFRY_FAILCHECK_PATH overrides; default is
+    <state_dir>/belfry-failcheck-at. This is a sibling of the liveness
+    sentinel and follows the same single-file, belfry-owned state pattern
+    -- belfry never writes the sqlite (the daemon's single-writer
+    invariant), so its "what did I already see" bookmark lives outside the
+    database.
+    """
+    override = os.environ.get("ANGELUS_BELFRY_FAILCHECK_PATH")
+    if override:
+        return Path(override)
+    return state_dir / DEFAULT_FAILCHECK_FILENAME
+
+
+def read_failcheck_watermark(path: Path) -> int | None:
+    """Read the last-seen dispatch id from the watermark file.
+
+    Returns None when the file is missing or unparseable -- both mean
+    "no trustworthy bookmark," which the caller treats as a first run
+    (establish the watermark, do NOT replay history).
+    """
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        print(
+            f"angelus belfry: failed to read failcheck watermark {path}: {exc}",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        print(
+            f"angelus belfry: invalid failcheck watermark {raw!r}; treating as first run",
+            file=sys.stderr,
+        )
+        return None
+
+
+def write_failcheck_watermark(path: Path, dispatch_id: int) -> None:
+    """Persist the highest dispatch id seen this tick.
+
+    Failures are logged and swallowed: a watermark that fails to advance
+    only means the next tick re-reports the same already-pinged failures
+    (noisy, not wrong), so a transient write error must not stop belfry
+    from issuing its pings on this tick.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(dispatch_id), encoding="utf-8")
+    except OSError as exc:
+        print(
+            f"angelus belfry: failed to write failcheck watermark {path}: {exc}",
+            file=sys.stderr,
+        )
+
+
+def failure_surface(db_path: Path, state_path: Path) -> str | None:
+    """Surface angelus's OWN self-reported failures, generically.
+
+    Two signals, read straight from the schema the daemon already writes,
+    with no mention of any specific channel or transport:
+      - dispatches.status='failed' rows recorded since the last belfry
+        tick (EDGE-triggered via a last-seen dispatch-id watermark, so a
+        transient failure pings DOWN once and is not re-alerted forever);
+      - open internal/* incidents -- the daemon's self-reported failures,
+        whose source begins 'internal/' (LEVEL-triggered on current
+        state, so belfry stays red every tick until the incident closes).
+
+    Returns a human-readable reason if anything is surfaced, else None.
+
+    Fails open: any sqlite/OS error is logged and swallowed (returns
+    None). The pid/wedge checks remain the liveness backstop; an
+    unreadable or schema-incomplete database must never manufacture a
+    false DOWN here.
+    """
+    last_seen = read_failcheck_watermark(state_path)
+    quoted = urllib.parse.quote(str(db_path), safe="/:")
+    uri = f"file:{quoted}?mode=ro"
+    try:
+        connection = sqlite3.connect(uri, uri=True)
+    except sqlite3.Error as exc:
+        print(
+            f"angelus belfry: failure-surface cannot open {db_path}: {exc}",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        max_id = int(
+            connection.execute(
+                "SELECT COALESCE(max(id), 0) FROM dispatches"
+            ).fetchone()[0]
+        )
+        failed_rows: list[tuple] = []
+        if last_seen is not None:
+            failed_rows = connection.execute(
+                "SELECT id, pipe, channel, last_error FROM dispatches "
+                "WHERE status = 'failed' AND id > ? ORDER BY id",
+                (last_seen,),
+            ).fetchall()
+        internal_rows = connection.execute(
+            "SELECT source FROM incidents "
+            "WHERE status = 'open' AND source LIKE 'internal/%' "
+            "ORDER BY opened_at, id"
+        ).fetchall()
+    except sqlite3.Error as exc:
+        print(
+            f"angelus belfry: failure-surface query failed: {exc}",
+            file=sys.stderr,
+        )
+        return None
+    finally:
+        connection.close()
+
+    # Advance the watermark to the highest id observed even when we are
+    # about to report DOWN: those failed dispatches have now been seen, so
+    # the next tick reports only newer ones (edge-trigger). Open internal
+    # incidents are intentionally NOT bookmarked -- they re-fire each tick
+    # until closed.
+    write_failcheck_watermark(state_path, max_id)
+
+    reasons: list[str] = []
+    if failed_rows:
+        details = []
+        for _id, pipe, channel, last_error in failed_rows[:FAILURE_DETAIL_LIMIT]:
+            detail = f"{pipe}/{channel}"
+            if last_error:
+                detail += f": {last_error}"
+            details.append(detail)
+        msg = f"{len(failed_rows)} failed dispatch(es) since last tick"
+        if details:
+            msg += f" ({'; '.join(details)})"
+        reasons.append(msg)
+    if internal_rows:
+        sources = sorted({row[0] for row in internal_rows})
+        reasons.append(
+            f"{len(internal_rows)} open internal finding(s) [{', '.join(sources)}]"
+        )
+    if reasons:
+        return "; ".join(reasons)
+    return None
 
 
 def pid_failure(pid_file: Path) -> str | None:

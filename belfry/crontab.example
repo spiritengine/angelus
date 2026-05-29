@@ -17,5 +17,10 @@
 # so a routine quiet stretch isn't read as wedged (e.g. 18000 = 5h for
 # a deployment whose slowest source fires every 4h).
 # ANGELUS_BELFRY_WEDGE_THRESHOLD_SEC=18000
+#
+# Optional: ANGELUS_BELFRY_FAILCHECK_PATH overrides where belfry stores its
+# last-seen dispatch-id bookmark for the failure-surface check (default
+# state/belfry-failcheck-at). Leave unset unless state/ is not writable.
+# ANGELUS_BELFRY_FAILCHECK_PATH=/var/lib/angelus/belfry-failcheck-at
 
 */5 * * * * cd /path/to/angelus && /usr/bin/env python belfry/belfry.py >> state/belfry.log 2>&1
