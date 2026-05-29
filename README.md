@@ -57,6 +57,44 @@ angelus daemon
 Set `ANGELUS_DRY_RUN=1` to write push payloads to `dispatches.log` instead of
 calling `notify-pat`.
 
+## Configuration
+
+Non-secret runtime config lives in one place: `state/angelus.env`. This is the
+single source of truth so the daemon and the belfry can't drift apart — the
+2026-05-29 incident was exactly that drift, when the daemon was relaunched
+outside systemd and silently lost `ANGELUS_EMAIL_TO`.
+
+Copy the checked-in template and fill it in:
+
+```sh
+cp state/angelus.env.example state/angelus.env
+```
+
+`state/angelus.env` is gitignored; `state/angelus.env.example` is the tracked
+template. It holds **non-secrets only** — recipient address, healthcheck URLs,
+and the belfry thresholds:
+
+- `ANGELUS_EMAIL_TO` — recipient for the email channel and belfry's notify.
+- `ANGELUS_BELFRY_SUCCESS_URL`, `ANGELUS_BELFRY_DOWN_URL` — healthchecks.io pings.
+- `ANGELUS_BELFRY_WEDGE_THRESHOLD_SEC` (default 600), `ANGELUS_BELFRY_STALE_AFTER_SEC`
+  (default 1200), `ANGELUS_BELFRY_NOTIFY_COMMAND`, and the sentinel/failcheck
+  path overrides — see the template for all knobs and defaults.
+
+The SMTP password is a real secret and does **not** belong here (that move is
+tracked separately as B20).
+
+The file is loaded the same way no matter how a process starts:
+
+- **systemd** — `deploy/angelus.service` carries `EnvironmentFile=-…/state/angelus.env`.
+- **cron** — the entry in `belfry/crontab.example` sources it before running belfry.
+- **in code** — the daemon (`angelus daemon`) and `belfry/belfry.py` both load it
+  at startup, so a hand-launch outside systemd still inherits the config.
+
+**Precedence: an explicitly-set environment variable always wins over the file.**
+Nothing in the file overwrites a name already present in the environment (a
+systemd `Environment=` line, a var exported in the shell or crontab, etc.). The
+file only fills in names that are unset.
+
 ## Reliability
 
 ### Transport separation
