@@ -27,5 +27,30 @@
 # running belfry. belfry.py also loads the same file in code, so the source
 # step here is mainly to put PATH in place for `/usr/bin/env python`.
 # The leading '[ -f ... ]' keeps a missing file from aborting the tick.
+#
+# The entry also exports XDG_RUNTIME_DIR so belfry's drift check can reach
+# the systemd --user bus from cron (a stock crontab sets neither
+# XDG_RUNTIME_DIR nor DBUS_SESSION_BUS_ADDRESS, without which
+# `systemctl --user` can't connect and the drift check fails open to a
+# silent no-op). belfry.py also injects this in code as a fallback. $(id -u)
+# avoids hardcoding the uid.
+#
+# Optional: ANGELUS_BELFRY_FAILCHECK_PATH overrides where belfry stores its
+# last-seen dispatch-id bookmark for the failure-surface check (default
+# state/belfry-failcheck-at). Leave unset unless state/ is not writable.
+# ANGELUS_BELFRY_FAILCHECK_PATH=/var/lib/angelus/belfry-failcheck-at
+#
+# Optional: ANGELUS_SYSTEMD_UNIT names the systemd --user unit belfry's
+# drift check asserts the live daemon belongs to (default 'angelus'). On
+# each tick belfry compares state/angelus.pid to
+# `systemctl --user show -p MainPID --value <unit>`; a mismatch, or the
+# unit being inactive while a daemon pid is alive, pings DOWN (someone ran
+# the daemon by hand, off-unit -- the 2026-05-29 failure mode). If
+# systemctl is unavailable the check fails open (no false DOWN).
+# ANGELUS_SYSTEMD_UNIT=angelus
+#
+# Every line belfry writes to state/belfry.log is prefixed with an ISO8601
+# UTC timestamp (e.g. 2026-05-29T14:03:00Z), so the log below can be placed
+# on an incident timeline.
 
-*/5 * * * * cd /path/to/angelus && { set -a; [ -f state/angelus.env ] && . state/angelus.env; set +a; }; /usr/bin/env python belfry/belfry.py >> state/belfry.log 2>&1
+*/5 * * * * cd /path/to/angelus && { set -a; [ -f state/angelus.env ] && . state/angelus.env; set +a; }; export XDG_RUNTIME_DIR="/run/user/$(id -u)"; /usr/bin/env python belfry/belfry.py >> state/belfry.log 2>&1
