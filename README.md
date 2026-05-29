@@ -59,6 +59,16 @@ calling `notify-pat`.
 
 ## Reliability
 
+### Transport separation
+
+Urgent and routine alerts ride different transports, so a dead transport can't
+swallow the alerts that matter most. The routine digest pipe (`daily`) uses
+email; the urgent/immediate pipe (`now`) and any escalation path use push
+(`notify-pat`). Don't point the `now` pipe — or any future escalation pipe — at
+the same channel as the digest. The 2026-05-29 incident was exactly this failure
+mode: email silently broke and the alerts that would have surfaced it were also
+riding email.
+
 The belfry is the external reliability layer. It runs outside the daemon from
 raw cron, checks `state/angelus.pid`, reads `source_fires` from
 `state/angelus.sqlite3` in read-only mode, pings healthchecks.io, and calls
