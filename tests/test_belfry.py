@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import signal
 import sqlite3
 import subprocess
@@ -239,6 +240,7 @@ def test_wedge_path_hits_down_and_escalates(tmp_path, monkeypatch) -> None:
         lambda args, check: calls.append(args)
         or subprocess.CompletedProcess(args, 0),
     )
+    monkeypatch.setattr(belfry, "systemd_main_pid", lambda: None)
 
     assert belfry.main([str(tmp_path)]) == 1
     assert pings == ["https://hc.example/down"]
@@ -266,6 +268,7 @@ def test_happy_path_hits_success_without_escalation(tmp_path, monkeypatch) -> No
         lambda args, check: calls.append(args)
         or subprocess.CompletedProcess(args, 0),
     )
+    monkeypatch.setattr(belfry, "systemd_main_pid", lambda: None)
 
     assert belfry.main([str(tmp_path)]) == 0
     assert pings == ["https://hc.example/success"]
@@ -552,6 +555,9 @@ def test_sentinel_touched_on_success_tick(tmp_path, monkeypatch) -> None:
         "run",
         lambda args, check: subprocess.CompletedProcess(args, 0),
     )
+    # Drift axis off the table for the sentinel/wedge/happy paths -- these
+    # tests isolate other axes; B17 drift has dedicated coverage below.
+    monkeypatch.setattr(belfry, "systemd_main_pid", lambda: None)
 
     sentinel = tmp_path / "state" / "belfry-pinged-at"
     assert not sentinel.exists()
@@ -589,6 +595,9 @@ def test_sentinel_touched_on_failure_tick(tmp_path, monkeypatch) -> None:
         "run",
         lambda args, check: subprocess.CompletedProcess(args, 0),
     )
+    # Drift axis off the table for the sentinel/wedge/happy paths -- these
+    # tests isolate other axes; B17 drift has dedicated coverage below.
+    monkeypatch.setattr(belfry, "systemd_main_pid", lambda: None)
 
     sentinel = tmp_path / "state" / "belfry-pinged-at"
     before = time.time()
@@ -627,6 +636,9 @@ def test_sentinel_touch_updates_existing_mtime(tmp_path, monkeypatch) -> None:
         "run",
         lambda args, check: subprocess.CompletedProcess(args, 0),
     )
+    # Drift axis off the table for the sentinel/wedge/happy paths -- these
+    # tests isolate other axes; B17 drift has dedicated coverage below.
+    monkeypatch.setattr(belfry, "systemd_main_pid", lambda: None)
 
     sentinel = tmp_path / "state" / "belfry-pinged-at"
     # Pre-create with an mtime well in the past so the after-tick mtime
@@ -669,6 +681,9 @@ def test_sentinel_path_override_honored(tmp_path, monkeypatch) -> None:
         "run",
         lambda args, check: subprocess.CompletedProcess(args, 0),
     )
+    # Drift axis off the table for the sentinel/wedge/happy paths -- these
+    # tests isolate other axes; B17 drift has dedicated coverage below.
+    monkeypatch.setattr(belfry, "systemd_main_pid", lambda: None)
 
     assert belfry.main([str(tmp_path)]) == 0
     assert override.exists(), "override path was not touched"
@@ -708,6 +723,9 @@ def test_sentinel_touch_swallows_oserror(tmp_path, monkeypatch, capsys) -> None:
         "run",
         lambda args, check: subprocess.CompletedProcess(args, 0),
     )
+    # Drift axis off the table for the sentinel/wedge/happy paths -- these
+    # tests isolate other axes; B17 drift has dedicated coverage below.
+    monkeypatch.setattr(belfry, "systemd_main_pid", lambda: None)
 
     rc = belfry.main([str(tmp_path)])
     assert rc == 0
@@ -752,6 +770,10 @@ def _record_mocks(belfry, monkeypatch):
         lambda args, check: calls.append(args)
         or subprocess.CompletedProcess(args, 0),
     )
+    # Take the B17 drift axis off the table: these tests isolate the
+    # failure-surface axis, so fail the drift check open (None = "cannot
+    # determine, no drift"). The drift axis has its own dedicated tests.
+    monkeypatch.setattr(belfry, "systemd_main_pid", lambda: None)
     return pings, calls
 
 
@@ -895,3 +917,274 @@ def test_failure_surface_fails_open_on_missing_tables(tmp_path, monkeypatch) -> 
     assert belfry.main([str(tmp_path)]) == 0
     assert pings == ["https://hc.example/success"]
     assert calls == []
+
+
+# --- B17 slice: drift detector -------------------------------------------
+#
+# A daemon can be alive (pid healthy, sources firing, no failed dispatches)
+# and STILL be the wrong instance: hand-launched outside its systemd unit,
+# detached from EnvironmentFile and Restart supervision. That is the exact
+# 2026-05-29 incident -- the process looked alive while running off-unit and
+# silently lost ANGELUS_EMAIL_TO. belfry is the out-of-band place to assert
+# "the live daemon IS the systemd-managed instance." systemd_main_pid() is
+# the seam: the tests below drive it (and the real subprocess plumbing) so
+# the check never depends on whatever unit happens to run on the test host.
+
+
+def _alive_for_drift(root: Path) -> None:
+    """Daemon state that pid_failure and wedge_failure both call healthy:
+    a live PID (this test process) and a fresh source_fire. Leaves the
+    failure-surface tables absent so that axis fails open -- the drift axis
+    is the only thing the stubbed systemd_main_pid can move."""
+    (root / "state").mkdir(exist_ok=True)
+    (root / "state" / "angelus.pid").write_text(
+        str(os.getpid()), encoding="utf-8"
+    )
+    _write_source_fire(root, datetime.now(UTC))
+
+
+def test_drift_pids_match_no_drift(tmp_path, monkeypatch) -> None:
+    """When systemd's MainPID equals the live daemon pid, the daemon IS the
+    managed instance: no drift, belfry pings SUCCESS."""
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    _alive_for_drift(tmp_path)
+    pings, calls = _record_mocks(belfry, monkeypatch)
+    # Override the _record_mocks fail-open default: systemd reports the same
+    # pid the pid file holds.
+    monkeypatch.setattr(belfry, "systemd_main_pid", lambda: os.getpid())
+
+    assert belfry.main([str(tmp_path)]) == 0
+    assert pings == ["https://hc.example/success"]
+    assert calls == []
+
+
+def test_drift_pids_differ_pings_down(tmp_path, monkeypatch) -> None:
+    """A live daemon whose pid does not match systemd's MainPID is an
+    instance running outside its unit -> DOWN, reason names the drift and
+    both pids."""
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    _alive_for_drift(tmp_path)
+    pings, calls = _record_mocks(belfry, monkeypatch)
+    other_pid = os.getpid() + 1
+    monkeypatch.setattr(belfry, "systemd_main_pid", lambda: other_pid)
+
+    assert belfry.main([str(tmp_path)]) == 1
+    assert pings[-1] == "https://hc.example/down"
+    payload = " ".join(calls[-1])
+    assert "drift" in payload
+    assert str(os.getpid()) in payload
+    assert str(other_pid) in payload
+
+
+def test_drift_unit_inactive_with_live_pid_pings_down(
+    tmp_path, monkeypatch
+) -> None:
+    """systemd reports MainPID 0 (unit inactive) while a daemon pid is alive
+    -> a daemon is running with no supervising unit at all -> DOWN."""
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    _alive_for_drift(tmp_path)
+    pings, calls = _record_mocks(belfry, monkeypatch)
+    monkeypatch.setattr(belfry, "systemd_main_pid", lambda: 0)
+
+    assert belfry.main([str(tmp_path)]) == 1
+    assert pings[-1] == "https://hc.example/down"
+    payload = " ".join(calls[-1])
+    assert "drift" in payload
+    assert "inactive" in payload
+
+
+def test_drift_fails_open_when_systemctl_unavailable(
+    tmp_path, monkeypatch
+) -> None:
+    """If systemd's MainPID cannot be determined (systemd_main_pid -> None),
+    belfry must not manufacture a false DOWN -- it pings SUCCESS. This is the
+    documented fail-open contract for an uninterrogatable systemd."""
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    _alive_for_drift(tmp_path)
+    pings, calls = _record_mocks(belfry, monkeypatch)
+    monkeypatch.setattr(belfry, "systemd_main_pid", lambda: None)
+
+    assert belfry.main([str(tmp_path)]) == 0
+    assert pings == ["https://hc.example/success"]
+    assert calls == []
+
+
+def test_drift_failure_missing_pid_file_returns_none(tmp_path) -> None:
+    """drift_failure with no pid file returns None -- pid_failure owns the
+    missing/dead-pid case, so drift has nothing to compare and fails open."""
+    belfry = _load_belfry()
+    assert belfry.drift_failure(tmp_path / "state" / "angelus.pid") is None
+
+
+def test_systemd_main_pid_parses_value(monkeypatch) -> None:
+    """systemd_main_pid shells out to systemctl and returns the integer
+    MainPID on a clean exit."""
+    belfry = _load_belfry()
+    captured: list[list[str]] = []
+
+    def fake_run(args, check, capture_output, text, timeout):
+        captured.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout="12345\n", stderr="")
+
+    monkeypatch.setattr(belfry.subprocess, "run", fake_run)
+    assert belfry.systemd_main_pid() == 12345
+    # The invocation is the dependency-free systemctl --user query.
+    assert captured[0][:5] == [
+        "systemctl",
+        "--user",
+        "show",
+        "-p",
+        "MainPID",
+    ]
+    assert captured[0][-1] == "angelus"
+
+
+def test_systemd_main_pid_unit_override(monkeypatch) -> None:
+    """ANGELUS_SYSTEMD_UNIT names the unit belfry interrogates."""
+    belfry = _load_belfry()
+    monkeypatch.setenv("ANGELUS_SYSTEMD_UNIT", "angelus-staging")
+    captured: list[list[str]] = []
+
+    def fake_run(args, check, capture_output, text, timeout):
+        captured.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout="7\n", stderr="")
+
+    monkeypatch.setattr(belfry.subprocess, "run", fake_run)
+    assert belfry.systemd_main_pid() == 7
+    assert captured[0][-1] == "angelus-staging"
+
+
+def test_systemd_main_pid_fails_open_when_systemctl_missing(
+    monkeypatch, capsys
+) -> None:
+    """No systemctl binary (FileNotFoundError) -> None (fail open), logged."""
+    belfry = _load_belfry()
+
+    def boom(args, check, capture_output, text, timeout):
+        raise FileNotFoundError("systemctl")
+
+    monkeypatch.setattr(belfry.subprocess, "run", boom)
+    assert belfry.systemd_main_pid() is None
+    assert "drift check cannot run systemctl" in capsys.readouterr().err
+
+
+def test_systemd_main_pid_fails_open_on_nonzero_exit(monkeypatch) -> None:
+    """A non-zero systemctl exit (no user bus, unknown unit) -> None."""
+    belfry = _load_belfry()
+
+    def fake_run(args, check, capture_output, text, timeout):
+        return subprocess.CompletedProcess(
+            args, 1, stdout="", stderr="Failed to connect to bus"
+        )
+
+    monkeypatch.setattr(belfry.subprocess, "run", fake_run)
+    assert belfry.systemd_main_pid() is None
+
+
+def test_systemd_main_pid_fails_open_on_unparseable(monkeypatch) -> None:
+    """Unparseable MainPID output -> None (fail open), never a crash."""
+    belfry = _load_belfry()
+
+    def fake_run(args, check, capture_output, text, timeout):
+        return subprocess.CompletedProcess(
+            args, 0, stdout="not-a-number\n", stderr=""
+        )
+
+    monkeypatch.setattr(belfry.subprocess, "run", fake_run)
+    assert belfry.systemd_main_pid() is None
+
+
+def test_systemd_main_pid_fails_open_on_timeout(monkeypatch) -> None:
+    """A systemctl timeout -> None (fail open)."""
+    belfry = _load_belfry()
+
+    def boom(args, check, capture_output, text, timeout):
+        raise subprocess.TimeoutExpired(cmd=args, timeout=timeout)
+
+    monkeypatch.setattr(belfry.subprocess, "run", boom)
+    assert belfry.systemd_main_pid() is None
+
+
+# --- B22 slice: belfry log lines are timestamped -------------------------
+#
+# Every line belfry writes to belfry.log (stdout/stderr under the cron
+# redirect) is prefixed with an ISO8601 UTC timestamp via plain strftime
+# (belfry stays dependency-free -- no angelus clock seam). Before B22 a
+# belfry.log line had no time anchor, so a postmortem could not place a
+# ping in the incident timeline.
+
+
+_TS_LINE = re.compile(r"^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z) (?P<msg>.+)$")
+
+
+def _assert_all_lines_timestamped(text: str) -> int:
+    """Assert every non-blank line starts with a parseable ISO8601 UTC
+    stamp followed by a non-empty message. Returns the line count so the
+    caller can assert lines were actually emitted."""
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    for line in lines:
+        match = _TS_LINE.match(line)
+        assert match, f"log line not timestamped: {line!r}"
+        # The stamp is a real timestamp, not just digits in the right shape.
+        datetime.strptime(match.group("ts"), "%Y-%m-%dT%H:%M:%SZ")
+        assert match.group("msg").strip(), f"empty message after stamp: {line!r}"
+    return len(lines)
+
+
+def test_log_lines_timestamped_on_down_tick(tmp_path, monkeypatch, capsys) -> None:
+    """A DOWN tick emits the ping line and the 'DOWN: <reason>' line, both
+    timestamped. Dead-PID is the simplest DOWN trigger."""
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "angelus.pid").write_text("999999", encoding="utf-8")
+    monkeypatch.setattr(
+        belfry.urllib.request,
+        "urlopen",
+        lambda url, timeout: _Response(),
+    )
+    monkeypatch.setattr(
+        belfry.subprocess,
+        "run",
+        lambda args, check: subprocess.CompletedProcess(args, 0),
+    )
+
+    assert belfry.main([str(tmp_path)]) == 1
+    captured = capsys.readouterr()
+    combined = captured.out + "\n" + captured.err
+    count = _assert_all_lines_timestamped(combined)
+    assert count >= 1
+    # The reason line is present and carries the dead-PID detail after its
+    # timestamp -- proving the prefix did not eat the message.
+    assert "angelus belfry: DOWN: dead: PID 999999" in captured.err
+
+
+def test_log_lines_timestamped_on_success_tick(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """A clean tick's stdout (the 'ok' and ping lines) is timestamped too --
+    not only the failure path."""
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    _alive_for_drift(tmp_path)
+    monkeypatch.setattr(
+        belfry.urllib.request,
+        "urlopen",
+        lambda url, timeout: _Response(),
+    )
+    monkeypatch.setattr(
+        belfry.subprocess,
+        "run",
+        lambda args, check: subprocess.CompletedProcess(args, 0),
+    )
+    monkeypatch.setattr(belfry, "systemd_main_pid", lambda: None)
+
+    assert belfry.main([str(tmp_path)]) == 0
+    captured = capsys.readouterr()
+    count = _assert_all_lines_timestamped(captured.out)
+    assert count >= 1
+    assert "angelus belfry: ok" in captured.out

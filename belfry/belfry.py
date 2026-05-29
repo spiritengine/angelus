@@ -22,6 +22,28 @@ DEFAULT_SENTINEL_FILENAME = "belfry-pinged-at"
 DEFAULT_FAILCHECK_FILENAME = "belfry-failcheck-at"
 DEFAULT_ENV_FILENAME = "angelus.env"
 FAILURE_DETAIL_LIMIT = 3
+DEFAULT_SYSTEMD_UNIT = "angelus"
+SYSTEMCTL_TIMEOUT_SEC = 10
+
+
+def _now_iso() -> str:
+    """ISO8601 UTC timestamp for log-line prefixes.
+
+    Plain strftime keeps belfry dependency-free (no angelus clock seam, no
+    third-party libs). Wall-clock is correct here: these are operator-facing
+    log lines, not values fed back into angelus' time logic.
+    """
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def log_out(message: str) -> None:
+    """Write one timestamped line to stdout (belfry.log via cron redirect)."""
+    print(f"{_now_iso()} {message}")
+
+
+def log_err(message: str) -> None:
+    """Write one timestamped line to stderr (belfry.log via cron redirect)."""
+    print(f"{_now_iso()} {message}", file=sys.stderr)
 
 
 def load_env_file(state: Path) -> dict[str, str]:
@@ -81,13 +103,15 @@ def main(argv: list[str] | None = None) -> int:
     # untouched here).
     touch_sentinel(sentinel_path(state))
 
-    # The checks below answer three distinct questions about angelus, in
+    # The checks below answer four distinct questions about angelus, in
     # descending order of "can we even read the rest": is the process
-    # alive (pid), is it firing sources (wedge), and is it self-reporting
-    # delivery failures (failure-surface). A dead process short-circuits
-    # the latter two -- with no daemon, a stale sqlite tells us nothing
-    # useful and would only manufacture confusing reasons. Otherwise we
-    # gather every reason so a single DOWN ping names all of them.
+    # alive (pid), is it firing sources (wedge), is it self-reporting
+    # delivery failures (failure-surface), and is the live daemon actually
+    # the systemd-managed instance (drift). A dead process short-circuits
+    # the latter three -- with no daemon, a stale sqlite tells us nothing
+    # useful and would only manufacture confusing reasons, and there is no
+    # live pid to compare against systemd. Otherwise we gather every reason
+    # so a single DOWN ping names all of them.
     dead_reason = pid_failure(state / "angelus.pid")
     if dead_reason:
         reasons = [dead_reason]
@@ -101,16 +125,23 @@ def main(argv: list[str] | None = None) -> int:
         )
         if failure_reason:
             reasons.append(failure_reason)
+        # Drift: a daemon is alive (we are in this branch), but is it the
+        # systemd-managed instance? A hand-launched daemon outside its unit
+        # is the exact 2026-05-29 failure mode -- the process looked alive
+        # to pid/wedge while running detached from systemd and its env.
+        drift_reason = drift_failure(state / "angelus.pid")
+        if drift_reason:
+            reasons.append(drift_reason)
 
     if reasons:
         reason = "; ".join(reasons)
         ok = ping_env("ANGELUS_BELFRY_DOWN_URL")
         ok = notify(reason) and ok
-        print(f"angelus belfry: DOWN: {reason}", file=sys.stderr)
+        log_err(f"angelus belfry: DOWN: {reason}")
         return 1 if ok else 2
 
     ok = ping_env("ANGELUS_BELFRY_SUCCESS_URL")
-    print("angelus belfry: ok")
+    log_out("angelus belfry: ok")
     return 0 if ok else 2
 
 
@@ -143,10 +174,7 @@ def touch_sentinel(path: Path) -> None:
         now = time.time()
         os.utime(path, (now, now))
     except OSError as exc:
-        print(
-            f"angelus belfry: failed to touch sentinel {path}: {exc}",
-            file=sys.stderr,
-        )
+        log_err(f"angelus belfry: failed to touch sentinel {path}: {exc}")
 
 
 def failcheck_path(state_dir: Path) -> Path:
@@ -177,17 +205,16 @@ def read_failcheck_watermark(path: Path) -> int | None:
     except FileNotFoundError:
         return None
     except OSError as exc:
-        print(
-            f"angelus belfry: failed to read failcheck watermark {path}: {exc}",
-            file=sys.stderr,
+        log_err(
+            f"angelus belfry: failed to read failcheck watermark {path}: {exc}"
         )
         return None
     try:
         return int(raw)
     except ValueError:
-        print(
-            f"angelus belfry: invalid failcheck watermark {raw!r}; treating as first run",
-            file=sys.stderr,
+        log_err(
+            f"angelus belfry: invalid failcheck watermark {raw!r}; "
+            f"treating as first run"
         )
         return None
 
@@ -204,9 +231,8 @@ def write_failcheck_watermark(path: Path, dispatch_id: int) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(str(dispatch_id), encoding="utf-8")
     except OSError as exc:
-        print(
-            f"angelus belfry: failed to write failcheck watermark {path}: {exc}",
-            file=sys.stderr,
+        log_err(
+            f"angelus belfry: failed to write failcheck watermark {path}: {exc}"
         )
 
 
@@ -235,9 +261,8 @@ def failure_surface(db_path: Path, state_path: Path) -> str | None:
     try:
         connection = sqlite3.connect(uri, uri=True)
     except sqlite3.Error as exc:
-        print(
-            f"angelus belfry: failure-surface cannot open {db_path}: {exc}",
-            file=sys.stderr,
+        log_err(
+            f"angelus belfry: failure-surface cannot open {db_path}: {exc}"
         )
         return None
     try:
@@ -259,10 +284,7 @@ def failure_surface(db_path: Path, state_path: Path) -> str | None:
             "ORDER BY opened_at, id"
         ).fetchall()
     except sqlite3.Error as exc:
-        print(
-            f"angelus belfry: failure-surface query failed: {exc}",
-            file=sys.stderr,
-        )
+        log_err(f"angelus belfry: failure-surface query failed: {exc}")
         return None
     finally:
         connection.close()
@@ -296,6 +318,98 @@ def failure_surface(db_path: Path, state_path: Path) -> str | None:
     return None
 
 
+def systemd_unit() -> str:
+    """The systemd unit name belfry asserts the daemon belongs to.
+
+    ANGELUS_SYSTEMD_UNIT overrides the default 'angelus' (the unit installed
+    from deploy/angelus.service), so a differently-named deployment can still
+    use the drift check.
+    """
+    return os.environ.get("ANGELUS_SYSTEMD_UNIT", DEFAULT_SYSTEMD_UNIT)
+
+
+def systemd_main_pid() -> int | None:
+    """Return the MainPID systemd attributes to the angelus unit.
+
+    Returns 0 when the unit is known to systemd but currently inactive
+    (systemd's own sentinel for "no main process"). Returns None when we
+    cannot determine the answer at all -- systemctl missing, no user bus,
+    a non-zero exit, an unparseable value, or a timeout. None is the
+    fail-open signal: belfry must never manufacture a DOWN ping just
+    because it could not interrogate systemd, so drift_failure treats None
+    as "no drift detectable."
+
+    Shells out to `systemctl --user show -p MainPID --value <unit>`; belfry
+    stays dependency-free (no angelus imports, no dbus library).
+    """
+    unit = systemd_unit()
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "show", "-p", "MainPID", "--value", unit],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=SYSTEMCTL_TIMEOUT_SEC,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        # FileNotFoundError (no systemctl), TimeoutExpired, etc. -> fail open.
+        log_err(f"angelus belfry: drift check cannot run systemctl: {exc}")
+        return None
+    if result.returncode != 0:
+        # e.g. no user bus / unknown unit on some systemd versions.
+        detail = result.stderr.strip() or f"exit {result.returncode}"
+        log_err(f"angelus belfry: drift check systemctl failed: {detail}")
+        return None
+    raw = result.stdout.strip()
+    try:
+        return int(raw)
+    except ValueError:
+        log_err(f"angelus belfry: drift check got unparseable MainPID {raw!r}")
+        return None
+
+
+def drift_failure(pid_file: Path) -> str | None:
+    """Assert the live daemon IS the systemd-managed instance.
+
+    Called only when a daemon is alive (pid_failure already returned None),
+    so the live pid comes straight from the pid file. Compares it to the
+    MainPID systemd reports for the unit:
+
+      - systemd MainPID == live pid  -> managed instance, no drift.
+      - systemd MainPID == 0 (unit inactive) while a daemon pid is alive
+        -> a daemon is running OUTSIDE its unit (someone ran it by hand).
+      - systemd MainPID != live pid  -> the alive daemon is not the one
+        systemd is supervising; another instance drifted off the unit.
+
+    Fails open: if the live pid is unreadable, or systemd's MainPID cannot
+    be determined (systemctl unavailable), returns None. The pid/wedge/
+    failure-surface checks remain the liveness backstop; an inability to
+    interrogate systemd must never be reported as a false DOWN.
+    """
+    try:
+        pid = int(pid_file.read_text(encoding="utf-8").strip())
+    except (FileNotFoundError, ValueError):
+        # pid_failure owns the dead/missing-pid case; nothing to compare.
+        return None
+
+    main_pid = systemd_main_pid()
+    if main_pid is None:
+        return None
+    if main_pid == pid:
+        return None
+    if main_pid == 0:
+        return (
+            f"drift: daemon PID {pid} is alive but systemd unit "
+            f"'{systemd_unit()}' is inactive (MainPID 0); daemon running "
+            f"outside its unit"
+        )
+    return (
+        f"drift: daemon PID {pid} does not match systemd unit "
+        f"'{systemd_unit()}' MainPID {main_pid}; an instance is running "
+        f"outside its unit"
+    )
+
+
 def pid_failure(pid_file: Path) -> str | None:
     try:
         raw = pid_file.read_text(encoding="utf-8").strip()
@@ -311,7 +425,10 @@ def pid_failure(pid_file: Path) -> str | None:
         return f"dead: PID {pid} is not running"
     except PermissionError:
         # EPERM still implies the process exists even if cron cannot signal it.
-        print(f"angelus belfry: cannot confirm PID {pid} via os.kill(0): permission denied", file=sys.stderr)
+        log_err(
+            f"angelus belfry: cannot confirm PID {pid} via os.kill(0): "
+            f"permission denied"
+        )
         return None
     return None
 
@@ -341,9 +458,9 @@ def wedge_threshold() -> timedelta:
     try:
         seconds = int(raw)
     except ValueError:
-        print(
-            "angelus belfry: invalid ANGELUS_BELFRY_WEDGE_THRESHOLD_SEC; using default",
-            file=sys.stderr,
+        log_err(
+            "angelus belfry: invalid ANGELUS_BELFRY_WEDGE_THRESHOLD_SEC; "
+            "using default"
         )
         seconds = DEFAULT_WEDGE_THRESHOLD_SEC
     return timedelta(seconds=max(1, seconds))
@@ -376,15 +493,15 @@ def parse_utc(value: str) -> datetime:
 def ping_env(name: str) -> bool:
     url = os.environ.get(name)
     if not url:
-        print(f"angelus belfry: {name} is not set; skipping ping", file=sys.stderr)
+        log_err(f"angelus belfry: {name} is not set; skipping ping")
         return False
     try:
         with urllib.request.urlopen(url, timeout=10) as response:
             status = getattr(response, "status", 200)
-        print(f"angelus belfry: pinged {name} status={status}")
+        log_out(f"angelus belfry: pinged {name} status={status}")
         return 200 <= int(status) < 300
     except Exception as exc:
-        print(f"angelus belfry: failed to ping {name}: {exc}", file=sys.stderr)
+        log_err(f"angelus belfry: failed to ping {name}: {exc}")
         return False
 
 
@@ -392,10 +509,7 @@ def notify(reason: str) -> bool:
     message = f"angelus belfry alert: {reason}"
     to = os.environ.get("ANGELUS_EMAIL_TO")
     if not to:
-        print(
-            "angelus belfry: ANGELUS_EMAIL_TO is not set; skipping notify",
-            file=sys.stderr,
-        )
+        log_err("angelus belfry: ANGELUS_EMAIL_TO is not set; skipping notify")
         return False
     command = os.environ.get("ANGELUS_BELFRY_NOTIFY_COMMAND", "patbot-email")
     try:
@@ -404,13 +518,10 @@ def notify(reason: str) -> bool:
             check=False,
         )
     except OSError as exc:
-        print(f"angelus belfry: {command} failed to start: {exc}", file=sys.stderr)
+        log_err(f"angelus belfry: {command} failed to start: {exc}")
         return False
     if result.returncode != 0:
-        print(
-            f"angelus belfry: {command} exited {result.returncode}",
-            file=sys.stderr,
-        )
+        log_err(f"angelus belfry: {command} exited {result.returncode}")
         return False
     return True
 
