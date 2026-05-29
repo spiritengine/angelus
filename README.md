@@ -64,6 +64,18 @@ raw cron, checks `state/angelus.pid`, reads `source_fires` from
 `state/angelus.sqlite3` in read-only mode, pings healthchecks.io, and calls
 `notify-pat` directly when the daemon is dead or wedged.
 
+Beyond liveness, the belfry also surfaces the daemon's own self-reported
+failures, generically: on each tick it reads `dispatches` and `incidents`
+(same read-only connection) and pings DOWN if any dispatch landed in
+`status='failed'` since the last tick, or any `internal/*` incident is open.
+Failed dispatches are edge-triggered off a last-seen-id bookmark
+(`state/belfry-failcheck-at` by default, or `ANGELUS_BELFRY_FAILCHECK_PATH`
+if overridden), so a transient failure pings once; open `internal/*`
+incidents are level-triggered and keep belfry red until they close. The
+check names no specific channel — it reads the schema the daemon already
+writes, so a live-but-not-delivering daemon (the 2026-05-29 silent-email
+failure mode) no longer reads as green.
+
 Setup:
 
 1. Register two healthchecks.io URLs as described in `belfry/healthchecks.example`.

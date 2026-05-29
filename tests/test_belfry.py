@@ -62,6 +62,82 @@ def _write_source_fire(root: Path, fired_at: datetime) -> None:
         connection.close()
 
 
+def _create_failure_tables(root: Path) -> None:
+    """Add the dispatches and incidents tables (the schema belfry's
+    failure-surface check reads) to an existing angelus.sqlite3. Mirrors
+    the real columns the check selects; other columns are omitted as the
+    read-only query never touches them."""
+    db = root / "state" / "angelus.sqlite3"
+    connection = sqlite3.connect(db)
+    try:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dispatches (
+                id INTEGER PRIMARY KEY,
+                pipe TEXT NOT NULL,
+                channel TEXT NOT NULL,
+                finding_ids TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 1,
+                last_error TEXT,
+                dispatched_at TEXT,
+                created_at TEXT,
+                updated_at TEXT,
+                source TEXT
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS incidents (
+                id INTEGER PRIMARY KEY,
+                source TEXT NOT NULL,
+                type TEXT NOT NULL,
+                entity TEXT NOT NULL,
+                dedup_key TEXT NOT NULL,
+                opened_at TEXT NOT NULL,
+                closed_at TEXT,
+                status TEXT NOT NULL CHECK (status IN ('open', 'closed'))
+            )
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _insert_dispatch(root: Path, status: str, channel: str = "push") -> None:
+    db = root / "state" / "angelus.sqlite3"
+    connection = sqlite3.connect(db)
+    try:
+        connection.execute(
+            """
+            INSERT INTO dispatches (pipe, channel, finding_ids, status, last_error)
+            VALUES ('daily', ?, '[1]', ?, 'simulated transport failure')
+            """,
+            (channel, status),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _open_internal_incident(root: Path, source: str = "internal/dispatch") -> None:
+    db = root / "state" / "angelus.sqlite3"
+    connection = sqlite3.connect(db)
+    try:
+        connection.execute(
+            """
+            INSERT INTO incidents (source, type, entity, dedup_key, opened_at, status)
+            VALUES (?, 'dispatch_failed', 'daily', ?, '2026-05-29T00:00:00Z', 'open')
+            """,
+            (source, f"{source}:dispatch_failed:daily"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def _set_urls(monkeypatch) -> None:
     monkeypatch.setenv("ANGELUS_BELFRY_SUCCESS_URL", "https://hc.example/success")
     monkeypatch.setenv("ANGELUS_BELFRY_DOWN_URL", "https://hc.example/down")
@@ -638,3 +714,184 @@ def test_sentinel_touch_swallows_oserror(tmp_path, monkeypatch, capsys) -> None:
     assert pings == ["https://hc.example/success"]
     err = capsys.readouterr().err
     assert "failed to touch sentinel" in err
+
+
+# --- B1 slice: belfry surfaces the daemon's self-reported failures --------
+#
+# A live, non-wedged daemon can still be failing its actual job: dispatches
+# landing in status='failed', or internal/* incidents left open. Before B1
+# belfry stayed green through exactly that (the 2026-05-29 incident). These
+# tests pin the third, generic failure-surfacing axis: failed dispatches
+# are edge-triggered off a last-seen-id watermark, open internal incidents
+# are level-triggered off current state, and neither special-cases any
+# channel.
+
+
+def _alive_daemon_state(root: Path) -> None:
+    """A daemon that pid_failure and wedge_failure both call healthy: live
+    PID, a fresh source_fire, plus the dispatches/incidents tables the
+    failure-surface check reads. Isolates the failure-surface axis as the
+    only one that can move the result."""
+    (root / "state").mkdir(exist_ok=True)
+    (root / "state" / "angelus.pid").write_text(str(os.getpid()), encoding="utf-8")
+    _write_source_fire(root, datetime.now(UTC))
+    _create_failure_tables(root)
+
+
+def _record_mocks(belfry, monkeypatch):
+    pings: list[str] = []
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        belfry.urllib.request,
+        "urlopen",
+        lambda url, timeout: pings.append(url) or _Response(),
+    )
+    monkeypatch.setattr(
+        belfry.subprocess,
+        "run",
+        lambda args, check: calls.append(args)
+        or subprocess.CompletedProcess(args, 0),
+    )
+    return pings, calls
+
+
+def test_failed_dispatch_since_last_tick_pings_down(tmp_path, monkeypatch) -> None:
+    """A failed dispatch recorded after belfry's last tick drives DOWN, and
+    re-firing belfry without a NEW failure does not re-alert (the watermark
+    is edge-triggered, not level-triggered)."""
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    _alive_daemon_state(tmp_path)
+    pings, calls = _record_mocks(belfry, monkeypatch)
+
+    # Tick 1: clean -> SUCCESS, and establishes the watermark.
+    assert belfry.main([str(tmp_path)]) == 0
+    assert pings == ["https://hc.example/success"]
+
+    # A failed dispatch lands after the bookmark.
+    _insert_dispatch(tmp_path, status="failed")
+
+    # Tick 2: the new failure surfaces -> DOWN, reason names it.
+    assert belfry.main([str(tmp_path)]) == 1
+    assert pings[-1] == "https://hc.example/down"
+    payload = " ".join(calls[-1])
+    assert "failed dispatch(es) since last tick" in payload
+    assert "daily/push" in payload
+
+    # Tick 3: no NEW failure -> back to SUCCESS (edge-triggered, the same
+    # failed row is not re-alerted).
+    assert belfry.main([str(tmp_path)]) == 0
+    assert pings[-1] == "https://hc.example/success"
+
+
+def test_no_failures_pings_success(tmp_path, monkeypatch) -> None:
+    """With no failed dispatches and no open internal incidents, the new
+    check is inert and belfry pings SUCCESS."""
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    _alive_daemon_state(tmp_path)
+    # A SUCCEEDED dispatch must not be mistaken for a failure.
+    _insert_dispatch(tmp_path, status="sent")
+    pings, calls = _record_mocks(belfry, monkeypatch)
+
+    assert belfry.main([str(tmp_path)]) == 0
+    assert pings == ["https://hc.example/success"]
+    assert calls == []
+
+
+def test_open_internal_incident_pings_down_every_tick(tmp_path, monkeypatch) -> None:
+    """An open internal/* incident is level-triggered: belfry stays red on
+    each tick until it closes, even with no failed dispatch present and on
+    the very first tick (no watermark needed for this axis)."""
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    _alive_daemon_state(tmp_path)
+    _open_internal_incident(tmp_path, source="internal/dispatch")
+    pings, calls = _record_mocks(belfry, monkeypatch)
+
+    assert belfry.main([str(tmp_path)]) == 1
+    assert pings[-1] == "https://hc.example/down"
+    payload = " ".join(calls[-1])
+    assert "open internal finding(s)" in payload
+    assert "internal/dispatch" in payload
+
+    # Still open on the next tick -> still DOWN (not silenced by a bookmark).
+    assert belfry.main([str(tmp_path)]) == 1
+    assert pings[-1] == "https://hc.example/down"
+
+
+def test_closed_internal_incident_does_not_ping_down(tmp_path, monkeypatch) -> None:
+    """A closed internal incident must not keep belfry red -- only OPEN
+    internal incidents surface."""
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    _alive_daemon_state(tmp_path)
+    _open_internal_incident(tmp_path, source="internal/dispatch")
+    db = tmp_path / "state" / "angelus.sqlite3"
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("UPDATE incidents SET status = 'closed'")
+        conn.commit()
+    finally:
+        conn.close()
+    pings, _calls = _record_mocks(belfry, monkeypatch)
+
+    assert belfry.main([str(tmp_path)]) == 0
+    assert pings == ["https://hc.example/success"]
+
+
+def test_first_run_does_not_replay_failed_history(tmp_path, monkeypatch) -> None:
+    """On belfry's first tick (no watermark file yet) a pre-existing failed
+    dispatch is NOT replayed as DOWN -- the first tick establishes the
+    bookmark. Otherwise a fresh belfry against a populated db would flood
+    on every historical failure."""
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    _alive_daemon_state(tmp_path)
+    _insert_dispatch(tmp_path, status="failed")  # predates belfry's first tick
+    assert not (tmp_path / "state" / "belfry-failcheck-at").exists()
+    pings, _calls = _record_mocks(belfry, monkeypatch)
+
+    # First tick: establish watermark, do not replay the old failure.
+    assert belfry.main([str(tmp_path)]) == 0
+    assert pings[-1] == "https://hc.example/success"
+    assert (tmp_path / "state" / "belfry-failcheck-at").exists()
+
+    # Second tick: still nothing new -> SUCCESS.
+    assert belfry.main([str(tmp_path)]) == 0
+    assert pings[-1] == "https://hc.example/success"
+
+
+def test_failcheck_path_override_honored(tmp_path, monkeypatch) -> None:
+    """ANGELUS_BELFRY_FAILCHECK_PATH overrides the default watermark
+    location, mirroring the sentinel override pattern."""
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    _alive_daemon_state(tmp_path)
+    override = tmp_path / "custom-failcheck"
+    monkeypatch.setenv("ANGELUS_BELFRY_FAILCHECK_PATH", str(override))
+    pings, _calls = _record_mocks(belfry, monkeypatch)
+
+    assert belfry.main([str(tmp_path)]) == 0
+    assert pings == ["https://hc.example/success"]
+    assert override.exists(), "override watermark path was not written"
+    assert not (tmp_path / "state" / "belfry-failcheck-at").exists(), (
+        "default watermark path written despite override env var being set"
+    )
+
+
+def test_failure_surface_fails_open_on_missing_tables(tmp_path, monkeypatch) -> None:
+    """If the dispatches/incidents tables are absent (schema-incomplete or
+    pre-migration db), failure_surface swallows the sqlite error and
+    returns None rather than manufacturing a false DOWN. The pid/wedge
+    axes remain the liveness backstop."""
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "angelus.pid").write_text(str(os.getpid()), encoding="utf-8")
+    _write_source_fire(tmp_path, datetime.now(UTC))  # source_fires only, no dispatches
+    pings, calls = _record_mocks(belfry, monkeypatch)
+
+    assert belfry.main([str(tmp_path)]) == 0
+    assert pings == ["https://hc.example/success"]
+    assert calls == []
