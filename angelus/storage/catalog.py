@@ -574,6 +574,101 @@ class Catalog:
         )
         return [self._finding_dict(row) for row in rows]
 
+    def timeline_events(self, since: str, until: str) -> list[dict[str, Any]]:
+        """Reconstruct the ordered story for a [since, until] window.
+
+        Interleaves source fires, observations, findings, and dispatches
+        (including failures) by timestamp into a single chronological list.
+        Read-only: four plain SELECTs unioned in Python so each event keeps
+        its own shape. Bounds are inclusive and compared as ISO strings,
+        which sort correctly because every timestamp column uses the same
+        '...Z' millisecond format.
+
+        Same-instant ties break by kind in causal order (fire, observation,
+        finding, dispatch) then by id, so a fire and the dispatch failure it
+        provoked read in the order they happened even when their timestamps
+        collide.
+        """
+        events: list[dict[str, Any]] = []
+        for row in self.connection.execute(
+            """
+            SELECT id, source_name, outcome, fired_at
+            FROM source_fires
+            WHERE fired_at >= ? AND fired_at <= ?
+            """,
+            (since, until),
+        ):
+            events.append(
+                {
+                    "ts": row["fired_at"],
+                    "kind": "fire",
+                    "id": int(row["id"]),
+                    "source": row["source_name"],
+                    "outcome": row["outcome"],
+                }
+            )
+        for row in self.connection.execute(
+            """
+            SELECT id, source, status, created_at
+            FROM observations
+            WHERE created_at >= ? AND created_at <= ?
+            """,
+            (since, until),
+        ):
+            events.append(
+                {
+                    "ts": row["created_at"],
+                    "kind": "observation",
+                    "id": int(row["id"]),
+                    "source": row["source"],
+                    "status": row["status"],
+                }
+            )
+        for row in self.connection.execute(
+            """
+            SELECT id, source, type, entity, severity, status, created_at
+            FROM findings
+            WHERE created_at >= ? AND created_at <= ?
+            """,
+            (since, until),
+        ):
+            events.append(
+                {
+                    "ts": row["created_at"],
+                    "kind": "finding",
+                    "id": int(row["id"]),
+                    "source": row["source"],
+                    "type": row["type"],
+                    "entity": row["entity"],
+                    "severity": row["severity"],
+                    "status": row["status"],
+                }
+            )
+        for row in self.connection.execute(
+            """
+            SELECT id, pipe, channel, status, last_error,
+                   COALESCE(dispatched_at, created_at) AS ts
+            FROM dispatches
+            WHERE COALESCE(dispatched_at, created_at) >= ?
+              AND COALESCE(dispatched_at, created_at) <= ?
+            """,
+            (since, until),
+        ):
+            events.append(
+                {
+                    "ts": row["ts"],
+                    "kind": "dispatch",
+                    "id": int(row["id"]),
+                    "pipe": row["pipe"],
+                    "channel": row["channel"],
+                    "status": row["status"],
+                    "error": row["last_error"],
+                }
+            )
+        kind_order = {"fire": 0, "observation": 1, "finding": 2, "dispatch": 3}
+        events.sort(key=lambda e: (e["ts"], kind_order[e["kind"]], e["id"]))
+        return events
+
     def record_pipe_send_failure(
         self, pipe: str, channel: str, finding_id: int, error: str
     ) -> bool:
