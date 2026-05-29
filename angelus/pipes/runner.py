@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,8 @@ from angelus.clock import Clock
 from angelus.lodging import Channel, Pipe
 from angelus.sources.runner import _kill_and_reap
 from angelus.storage import Catalog
+
+LOGGER = logging.getLogger(__name__)
 
 # Prior wording said "see structured data above" -- correct under the
 # old (preamble, body) order. After the cleanup reversed to (body,
@@ -151,12 +154,36 @@ class PipeDrain:
                         str(exc),
                     )
                     if exhausted:
+                        # Retries exhausted: the channel is now marked
+                        # unhealthy and an internal/dispatch finding is
+                        # written. Log at ERROR -- this is a delivery the
+                        # system has given up on (B22).
+                        LOGGER.error(
+                            "pipe %s: dispatch of finding %s over channel %s "
+                            "failed and exhausted retries; marking channel "
+                            "unhealthy: %s",
+                            pipe.name,
+                            finding_id,
+                            channel.name,
+                            exc,
+                        )
                         self.catalog.write_internal_finding(
                             "internal/dispatch",
                             "channel_unhealthy",
                             channel.name,
                             str(exc),
                             known_pipes,
+                        )
+                    else:
+                        # Will retry on a later drain. WARNING, not ERROR --
+                        # a single transient failure is expected to recover.
+                        LOGGER.warning(
+                            "pipe %s: dispatch of finding %s over channel %s "
+                            "failed, will retry: %s",
+                            pipe.name,
+                            finding_id,
+                            channel.name,
+                            exc,
                         )
                 else:
                     self.catalog.record_dispatch(
@@ -199,6 +226,14 @@ class PipeDrain:
         body, llm_error = await self._render_llm_body(pipe, structured)
         if llm_error is not None:
             body = LLM_FALLBACK_FOOTER
+            # The digest still ships with the structured fallback body, but
+            # the synthesis paragraph is gone -- a degraded delivery worth an
+            # ERROR line alongside the internal/render finding (B22).
+            LOGGER.error(
+                "pipe %s: llm digest render failed, using fallback body: %s",
+                pipe.name,
+                llm_error,
+            )
             self.catalog.write_internal_finding(
                 "internal/render",
                 "llm_render_failed",
@@ -250,6 +285,16 @@ class PipeDrain:
             try:
                 await self._send_channel(channel, message, subject)
             except Exception as exc:
+                # The daily digest is the routine-delivery contract; a failed
+                # send here is the exact 2026-05-29 silent-failure shape, so
+                # log ERROR in addition to the failed dispatch row and the
+                # internal/dispatch finding (B22).
+                LOGGER.error(
+                    "pipe %s: digest dispatch over channel %s failed: %s",
+                    pipe.name,
+                    channel.name,
+                    exc,
+                )
                 self.catalog.record_dispatch(
                     pipe.name,
                     channel.name,

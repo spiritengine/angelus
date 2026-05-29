@@ -97,6 +97,17 @@ file only fills in names that are unset.
 
 ## Reliability
 
+### Logging
+
+The daemon writes one canonical, tail-able log at `state/angelus.log` (a
+rotating file written by the app, not by stdout redirection), so systemd and
+manual launches log identically — fixing the journald-vs-file split that
+helped hide the 2026-05-29 incident. Every failure path logs at WARNING/ERROR
+in addition to its database record, so `grep ERROR state/angelus.log` surfaces
+real failures. Belfry keeps its own separate `state/belfry.log`. Full
+details — rotation policy, severity levels, how to tail — in
+[docs/logging.md](docs/logging.md).
+
 ### Transport separation
 
 Urgent and routine alerts ride different transports, so a dead transport can't

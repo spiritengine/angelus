@@ -17,6 +17,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from angelus.clock import Clock
 from angelus.control import ControlServer
 from angelus.envfile import load_env_file
+from angelus.logging_config import configure_logging
 from angelus.lodging import Lodging, ScheduledSource, load_lodging
 from angelus.lodging.reloader import LodgingReloader
 from angelus.pipes import PipeDrain
@@ -813,11 +814,13 @@ def _make_trigger(cadence: str):
 
 
 def main(root: Path | None = None) -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
     root = root or Path.cwd()
+    # Single canonical log destination regardless of launch method (B21+B22):
+    # a rotating file at state/angelus.log, written by the app rather than by
+    # stdout redirection, so systemd and a hand-launched daemon log
+    # identically. Configure logging first so the env-load line below is
+    # captured. See angelus/logging_config.py and docs/logging.md.
+    configure_logging(root)
     # Load non-secret config from state/angelus.env (B16). systemd's
     # EnvironmentFile= already does this for the managed unit; doing it in code
     # too means a hand-launched daemon -- the 2026-05-29 incident -- inherits
