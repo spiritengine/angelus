@@ -328,6 +328,23 @@ def systemd_unit() -> str:
     return os.environ.get("ANGELUS_SYSTEMD_UNIT", DEFAULT_SYSTEMD_UNIT)
 
 
+def _user_bus_env() -> dict[str, str]:
+    """Environment for `systemctl --user` so it can reach the user bus.
+
+    A stock crontab sets neither XDG_RUNTIME_DIR nor DBUS_SESSION_BUS_ADDRESS,
+    and without one of them `systemctl --user` cannot connect to the user bus
+    -- the drift check would then fail open to a silent no-op (the exact
+    failure class this effort exists to kill). When both are unset, point
+    XDG_RUNTIME_DIR at the invoking user's runtime dir. Never overwrite an
+    existing bus var (an explicit value wins). Stdlib only; fail-open is
+    unchanged -- if the bus is still unreachable, systemd_main_pid returns None.
+    """
+    env = dict(os.environ)
+    if not env.get("XDG_RUNTIME_DIR") and not env.get("DBUS_SESSION_BUS_ADDRESS"):
+        env["XDG_RUNTIME_DIR"] = f"/run/user/{os.getuid()}"
+    return env
+
+
 def systemd_main_pid() -> int | None:
     """Return the MainPID systemd attributes to the angelus unit.
 
@@ -350,6 +367,7 @@ def systemd_main_pid() -> int | None:
             capture_output=True,
             text=True,
             timeout=SYSTEMCTL_TIMEOUT_SEC,
+            env=_user_bus_env(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         # FileNotFoundError (no systemctl), TimeoutExpired, etc. -> fail open.

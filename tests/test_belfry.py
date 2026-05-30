@@ -275,6 +275,59 @@ def test_happy_path_hits_success_without_escalation(tmp_path, monkeypatch) -> No
     assert calls == []
 
 
+def test_systemd_main_pid_injects_bus_env_when_absent(monkeypatch) -> None:
+    # The drift check runs from cron, where XDG_RUNTIME_DIR/DBUS are unset and
+    # `systemctl --user` can't reach the user bus. systemd_main_pid must inject
+    # XDG_RUNTIME_DIR so the check isn't a silent no-op.
+    belfry = _load_belfry()
+    captured: dict = {}
+
+    def fake_run(args, **kwargs):
+        captured["args"] = args
+        captured["env"] = kwargs.get("env")
+        return subprocess.CompletedProcess(args, 0, stdout="2678722\n", stderr="")
+
+    monkeypatch.setattr(belfry.subprocess, "run", fake_run)
+    monkeypatch.setattr(belfry.os, "getuid", lambda: 1000)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
+
+    assert belfry.systemd_main_pid() == 2678722
+    assert captured["args"][:3] == ["systemctl", "--user", "show"]
+    assert captured["env"]["XDG_RUNTIME_DIR"] == "/run/user/1000"
+
+
+def test_systemd_main_pid_preserves_existing_xdg(monkeypatch) -> None:
+    belfry = _load_belfry()
+    captured: dict = {}
+
+    def fake_run(args, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return subprocess.CompletedProcess(args, 0, stdout="5\n", stderr="")
+
+    monkeypatch.setattr(belfry.subprocess, "run", fake_run)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/already")
+
+    assert belfry.systemd_main_pid() == 5
+    assert captured["env"]["XDG_RUNTIME_DIR"] == "/run/user/already"
+
+
+def test_systemd_main_pid_skips_xdg_when_dbus_present(monkeypatch) -> None:
+    belfry = _load_belfry()
+    captured: dict = {}
+
+    def fake_run(args, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return subprocess.CompletedProcess(args, 0, stdout="5\n", stderr="")
+
+    monkeypatch.setattr(belfry.subprocess, "run", fake_run)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus")
+
+    assert belfry.systemd_main_pid() == 5
+    assert "XDG_RUNTIME_DIR" not in captured["env"]
+
+
 # --- M2 slice 6: belfry independence end-to-end --------------------------
 #
 # The unit tests above stage a synthetic state directory; this test brings
@@ -1026,7 +1079,7 @@ def test_systemd_main_pid_parses_value(monkeypatch) -> None:
     belfry = _load_belfry()
     captured: list[list[str]] = []
 
-    def fake_run(args, check, capture_output, text, timeout):
+    def fake_run(args, check, capture_output, text, timeout, env=None):
         captured.append(args)
         return subprocess.CompletedProcess(args, 0, stdout="12345\n", stderr="")
 
@@ -1049,7 +1102,7 @@ def test_systemd_main_pid_unit_override(monkeypatch) -> None:
     monkeypatch.setenv("ANGELUS_SYSTEMD_UNIT", "angelus-staging")
     captured: list[list[str]] = []
 
-    def fake_run(args, check, capture_output, text, timeout):
+    def fake_run(args, check, capture_output, text, timeout, env=None):
         captured.append(args)
         return subprocess.CompletedProcess(args, 0, stdout="7\n", stderr="")
 
@@ -1064,7 +1117,7 @@ def test_systemd_main_pid_fails_open_when_systemctl_missing(
     """No systemctl binary (FileNotFoundError) -> None (fail open), logged."""
     belfry = _load_belfry()
 
-    def boom(args, check, capture_output, text, timeout):
+    def boom(args, check, capture_output, text, timeout, env=None):
         raise FileNotFoundError("systemctl")
 
     monkeypatch.setattr(belfry.subprocess, "run", boom)
@@ -1076,7 +1129,7 @@ def test_systemd_main_pid_fails_open_on_nonzero_exit(monkeypatch) -> None:
     """A non-zero systemctl exit (no user bus, unknown unit) -> None."""
     belfry = _load_belfry()
 
-    def fake_run(args, check, capture_output, text, timeout):
+    def fake_run(args, check, capture_output, text, timeout, env=None):
         return subprocess.CompletedProcess(
             args, 1, stdout="", stderr="Failed to connect to bus"
         )
@@ -1089,7 +1142,7 @@ def test_systemd_main_pid_fails_open_on_unparseable(monkeypatch) -> None:
     """Unparseable MainPID output -> None (fail open), never a crash."""
     belfry = _load_belfry()
 
-    def fake_run(args, check, capture_output, text, timeout):
+    def fake_run(args, check, capture_output, text, timeout, env=None):
         return subprocess.CompletedProcess(
             args, 0, stdout="not-a-number\n", stderr=""
         )
@@ -1102,7 +1155,7 @@ def test_systemd_main_pid_fails_open_on_timeout(monkeypatch) -> None:
     """A systemctl timeout -> None (fail open)."""
     belfry = _load_belfry()
 
-    def boom(args, check, capture_output, text, timeout):
+    def boom(args, check, capture_output, text, timeout, env=None):
         raise subprocess.TimeoutExpired(cmd=args, timeout=timeout)
 
     monkeypatch.setattr(belfry.subprocess, "run", boom)
