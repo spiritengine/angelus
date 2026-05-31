@@ -25,6 +25,18 @@ FAILURE_DETAIL_LIMIT = 3
 DEFAULT_SYSTEMD_UNIT = "angelus"
 SYSTEMCTL_TIMEOUT_SEC = 10
 
+# B12 restart-fixer defaults.  All overridable via env vars.
+DEFAULT_RESTART_LOG_FILENAME = "belfry-restart-log"
+DEFAULT_NEEDS_SRE_FILENAME = "belfry-needs-sre"
+DEFAULT_FIXERS_LOG_FILENAME = "fixers.log"
+# At most 3 restarts in a 30-minute window before escalating to the SRE tier.
+DEFAULT_MAX_RESTARTS = 3
+DEFAULT_RESTART_WINDOW_SEC = 1800
+# Wait this long after `systemctl restart` before checking whether the daemon
+# came back.  Small enough to not stall the cron tick; big enough for a normal
+# startup sequence.
+DEFAULT_RECOVER_WAIT_SEC = 3
+
 
 def _now_iso() -> str:
     """ISO8601 UTC timestamp for log-line prefixes.
@@ -103,38 +115,65 @@ def main(argv: list[str] | None = None) -> int:
     # untouched here).
     touch_sentinel(sentinel_path(state))
 
-    # The checks below answer four distinct questions about angelus, in
-    # descending order of "can we even read the rest": is the process
-    # alive (pid), is it firing sources (wedge), is it self-reporting
-    # delivery failures (failure-surface), and is the live daemon actually
-    # the systemd-managed instance (drift). A dead process short-circuits
-    # the latter three -- with no daemon, a stale sqlite tells us nothing
-    # useful and would only manufacture confusing reasons, and there is no
-    # live pid to compare against systemd. Otherwise we gather every reason
-    # so a single DOWN ping names all of them.
+    # Four checks, split by what they imply for autoremediation:
+    #
+    # ABSENCE reasons (daemon not running / not delivering):
+    #   pid_failure  -- dead process: restart is the right tool.
+    #   wedge_failure -- alive but not firing sources: also absence.
+    #
+    # OTHER reasons (daemon IS alive; restart is the wrong tool):
+    #   failure_surface -- daemon self-reporting live errors: alerting only,
+    #       never restart (would mask the root cause and interrupt delivery).
+    #   drift_failure -- alive but mis-launched outside the systemd unit:
+    #       alerting only (a systemctl restart while a hand-launched instance
+    #       holds the pid is messy; that's a human/SRE fix).
+    #
+    # A dead process short-circuits the live-daemon checks: with no daemon a
+    # stale sqlite tells us nothing useful, and there is no live pid to
+    # compare against systemd.  Otherwise gather every reason so a single
+    # DOWN ping names all of them.
     dead_reason = pid_failure(state / "angelus.pid")
     if dead_reason:
-        reasons = [dead_reason]
+        absence_reasons: list[str] = [dead_reason]
+        other_reasons: list[str] = []
     else:
-        reasons = []
+        absence_reasons = []
+        other_reasons = []
         wedge_reason = wedge_failure(state / "angelus.sqlite3")
         if wedge_reason:
-            reasons.append(wedge_reason)
+            absence_reasons.append(wedge_reason)
         failure_reason = failure_surface(
             state / "angelus.sqlite3", failcheck_path(state)
         )
         if failure_reason:
-            reasons.append(failure_reason)
-        # Drift: a daemon is alive (we are in this branch), but is it the
-        # systemd-managed instance? A hand-launched daemon outside its unit
-        # is the exact 2026-05-29 failure mode -- the process looked alive
-        # to pid/wedge while running detached from systemd and its env.
+            other_reasons.append(failure_reason)
         drift_reason = drift_failure(state / "angelus.pid")
         if drift_reason:
-            reasons.append(drift_reason)
+            other_reasons.append(drift_reason)
 
-    if reasons:
-        reason = "; ".join(reasons)
+    all_reasons = absence_reasons + other_reasons
+    if all_reasons:
+        if absence_reasons:
+            # Daemon is absent: attempt a loop-guarded restart unless a drift
+            # reason is also present.  Drift means the daemon is alive but
+            # launched outside its systemd unit — `systemctl restart` would
+            # spawn a second instance alongside the mis-launched one, violating
+            # the single-writer invariant.  Drift is always alert-only.
+            has_drift = any(r.startswith("drift:") for r in other_reasons)
+            if has_drift:
+                action_note = (
+                    "wedged but drifted — restart withheld, drift is a human/SRE fix"
+                )
+            else:
+                # Attempt the loop-guarded restart.  The action note is appended
+                # to the reason string so the DOWN ping and notify() both carry
+                # "what we did and what happened."  A successful restart is still
+                # alert-worthy (a real problem occurred); the next clean tick
+                # pings SUCCESS as normal.
+                action_note = _autoremediate_absence(state, absence_reasons)
+            reason = "; ".join(all_reasons) + "; " + action_note
+        else:
+            reason = "; ".join(all_reasons)
         ok = ping_env("ANGELUS_BELFRY_DOWN_URL")
         ok = notify(reason) and ok
         log_err(f"angelus belfry: DOWN: {reason}")
@@ -193,6 +232,93 @@ def failcheck_path(state_dir: Path) -> Path:
     return state_dir / DEFAULT_FAILCHECK_FILENAME
 
 
+def restart_log_path(state_dir: Path) -> Path:
+    """Path for the rolling restart-timestamp log (loop-guard state).
+
+    ANGELUS_BELFRY_RESTART_PATH overrides; default is
+    <state_dir>/belfry-restart-log.  Follows the same single-file,
+    belfry-owned pattern as the liveness sentinel and failcheck watermark.
+    """
+    override = os.environ.get("ANGELUS_BELFRY_RESTART_PATH")
+    if override:
+        return Path(override)
+    return state_dir / DEFAULT_RESTART_LOG_FILENAME
+
+
+def needs_sre_path(state_dir: Path) -> Path:
+    """Path for the needs-sre escalation sentinel.
+
+    ANGELUS_BELFRY_NEEDS_SRE_PATH overrides; default is
+    <state_dir>/belfry-needs-sre.  Written when the loop guard blocks a
+    restart so an out-of-band SRE runner can consume it.
+    """
+    override = os.environ.get("ANGELUS_BELFRY_NEEDS_SRE_PATH")
+    if override:
+        return Path(override)
+    return state_dir / DEFAULT_NEEDS_SRE_FILENAME
+
+
+def fixers_log_path(state_dir: Path) -> Path:
+    """Path for the shared fixers audit log.
+
+    ANGELUS_BELFRY_FIXERS_LOG_PATH overrides; default is
+    <state_dir>/fixers.log.  Both belfry and (future) in-daemon fixers
+    append here so 'belfry restarted twice at 3am' reads back in one place.
+    """
+    override = os.environ.get("ANGELUS_BELFRY_FIXERS_LOG_PATH")
+    if override:
+        return Path(override)
+    return state_dir / DEFAULT_FIXERS_LOG_FILENAME
+
+
+def max_restarts() -> int:
+    """Maximum restart attempts permitted in the rolling window."""
+    raw = os.environ.get("ANGELUS_BELFRY_MAX_RESTARTS")
+    if raw is None:
+        return DEFAULT_MAX_RESTARTS
+    try:
+        n = int(raw)
+    except ValueError:
+        log_err(
+            "angelus belfry: invalid ANGELUS_BELFRY_MAX_RESTARTS; "
+            "using default"
+        )
+        return DEFAULT_MAX_RESTARTS
+    return max(1, n)
+
+
+def restart_window_sec() -> int:
+    """Rolling window length (seconds) for the restart loop guard."""
+    raw = os.environ.get("ANGELUS_BELFRY_RESTART_WINDOW_SEC")
+    if raw is None:
+        return DEFAULT_RESTART_WINDOW_SEC
+    try:
+        secs = int(raw)
+    except ValueError:
+        log_err(
+            "angelus belfry: invalid ANGELUS_BELFRY_RESTART_WINDOW_SEC; "
+            "using default"
+        )
+        return DEFAULT_RESTART_WINDOW_SEC
+    return max(1, secs)
+
+
+def recover_wait_sec() -> int:
+    """Seconds to wait after systemctl restart before verifying recovery."""
+    raw = os.environ.get("ANGELUS_BELFRY_RECOVER_WAIT_SEC")
+    if raw is None:
+        return DEFAULT_RECOVER_WAIT_SEC
+    try:
+        secs = int(raw)
+    except ValueError:
+        log_err(
+            "angelus belfry: invalid ANGELUS_BELFRY_RECOVER_WAIT_SEC; "
+            "using default"
+        )
+        return DEFAULT_RECOVER_WAIT_SEC
+    return max(0, secs)
+
+
 def read_failcheck_watermark(path: Path) -> int | None:
     """Read the last-seen dispatch id from the watermark file.
 
@@ -234,6 +360,205 @@ def write_failcheck_watermark(path: Path, dispatch_id: int) -> None:
         log_err(
             f"angelus belfry: failed to write failcheck watermark {path}: {exc}"
         )
+
+
+def read_restart_log(path: Path) -> list[float]:
+    """Read restart timestamps (Unix epoch floats) from the restart log.
+
+    Returns an empty list when the file is missing or unparseable — both
+    mean "no recorded restarts," which the caller treats as a clean slate.
+    Unparseable lines are skipped with a log; a single bad line must not
+    discard the entire history.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        log_err(f"angelus belfry: failed to read restart log {path}: {exc}")
+        return []
+    timestamps: list[float] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            timestamps.append(float(stripped))
+        except ValueError:
+            log_err(
+                f"angelus belfry: unreadable restart log line {stripped!r}; "
+                f"skipping"
+            )
+    return timestamps
+
+
+def write_restart_log(path: Path, timestamps: list[float]) -> bool:
+    """Persist the current in-window restart timestamps.
+
+    Returns True on success, False on failure.  A failed write means the
+    guard state cannot be durably recorded; the caller MUST NOT restart on
+    this tick (fail safe, not fail open) — an un-guarded restart loop is
+    worse than a withheld restart.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "".join(f"{ts}\n" for ts in timestamps), encoding="utf-8"
+        )
+        return True
+    except OSError as exc:
+        log_err(f"angelus belfry: failed to write restart log {path}: {exc}")
+        return False
+
+
+def restart_daemon() -> bool:
+    """Shell `systemctl --user restart <unit>`.
+
+    Returns True on a zero exit (restart dispatched to systemd), False on
+    any error (OSError, timeout, nonzero exit).  Never raises: belfry must
+    not crash because systemctl is absent or the user bus is unreachable.
+    Keeping this as its own function makes it mockable in tests.
+    """
+    unit = systemd_unit()
+    try:
+        result = subprocess.run(
+            ["systemctl", "--user", "restart", unit],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=SYSTEMCTL_TIMEOUT_SEC,
+            env=_user_bus_env(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log_err(f"angelus belfry: restart failed (systemctl unavailable): {exc}")
+        return False
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"exit {result.returncode}"
+        log_err(f"angelus belfry: restart systemctl failed: {detail}")
+        return False
+    log_out(f"angelus belfry: systemctl --user restart {unit} dispatched")
+    return True
+
+
+def verify_recovery(pid_file: Path) -> bool:
+    """Wait briefly, then re-check whether the daemon is alive.
+
+    Returns True if pid_failure finds the daemon alive after the wait,
+    False otherwise.  The wait is bounded and configurable; it is small
+    enough that it does not materially stall the cron tick.
+    """
+    wait = recover_wait_sec()
+    if wait > 0:
+        time.sleep(wait)
+    return pid_failure(pid_file) is None
+
+
+def write_needs_sre_sentinel(path: Path, reason: str) -> None:
+    """Write the needs-sre sentinel so an out-of-band SRE runner can consume it.
+
+    Overwrites any previous content (a fresh crash-loop entry supersedes an
+    older one).  Failures are logged and swallowed.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{_now_iso()} {reason}\n", encoding="utf-8")
+    except OSError as exc:
+        log_err(
+            f"angelus belfry: failed to write needs-sre sentinel {path}: {exc}"
+        )
+
+
+def append_fixers_log(
+    path: Path, actor: str, action: str, reason: str, outcome: str
+) -> None:
+    """Append one structured line to the shared fixers audit log.
+
+    Format: ISO8601 timestamp, actor=belfry, action=restart|escalate,
+    reason (quoted), outcome.  Append-only; creates the file if missing.
+    Failures are logged and swallowed — the audit log must never crash belfry.
+    """
+    line = (
+        f"{_now_iso()} actor={actor} action={action} "
+        f"reason={reason!r} outcome={outcome}\n"
+    )
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+    except OSError as exc:
+        log_err(
+            f"angelus belfry: failed to append to fixers log {path}: {exc}"
+        )
+
+
+def _autoremediate_absence(state: Path, absence_reasons: list[str]) -> str:
+    """Attempt a restart when the daemon is absent (dead or wedged).
+
+    This is the loop-guarded restart path.  It reads the rolling restart
+    log, prunes timestamps outside the window, and either:
+      - escalates (loop guard exceeded): writes the needs-sre sentinel,
+        appends to fixers.log, returns a loud escalation note.
+      - restarts: records this attempt, shells systemctl restart, verifies
+        recovery, appends to fixers.log, returns an action note.
+
+    The restart is recorded BEFORE the systemctl call so even a hung or
+    partially-completed restart counts toward the window (prevents an
+    infinite loop of broken restarts from bypassing the guard).
+
+    A successful auto-restart is still alert-worthy: the caller always
+    pings ANGELUS_BELFRY_DOWN_URL and notify() regardless of outcome.
+    """
+    rlog_path = restart_log_path(state)
+    flog_path = fixers_log_path(state)
+    nsre_path = needs_sre_path(state)
+    n_max = max_restarts()
+    window = restart_window_sec()
+    now_ts = time.time()
+    reason_str = "; ".join(absence_reasons)
+
+    # Prune entries outside the rolling window before counting.
+    all_timestamps = read_restart_log(rlog_path)
+    window_start = now_ts - window
+    in_window = [ts for ts in all_timestamps if ts >= window_start]
+
+    if len(in_window) >= n_max:
+        # Loop guard triggered: stop restarting, escalate.
+        escalation = (
+            f"crash-loop: {len(in_window)} restart(s) in last {window}s "
+            f"(max {n_max}); needs-sre sentinel written; human needed"
+        )
+        write_needs_sre_sentinel(nsre_path, f"{escalation}: {reason_str}")
+        append_fixers_log(flog_path, "belfry", "escalate", reason_str, "blocked")
+        log_err(f"angelus belfry: loop guard exceeded — {escalation}")
+        return escalation
+
+    # Record this attempt before the systemctl call (see docstring).
+    # If the persist fails, withhold the restart: the guard cannot track
+    # this tick, so restarting now would leave the count unrecorded and
+    # allow an unlimited restart loop on the next tick (fail safe > fail open).
+    in_window.append(now_ts)
+    persisted = write_restart_log(rlog_path, in_window)
+    if not persisted:
+        guard_fail_note = (
+            "restart withheld: loop-guard could not persist state "
+            "(disk/permissions error on restart log); human attention needed"
+        )
+        append_fixers_log(
+            flog_path, "belfry", "guard_fail", reason_str, "withheld"
+        )
+        log_err(f"angelus belfry: {guard_fail_note}")
+        return guard_fail_note
+
+    restarted = restart_daemon()
+    if restarted:
+        recovered = verify_recovery(state / "angelus.pid")
+        outcome = "recovered" if recovered else "not_recovered"
+    else:
+        outcome = "restart_failed"
+
+    append_fixers_log(flog_path, "belfry", "restart", reason_str, outcome)
+    log_out(f"angelus belfry: restart attempt: outcome={outcome}")
+    return f"auto-restart attempted; outcome={outcome}"
 
 
 def failure_surface(db_path: Path, state_path: Path) -> str | None:
