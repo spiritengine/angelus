@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -359,6 +361,9 @@ class PipeDrain:
             "suppressed_findings": self.catalog.suppressed_findings_since(last_drain_at),
             "open_incidents": open_incidents,
             "recent_closures": self.catalog.clearance_findings_since(last_drain_at),
+            "fixer_actions": _gather_fixer_actions(
+                _fixer_log_path(self.workdir), last_drain_at
+            ),
         }
         # Add local-time strings alongside the UTC originals so both the
         # jinja templates and the chronicler prompt can use human-readable
@@ -575,3 +580,93 @@ def _attach_local_timestamps(item: dict[str, Any]) -> None:
         # with proper tzdata always emit an abbreviation; the rstrip
         # is cheap insurance for containerized deploys.
         item[f"{field}_local"] = local.strftime("%a %Y-%m-%d %H:%M %Z").rstrip()
+
+
+# ---------------------------------------------------------------------------
+# Fixer-actions log gatherer
+# ---------------------------------------------------------------------------
+
+# Matches key=value pairs in fixers.log lines. Values are either Python-repr
+# single-quoted ('...'), double-quoted ("..."), or bare non-whitespace tokens.
+_FIXER_KV_RE = re.compile(
+    r"(\w+)="
+    r"(?:'((?:[^'\\]|\\.)*)'|\"((?:[^\"\\]|\\.)*)\"|(\S+))"
+)
+
+
+def _fixer_log_path(workdir: Path) -> Path:
+    """Path to fixers.log. Respects ANGELUS_BELFRY_FIXERS_LOG_PATH override
+    so tests and alternate deployments can redirect without touching state/."""
+    override = os.environ.get("ANGELUS_BELFRY_FIXERS_LOG_PATH")
+    if override:
+        return Path(override)
+    return workdir / "state" / "fixers.log"
+
+
+def _gather_fixer_actions(
+    log_path: Path, since: str | None
+) -> list[dict[str, Any]]:
+    """Read fixers.log and return autoremediation actions since `since`.
+
+    Lines with a timestamp <= since are excluded. Missing or empty log
+    yields an empty list without error. For spawn lines with a report_path,
+    an optional report_excerpt dict (outcome/root-cause fields) is attached
+    when the report file exists.
+    """
+    if not log_path.exists():
+        return []
+    try:
+        text = log_path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    actions: list[dict[str, Any]] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        first_space = line.find(" ")
+        if first_space < 0:
+            continue
+        ts_str = line[:first_space]
+        rest = line[first_space + 1:]
+        if since is not None:
+            try:
+                if _parse_utc(ts_str) <= _parse_utc(since):
+                    continue
+            except ValueError:
+                continue
+        entry: dict[str, Any] = {"occurred_at": ts_str}
+        for m in _FIXER_KV_RE.finditer(rest):
+            key = m.group(1)
+            value = next(
+                (v for v in (m.group(2), m.group(3), m.group(4)) if v is not None), ""
+            )
+            entry[key] = value
+        if entry.get("action") == "spawn":
+            report_path_str = entry.get("report_path")
+            if report_path_str:
+                report_path = Path(report_path_str)
+                if report_path.exists():
+                    entry["report_excerpt"] = _excerpt_sre_report(report_path)
+        actions.append(entry)
+    return actions
+
+
+def _excerpt_sre_report(report_path: Path) -> dict[str, str]:
+    """Extract outcome and root-cause values from an SRE report file.
+
+    Returns a dict with whichever of 'outcome' and 'root-cause' are present.
+    OSError or parse failures return an empty dict.
+    """
+    try:
+        text = report_path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    excerpt: dict[str, str] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        for field in ("outcome:", "root-cause:"):
+            if stripped.lower().startswith(field):
+                excerpt[field.rstrip(":")] = stripped[len(field):].strip()
+                break
+    return excerpt
