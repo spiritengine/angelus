@@ -11,9 +11,33 @@ import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BELFRY_PATH = REPO_ROOT / "belfry" / "belfry.py"
+
+_BELFRY_ENV_VARS = [
+    "ANGELUS_BELFRY_NOTIFY_COMMAND",
+    "ANGELUS_BELFRY_WEDGE_THRESHOLD_SEC",
+    "ANGELUS_BELFRY_SUCCESS_URL",
+    "ANGELUS_BELFRY_DOWN_URL",
+    "ANGELUS_BELFRY_MAX_RESTARTS",
+    "ANGELUS_BELFRY_RESTART_WINDOW_SEC",
+    "ANGELUS_BELFRY_RECOVER_WAIT_SEC",
+    "ANGELUS_BELFRY_SENTINEL_PATH",
+    "ANGELUS_BELFRY_FAILCHECK_PATH",
+    "ANGELUS_BELFRY_NEEDS_SRE_PATH",
+    "ANGELUS_BELFRY_RESTART_PATH",
+    "ANGELUS_BELFRY_FIXERS_LOG_PATH",
+    "ANGELUS_SYSTEMD_UNIT",
+]
+
+
+@pytest.fixture(autouse=True)
+def _clear_belfry_env(monkeypatch):
+    for var in _BELFRY_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
 
 
 class _Response:
