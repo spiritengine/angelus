@@ -322,7 +322,12 @@ def check_daemon_healthy(state: Path) -> bool:
 # Spindle invocation
 # ---------------------------------------------------------------------------
 
-def spindle_spin(prompt: str, working_dir: str, tags: str) -> str | None:
+def spindle_spin(
+    prompt: str,
+    working_dir: str,
+    tags: str,
+    env: dict[str, str] | None = None,
+) -> str | None:
     """Invoke `spindle spin --permission auto+shard`. Returns spool_id or None."""
     try:
         result = subprocess.run(
@@ -336,6 +341,7 @@ def spindle_spin(prompt: str, working_dir: str, tags: str) -> str | None:
             capture_output=True,
             text=True,
             timeout=30,
+            env=env,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         log_err(f"sre-runner: spindle spin failed: {exc}")
@@ -430,7 +436,8 @@ def build_sre_prompt(sentinel_reason: str, state: Path, report_path: Path) -> st
         f"Required final action — you MUST write your report to this exact absolute path "
         f"before finishing:\n"
         f"{report_path}\n\n"
-        f"Create the directory if it does not exist (mkdir -p). Write the file even if you "
+        f"The directory is bind-mounted writable in your sandbox — a plain write works. "
+        f"Write the file even if you "
         f"could not fix the problem — an unresolved report is required. The file content "
         f"must be exactly this structure:\n"
         f"outcome: resolved | unresolved | escalated-to-human\n"
@@ -572,9 +579,21 @@ def _run(root: Path, state: Path) -> int:
     reports_dir = sre_reports_dir(state)
     report_path = reports_dir / f"{report_ts}.md"
 
+    # Directory must exist before spawn; spindle silently skips non-existent bind targets.
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    # Grant the shard sandbox write access to the reports directory.
+    reports_abs = str(reports_dir.resolve())
+    child_env = os.environ.copy()
+    existing_binds = child_env.get("SPINDLE_SHARD_WRITABLE_BINDS", "")
+    if existing_binds:
+        child_env["SPINDLE_SHARD_WRITABLE_BINDS"] = existing_binds + ":" + reports_abs
+    else:
+        child_env["SPINDLE_SHARD_WRITABLE_BINDS"] = reports_abs
+
     prompt = build_sre_prompt(sentinel_reason, state, report_path)
     log_out(f"sre-runner: spawning SRE agent; expected report path: {report_path}")
-    spool_id = spindle_spin(prompt, str(root), tags="angelus-sre")
+    spool_id = spindle_spin(prompt, str(root), tags="angelus-sre", env=child_env)
 
     if spool_id is None:
         log_err("sre-runner: spindle spin failed; spawn counted toward guards")
