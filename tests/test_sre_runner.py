@@ -144,7 +144,7 @@ def test_spawn_invocation_shape(tmp_path):
     captured_prompt = {}
     captured_working_dir = {}
 
-    def fake_spin(prompt, working_dir, tags):
+    def fake_spin(prompt, working_dir, tags, env=None):
         captured_prompt["v"] = prompt
         captured_working_dir["v"] = working_dir
         return "spool99"
@@ -452,3 +452,77 @@ def test_fixers_log_spawn_line(tmp_path):
     assert "report_path=" in line
     # The report_path field should reference the sre-reports dir
     assert "sre-reports" in line
+
+
+# ---------------------------------------------------------------------------
+# Test: SPINDLE_SHARD_WRITABLE_BINDS is set in the spawn env.
+# ---------------------------------------------------------------------------
+
+def test_spawn_env_contains_writable_binds(tmp_path):
+    runner = _load_runner()
+    state = tmp_path / "state"
+    _write_sentinel(state, "loop reason")
+
+    captured_env = {}
+
+    def fake_spin(prompt, working_dir, tags, env=None):
+        captured_env["v"] = env
+        return "spool99"
+
+    with patch.object(runner, "spindle_spin", side_effect=fake_spin), \
+         patch.object(runner, "spindle_wait", return_value="completed"), \
+         patch.object(runner, "check_daemon_healthy", return_value=True), \
+         patch.object(runner, "notify_pat"):
+        runner._run(tmp_path, state)
+
+    env = captured_env["v"]
+    assert env is not None
+    binds = env.get("SPINDLE_SHARD_WRITABLE_BINDS", "")
+    expected = str((state / "sre-reports").resolve())
+    assert expected in binds.split(":")
+
+
+def test_spawn_env_appends_existing_writable_binds(tmp_path):
+    runner = _load_runner()
+    state = tmp_path / "state"
+    _write_sentinel(state, "loop reason")
+
+    captured_env = {}
+
+    def fake_spin(prompt, working_dir, tags, env=None):
+        captured_env["v"] = env
+        return "spool99"
+
+    with patch.dict(os.environ, {"SPINDLE_SHARD_WRITABLE_BINDS": "/some/other/path"}), \
+         patch.object(runner, "spindle_spin", side_effect=fake_spin), \
+         patch.object(runner, "spindle_wait", return_value="completed"), \
+         patch.object(runner, "check_daemon_healthy", return_value=True), \
+         patch.object(runner, "notify_pat"):
+        runner._run(tmp_path, state)
+
+    env = captured_env["v"]
+    assert env is not None
+    parts = env.get("SPINDLE_SHARD_WRITABLE_BINDS", "").split(":")
+    assert "/some/other/path" in parts
+    expected = str((state / "sre-reports").resolve())
+    assert expected in parts
+
+
+def test_reports_dir_created_before_spawn(tmp_path):
+    runner = _load_runner()
+    state = tmp_path / "state"
+    _write_sentinel(state, "loop reason")
+
+    dir_existed_at_spin = {}
+
+    def fake_spin(prompt, working_dir, tags, env=None):
+        dir_existed_at_spin["v"] = (state / "sre-reports").exists()
+        return "spool99"
+
+    with patch.object(runner, "spindle_spin", side_effect=fake_spin), \
+         patch.object(runner, "spindle_wait", return_value="completed"), \
+         patch.object(runner, "check_daemon_healthy", return_value=True), \
+         patch.object(runner, "notify_pat"):
+        runner._run(tmp_path, state)
+
+    assert dir_existed_at_spin["v"] is True
