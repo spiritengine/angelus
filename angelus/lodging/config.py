@@ -21,6 +21,7 @@ SUPPORTED_DIGEST_INPUTS = (
     "open_incidents",
     "suppressed_findings",
     "recent_closures",
+    "fixer_actions",
 )
 
 DISABLED_SUFFIX = ".disabled"
