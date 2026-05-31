@@ -54,3 +54,27 @@
 # on an incident timeline.
 
 */5 * * * * cd /path/to/angelus && { set -a; [ -f state/angelus.env ] && . state/angelus.env; set +a; }; export XDG_RUNTIME_DIR="/run/user/$(id -u)"; /usr/bin/env python belfry/belfry.py >> state/belfry.log 2>&1
+
+# SRE escalation runner — runs every minute; rate-limiting is done in-script
+# (MIN_SPAWN_INTERVAL=45m, MAX_SPAWNS=3 per 6h window) so cron frequency
+# only controls how quickly a fresh sentinel is noticed, not how often an
+# agent is actually spawned.
+#
+# Requires spindle on PATH and notify-pat for escalation pages.  Sources the
+# same state/angelus.env as belfry for ANGELUS_BELFRY_NOTIFY_COMMAND,
+# ANGELUS_BELFRY_NEEDS_SRE_PATH, and any other overrides.
+#
+# state/sre-reports/ — agent-written report files land here.  They are
+# gitignored (runtime state) but tracked in the audit log (state/fixers.log)
+# and referenced in the morning digest.
+#
+# Optional env overrides (all have defaults; set in state/angelus.env):
+#   ANGELUS_SRE_MIN_INTERVAL_SEC   default 2700 (45 min between retries)
+#   ANGELUS_SRE_MAX_SPAWNS         default 3 (hard cap per window)
+#   ANGELUS_SRE_SPAWN_WINDOW_SEC   default 21600 (6 h rolling window)
+#   ANGELUS_SRE_TIMEOUT_SEC        default 1800 (agent run timeout)
+#   ANGELUS_SRE_LOCK_PATH          default state/sre-runner.lock
+#   ANGELUS_SRE_LAST_SPAWN_PATH    default state/sre-last-spawn-at
+#   ANGELUS_SRE_SPAWN_LOG_PATH     default state/sre-spawn-log
+#   ANGELUS_SRE_REPORTS_DIR        default state/sre-reports
+* * * * * cd /path/to/angelus && { set -a; [ -f state/angelus.env ] && . state/angelus.env; set +a; }; export XDG_RUNTIME_DIR="/run/user/$(id -u)"; /usr/bin/env python deploy/sre_runner.py >> state/sre-runner.log 2>&1
