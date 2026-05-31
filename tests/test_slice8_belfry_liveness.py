@@ -205,6 +205,8 @@ def test_op_health_surfaces_belfry_after_real_belfry_tick(
     monkeypatch.setenv("ANGELUS_BELFRY_SUCCESS_URL", "https://hc.example/success")
     monkeypatch.setenv("ANGELUS_BELFRY_DOWN_URL", "https://hc.example/down")
     monkeypatch.setenv("ANGELUS_EMAIL_TO", "test@example.com")
+    # Skip the post-restart recovery sleep introduced by B12.
+    monkeypatch.setenv("ANGELUS_BELFRY_RECOVER_WAIT_SEC", "0")
     # Belfry takes the DOWN path (no live PID file). The sentinel-touch
     # contract is "every tick, success OR failure," so the failure path
     # exercises exactly the same touch the test cares about, without
@@ -220,10 +222,12 @@ def test_op_health_surfaces_belfry_after_real_belfry_tick(
         "urlopen",
         lambda url, timeout: pings.append(url) or _no_op_response(),
     )
+    # B12: dead-pid path now also calls restart_daemon() via subprocess.run
+    # with capture_output/text/timeout/env — widen the stub to accept those.
     monkeypatch.setattr(
         belfry.subprocess,
         "run",
-        lambda args, check: calls.append(args)
+        lambda args, check=False, **kwargs: calls.append(args)
         or subprocess.CompletedProcess(args, 0),
     )
 
