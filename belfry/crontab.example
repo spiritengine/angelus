@@ -12,12 +12,12 @@
 #   ANGELUS_BELFRY_SUCCESS_URL=https://hc-ping.com/<angelus-belfry-ping-uuid>
 #   ANGELUS_BELFRY_DOWN_URL=https://hc-ping.com/<angelus-daemon-down-uuid>
 #
-# Belfry's notify() sends to ANGELUS_EMAIL_TO via the command in
-# ANGELUS_BELFRY_NOTIFY_COMMAND (defaults to bare 'patbot-email' on PATH).
-# Both live in state/angelus.env. If ANGELUS_EMAIL_TO is unset notify()
-# silently no-ops and the only escalation channel left is the DOWN_URL
-# healthcheck ping. Set ANGELUS_BELFRY_NOTIFY_COMMAND to an absolute path
-# because cron PATH is usually stripped.
+# Belfry's notify() sends a push alert via the command in
+# ANGELUS_BELFRY_NOTIFY_COMMAND (defaults to bare 'notify-pat' on PATH).
+# Push is the deliberate choice: belfry alerting over email would be
+# fate-sharing with the transport it's meant to detect as broken
+# (2026-05-29 incident). Set ANGELUS_BELFRY_NOTIFY_COMMAND to an absolute
+# path because cron PATH is usually stripped.
 #
 # ANGELUS_BELFRY_WEDGE_THRESHOLD_SEC (optional) and
 # ANGELUS_BELFRY_FAILCHECK_PATH (optional) also live in state/angelus.env --
