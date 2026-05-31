@@ -142,7 +142,6 @@ def _open_internal_incident(root: Path, source: str = "internal/dispatch") -> No
 def _set_urls(monkeypatch) -> None:
     monkeypatch.setenv("ANGELUS_BELFRY_SUCCESS_URL", "https://hc.example/success")
     monkeypatch.setenv("ANGELUS_BELFRY_DOWN_URL", "https://hc.example/down")
-    monkeypatch.setenv("ANGELUS_EMAIL_TO", "test@example.com")
 
 
 def test_belfry_imports_no_angelus_modules() -> None:
@@ -1241,3 +1240,107 @@ def test_log_lines_timestamped_on_success_tick(
     count = _assert_all_lines_timestamped(captured.out)
     assert count >= 1
     assert "angelus belfry: ok" in captured.out
+
+
+# --- B8 slice: belfry notify() goes over push, not email -----------------
+#
+# belfry's alerting must not share a transport with the daemon -- email
+# silently breaking (2026-05-29 incident) is exactly the failure mode
+# belfry must detect. notify() shells out to notify-pat (push) instead of
+# patbot-email. ANGELUS_EMAIL_TO is irrelevant to belfry's own alert path.
+
+
+def test_notify_push_argv_shape(monkeypatch) -> None:
+    """notify() calls [command, message] -- the notify-pat interface, not the
+    old patbot-email shape [command, 'send', to, subject, '--body', body]."""
+    belfry = _load_belfry()
+    captured: list[list[str]] = []
+
+    def fake_run(args, check):
+        captured.append(list(args))
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(belfry.subprocess, "run", fake_run)
+    monkeypatch.delenv("ANGELUS_EMAIL_TO", raising=False)
+
+    assert belfry.notify("daemon dead") is True
+    assert len(captured) == 1
+    assert captured[0] == ["notify-pat", "angelus belfry alert: daemon dead"]
+
+
+def test_notify_default_command_is_notify_pat(monkeypatch) -> None:
+    """Without ANGELUS_BELFRY_NOTIFY_COMMAND set, the command is notify-pat."""
+    belfry = _load_belfry()
+    captured: list[list[str]] = []
+
+    def fake_run(args, check):
+        captured.append(list(args))
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(belfry.subprocess, "run", fake_run)
+    monkeypatch.delenv("ANGELUS_BELFRY_NOTIFY_COMMAND", raising=False)
+
+    belfry.notify("test reason")
+    assert captured[0][0] == "notify-pat"
+
+
+def test_notify_command_override(monkeypatch) -> None:
+    """ANGELUS_BELFRY_NOTIFY_COMMAND replaces the default."""
+    belfry = _load_belfry()
+    captured: list[list[str]] = []
+
+    def fake_run(args, check):
+        captured.append(list(args))
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(belfry.subprocess, "run", fake_run)
+    monkeypatch.setenv("ANGELUS_BELFRY_NOTIFY_COMMAND", "/usr/local/bin/custom-push")
+
+    belfry.notify("test reason")
+    assert captured[0][0] == "/usr/local/bin/custom-push"
+
+
+def test_notify_does_not_require_email_to(monkeypatch) -> None:
+    """notify() must not skip or fail when ANGELUS_EMAIL_TO is unset."""
+    belfry = _load_belfry()
+    captured: list[list[str]] = []
+
+    def fake_run(args, check):
+        captured.append(list(args))
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(belfry.subprocess, "run", fake_run)
+    monkeypatch.delenv("ANGELUS_EMAIL_TO", raising=False)
+
+    result = belfry.notify("daemon dead")
+    assert result is True
+    assert len(captured) == 1
+
+
+def test_notify_oserror_logs_and_returns_false(monkeypatch, capsys) -> None:
+    """If the push command fails to start, notify() logs via log_err and
+    returns False -- same error-handling shape as before B8."""
+    belfry = _load_belfry()
+
+    def boom(args, check):
+        raise OSError("no such file")
+
+    monkeypatch.setattr(belfry.subprocess, "run", boom)
+
+    assert belfry.notify("test") is False
+    err = capsys.readouterr().err
+    assert "failed to start" in err
+
+
+def test_notify_nonzero_exit_logs_and_returns_false(monkeypatch, capsys) -> None:
+    """A non-zero exit from the push command is logged and returns False."""
+    belfry = _load_belfry()
+
+    def fake_run(args, check):
+        return subprocess.CompletedProcess(args, 1)
+
+    monkeypatch.setattr(belfry.subprocess, "run", fake_run)
+
+    assert belfry.notify("test") is False
+    err = capsys.readouterr().err
+    assert "exited 1" in err

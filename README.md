@@ -74,7 +74,7 @@ cp state/angelus.env.example state/angelus.env
 template. It holds **non-secrets only** — recipient address, healthcheck URLs,
 and the belfry thresholds:
 
-- `ANGELUS_EMAIL_TO` — recipient for the email channel and belfry's notify.
+- `ANGELUS_EMAIL_TO` — recipient for the email channel (daily digest). Not used by belfry.
 - `ANGELUS_BELFRY_SUCCESS_URL`, `ANGELUS_BELFRY_DOWN_URL` — healthchecks.io pings.
 - `ANGELUS_BELFRY_WEDGE_THRESHOLD_SEC` (default 600), `ANGELUS_BELFRY_STALE_AFTER_SEC`
   (default 1200), `ANGELUS_BELFRY_NOTIFY_COMMAND`, and the sentinel/failcheck
@@ -121,7 +121,8 @@ riding email.
 The belfry is the external reliability layer. It runs outside the daemon from
 raw cron, checks `state/angelus.pid`, reads `source_fires` from
 `state/angelus.sqlite3` in read-only mode, pings healthchecks.io, and calls
-`notify-pat` directly when the daemon is dead or wedged.
+`notify-pat` directly when the daemon is dead or wedged. Belfry must never
+alert over email — email is the transport it exists to detect as broken.
 
 Beyond liveness, the belfry also surfaces the daemon's own self-reported
 failures, generically: on each tick it reads `dispatches` and `incidents`
