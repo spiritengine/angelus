@@ -13,6 +13,9 @@ node_modules/
 # secret-adjacent state/angelus.env) but keep the checked-in env template.
 state/*
 !state/angelus.env.example
+!state/sre-reports/
+state/sre-reports/*
+!state/sre-reports/.gitkeep
 observations/
 findings/
 dispatches.log
