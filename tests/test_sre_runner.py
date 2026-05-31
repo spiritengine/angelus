@@ -289,6 +289,60 @@ def test_fail_safe_unwritable_spawn_log(tmp_path):
     mock_spin.assert_not_called()
 
 
+def test_fail_safe_write_last_spawn_ts_fails_no_spawn(tmp_path):
+    """write_last_spawn_ts returning False triggers rollback and blocks spawn."""
+    runner = _load_runner()
+    state = tmp_path / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    _write_sentinel(state)
+
+    with patch.object(runner, "write_last_spawn_ts", return_value=False), \
+         patch.object(runner, "spindle_spin") as mock_spin, \
+         patch.object(runner, "notify_pat"):
+        rc = runner._run(tmp_path, state)
+
+    assert rc == 0
+    mock_spin.assert_not_called()
+
+
+def test_failed_spawn_counts_toward_both_guards(tmp_path):
+    """A spindle_spin returning None (failed spawn) still persists both state files.
+
+    The next tick must be throttled by the 45-min interval and the failed
+    attempt counts toward the 6h max-spawns window.
+    """
+    runner = _load_runner()
+    state = tmp_path / "state"
+    _write_sentinel(state, "crash-loop: failed-spawn test")
+
+    before = time.time()
+
+    with patch.object(runner, "spindle_spin", return_value=None) as mock_spin, \
+         patch.object(runner, "notify_pat"):
+        rc = runner._run(tmp_path, state)
+
+    after = time.time()
+
+    mock_spin.assert_called_once()
+
+    # sre-spawn-log must have exactly one entry within the test time range
+    spawn_log_path = state / "sre-spawn-log"
+    assert spawn_log_path.exists(), "sre-spawn-log must exist after a failed spawn"
+    entries = [l.strip() for l in spawn_log_path.read_text().splitlines() if l.strip()]
+    assert len(entries) == 1
+    ts = float(entries[0])
+    assert before <= ts <= after, "spawn log entry timestamp is outside test window"
+
+    # sre-last-spawn-at must be written so the next tick is throttled
+    last_spawn_path = state / "sre-last-spawn-at"
+    assert last_spawn_path.exists(), "sre-last-spawn-at must exist after a failed spawn"
+    last_ts = float(last_spawn_path.read_text().strip())
+    assert before <= last_ts <= after, "last-spawn timestamp is outside test window"
+
+    # rc=1 signals failed spawn (guards still applied)
+    assert rc == 1
+
+
 # ---------------------------------------------------------------------------
 # Test: sentinel clear on healthy post-check; retained on unhealthy.
 # ---------------------------------------------------------------------------
