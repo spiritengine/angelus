@@ -1746,3 +1746,200 @@ def test_outbound_fires_on_restart(tmp_path, monkeypatch) -> None:
     assert "auto-restart" in payload, (
         f"notify-pat payload missing 'auto-restart': {payload!r}"
     )
+
+
+def test_restart_withheld_when_log_persist_fails(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """If write_restart_log fails (disk/permissions error), the restart is NOT
+    attempted.  The guard must err toward NOT restarting when its own state
+    cannot be durably recorded — an un-guarded restart loop is the failure
+    mode the guard exists to prevent.
+
+    A DOWN ping and notify() still fire: the daemon is genuinely absent,
+    that is a real alert regardless of the guard's internal state.
+    """
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    monkeypatch.setenv("ANGELUS_BELFRY_RECOVER_WAIT_SEC", "0")
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "angelus.pid").write_text("999999", encoding="utf-8")
+    monkeypatch.setattr(belfry, "systemd_main_pid", lambda: None)
+
+    # write_restart_log returns False — simulates disk-full / permission error.
+    monkeypatch.setattr(belfry, "write_restart_log", lambda path, ts: False)
+
+    restart_attempted: list[bool] = []
+    monkeypatch.setattr(
+        belfry,
+        "restart_daemon",
+        lambda: restart_attempted.append(True) or True,
+    )
+
+    pings: list[str] = []
+    notify_calls: list[list[str]] = []
+
+    def fake_run(args, check=False, **kwargs):
+        notify_calls.append(list(args))
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(belfry.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        belfry.urllib.request,
+        "urlopen",
+        lambda url, timeout: pings.append(url) or _Response(),
+    )
+
+    rc = belfry.main([str(tmp_path)])
+
+    # Still alerts DOWN (daemon is genuinely absent).
+    assert rc in (1, 2), f"expected DOWN; got {rc}"
+    assert "https://hc.example/down" in pings, f"DOWN ping missing; pings={pings}"
+
+    # restart_daemon must NOT have been called when guard cannot persist.
+    assert not restart_attempted, (
+        "restart_daemon must NOT be called when write_restart_log fails"
+    )
+
+    # The reason text mentions the withheld restart so notify-pat carries it.
+    all_payloads = " ".join(" ".join(c) for c in notify_calls)
+    assert "withheld" in all_payloads, (
+        f"notify payload must mention 'withheld': {all_payloads!r}"
+    )
+
+
+def test_no_restart_on_wedge_and_drift(tmp_path, monkeypatch) -> None:
+    """When the daemon is BOTH wedged (absence reason) AND drifted, the
+    restart must be withheld.  Drift means the daemon is alive but running
+    outside its systemd unit — `systemctl restart` would start a SECOND
+    instance alongside the mis-launched one, violating the single-writer
+    invariant.  Drift is always alert-only, never auto-restarted.
+
+    Discrimination: with drift suppression removed (just call
+    _autoremediate_absence unconditionally), the restart_calls list below
+    gains one entry and the assertion fails.
+    """
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    monkeypatch.setenv("ANGELUS_BELFRY_RECOVER_WAIT_SEC", "0")
+    (tmp_path / "state").mkdir()
+    # Daemon alive (live pid) but stale source_fire → wedge (absence reason).
+    (tmp_path / "state" / "angelus.pid").write_text(
+        str(os.getpid()), encoding="utf-8"
+    )
+    _write_source_fire(tmp_path, datetime.now(UTC) - timedelta(minutes=30))
+    # Also drifted: live pid != systemd MainPID (other reason).
+    monkeypatch.setattr(belfry, "systemd_main_pid", lambda: os.getpid() + 9999)
+
+    restart_calls: list[list[str]] = []
+    notify_calls: list[list[str]] = []
+
+    def fake_run(args, check=False, **kwargs):
+        a = list(args)
+        if a[:3] == ["systemctl", "--user", "restart"]:
+            restart_calls.append(a)
+        else:
+            notify_calls.append(a)
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(belfry.subprocess, "run", fake_run)
+    pings: list[str] = []
+    monkeypatch.setattr(
+        belfry.urllib.request,
+        "urlopen",
+        lambda url, timeout: pings.append(url) or _Response(),
+    )
+
+    rc = belfry.main([str(tmp_path)])
+
+    # Still alerts DOWN.
+    assert rc in (1, 2), f"expected DOWN; got {rc}"
+    assert "https://hc.example/down" in pings, f"DOWN ping missing; pings={pings}"
+
+    # No restart (drift suppressed it).
+    assert restart_calls == [], (
+        f"restart must NOT fire when drift is also present; got {restart_calls}"
+    )
+
+    # Reason text carries the drift-suppression explanation.
+    all_payloads = " ".join(" ".join(c) for c in notify_calls)
+    assert "drift" in all_payloads, (
+        f"notify payload must mention 'drift': {all_payloads!r}"
+    )
+    assert "withheld" in all_payloads, (
+        f"notify payload must mention 'withheld': {all_payloads!r}"
+    )
+
+
+def test_failed_restart_counts_toward_guard(tmp_path, monkeypatch) -> None:
+    """A FAILED systemctl restart still counts toward the loop guard.
+
+    The guard records the attempt BEFORE calling restart_daemon(), so even a
+    restart that systemctl rejects accumulates toward N.  This pins that
+    invariant: if only successful restarts counted, a daemon systemctl cannot
+    restart would never accumulate toward the limit, defeating the guard
+    entirely for that failure class.
+
+    Setup: restart_daemon() always returns False (systemctl nonzero).  After
+    N ticks (all failed restarts), tick N+1 must be BLOCKED by the guard with
+    the needs-sre sentinel written.
+    """
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    monkeypatch.setenv("ANGELUS_BELFRY_RECOVER_WAIT_SEC", "0")
+    monkeypatch.setenv("ANGELUS_BELFRY_MAX_RESTARTS", "3")
+    monkeypatch.setenv("ANGELUS_BELFRY_RESTART_WINDOW_SEC", "1800")
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "angelus.pid").write_text("999999", encoding="utf-8")
+    monkeypatch.setattr(belfry, "systemd_main_pid", lambda: None)
+
+    # restart_daemon always fails — systemctl returns nonzero / unit not found.
+    monkeypatch.setattr(belfry, "restart_daemon", lambda: False)
+
+    monkeypatch.setattr(
+        belfry.urllib.request,
+        "urlopen",
+        lambda url, timeout: _Response(),
+    )
+    notify_calls: list[list[str]] = []
+
+    def fake_run(args, check=False, **kwargs):
+        notify_calls.append(list(args))
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(belfry.subprocess, "run", fake_run)
+
+    # Ticks 1, 2, 3: all attempt restart (which fails), all record a timestamp.
+    rlog_path = belfry.restart_log_path(tmp_path / "state")
+    for tick in range(1, 4):
+        rc = belfry.main([str(tmp_path)])
+        assert rc in (1, 2), f"tick {tick}: expected DOWN (got {rc})"
+        # Verify N timestamps accumulated so far (all within window).
+        timestamps = belfry.read_restart_log(rlog_path)
+        in_window = [ts for ts in timestamps if ts >= time.time() - 1800]
+        assert len(in_window) == tick, (
+            f"tick {tick}: expected {tick} in-window timestamp(s); "
+            f"got {len(in_window)}"
+        )
+
+    # Tick 4: loop guard must block despite all prior restarts having failed.
+    rc = belfry.main([str(tmp_path)])
+    assert rc in (1, 2), "tick 4: expected DOWN"
+
+    # needs-sre sentinel must be written — guard fired.
+    nsre = belfry.needs_sre_path(tmp_path / "state")
+    assert nsre.exists(), "needs-sre sentinel not written when guard blocks on failed restarts"
+    assert "crash-loop" in nsre.read_text(encoding="utf-8")
+
+    # Audit log: 3 restart entries (failed outcome) + 1 escalate entry.
+    flog = belfry.fixers_log_path(tmp_path / "state")
+    assert flog.exists(), "fixers.log not written"
+    lines = [ln for ln in flog.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    restart_lines = [ln for ln in lines if "action=restart" in ln]
+    escalate_lines = [ln for ln in lines if "action=escalate" in ln]
+    assert len(restart_lines) == 3, (
+        f"expected 3 restart log entries (failed outcome); got {restart_lines}"
+    )
+    assert len(escalate_lines) == 1, (
+        f"expected 1 escalate entry; got {escalate_lines}"
+    )

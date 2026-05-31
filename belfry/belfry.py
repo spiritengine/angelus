@@ -154,12 +154,23 @@ def main(argv: list[str] | None = None) -> int:
     all_reasons = absence_reasons + other_reasons
     if all_reasons:
         if absence_reasons:
-            # Daemon is absent: attempt a loop-guarded restart.  The action
-            # note is appended to the reason string so the DOWN ping and
-            # notify() both carry "what we did and what happened."  A
-            # successful restart is still alert-worthy (a real problem
-            # occurred); the next clean tick pings SUCCESS as normal.
-            action_note = _autoremediate_absence(state, absence_reasons)
+            # Daemon is absent: attempt a loop-guarded restart unless a drift
+            # reason is also present.  Drift means the daemon is alive but
+            # launched outside its systemd unit — `systemctl restart` would
+            # spawn a second instance alongside the mis-launched one, violating
+            # the single-writer invariant.  Drift is always alert-only.
+            has_drift = any(r.startswith("drift:") for r in other_reasons)
+            if has_drift:
+                action_note = (
+                    "wedged but drifted — restart withheld, drift is a human/SRE fix"
+                )
+            else:
+                # Attempt the loop-guarded restart.  The action note is appended
+                # to the reason string so the DOWN ping and notify() both carry
+                # "what we did and what happened."  A successful restart is still
+                # alert-worthy (a real problem occurred); the next clean tick
+                # pings SUCCESS as normal.
+                action_note = _autoremediate_absence(state, absence_reasons)
             reason = "; ".join(all_reasons) + "; " + action_note
         else:
             reason = "; ".join(all_reasons)
@@ -381,20 +392,23 @@ def read_restart_log(path: Path) -> list[float]:
     return timestamps
 
 
-def write_restart_log(path: Path, timestamps: list[float]) -> None:
+def write_restart_log(path: Path, timestamps: list[float]) -> bool:
     """Persist the current in-window restart timestamps.
 
-    Failures are logged and swallowed: a stale restart log only means the
-    guard may be lenient on the next tick, which is far less bad than
-    crashing belfry while trying to record a restart.
+    Returns True on success, False on failure.  A failed write means the
+    guard state cannot be durably recorded; the caller MUST NOT restart on
+    this tick (fail safe, not fail open) — an un-guarded restart loop is
+    worse than a withheld restart.
     """
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
             "".join(f"{ts}\n" for ts in timestamps), encoding="utf-8"
         )
+        return True
     except OSError as exc:
         log_err(f"angelus belfry: failed to write restart log {path}: {exc}")
+        return False
 
 
 def restart_daemon() -> bool:
@@ -519,8 +533,21 @@ def _autoremediate_absence(state: Path, absence_reasons: list[str]) -> str:
         return escalation
 
     # Record this attempt before the systemctl call (see docstring).
+    # If the persist fails, withhold the restart: the guard cannot track
+    # this tick, so restarting now would leave the count unrecorded and
+    # allow an unlimited restart loop on the next tick (fail safe > fail open).
     in_window.append(now_ts)
-    write_restart_log(rlog_path, in_window)
+    persisted = write_restart_log(rlog_path, in_window)
+    if not persisted:
+        guard_fail_note = (
+            "restart withheld: loop-guard could not persist state "
+            "(disk/permissions error on restart log); human attention needed"
+        )
+        append_fixers_log(
+            flog_path, "belfry", "guard_fail", reason_str, "withheld"
+        )
+        log_err(f"angelus belfry: {guard_fail_note}")
+        return guard_fail_note
 
     restarted = restart_daemon()
     if restarted:
