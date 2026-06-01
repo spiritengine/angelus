@@ -493,6 +493,19 @@ def test_render_llm_body_reaps_horizon_when_cancelled_inside_spawn(
             # create_subprocess_exec returns in ms; the sleep only widens
             # the window so the test can land its cancel inside it.
             proc = await real_exec(*args, **kwargs)
+            # Gate the signal on the child's pid marker actually existing.
+            # The stub forks `sleep` and runs `echo $! > marker`
+            # asynchronously, so the marker can lag subprocess creation under
+            # load; signalling on bare creation would race the test's marker
+            # read -> FileNotFoundError. Worse, that crash leaks the sleep:
+            # asyncio.run teardown cancels the internal launch task directly
+            # (a path production never takes), so _recover_cancelled_spawn
+            # gets nothing to reap. Polling here keeps the 0.3s Window-A pause
+            # intact while guaranteeing the marker is present.
+            for _ in range(500):
+                if marker.exists() and marker.read_text().strip():
+                    break
+                await asyncio.sleep(0.005)
             spawn_started.set()
             await asyncio.sleep(0.3)
             return proc
