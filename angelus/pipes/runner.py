@@ -461,8 +461,43 @@ class PipeDrain:
         except OSError as exc:
             return None, f"chronicler prompt staging failed: {exc}"
         _prune_digest_staging(staging_dir)
-        try:
-            process = await asyncio.create_subprocess_exec(
+        # WINDOW A vs WINDOW B -- two distinct daemon-shutdown cancellation
+        # races, both of which orphan the forking `horizon cast` subtree if
+        # unhandled.
+        #
+        # A digest pipe drains from an APScheduler interval/cron job.
+        # AsyncIOExecutor.shutdown() cancels that job's asyncio task on
+        # daemon shutdown -- it .cancel()s the future, it does NOT await it.
+        # The CancelledError lands at whichever `await` the drain is parked
+        # on, and there are two of them in this render:
+        #
+        #   WINDOW B (rarer) -- parked at `await process.communicate()`
+        #   below. `process` is already bound there, so the
+        #   `except CancelledError` arm can _kill_and_reap(process). That
+        #   arm, plus the daemon tracking in-flight drain tasks in
+        #   self._drain_tasks and awaiting them in run()'s shutdown-finally,
+        #   is what makes B's reap complete before the event loop closes.
+        #
+        #   WINDOW A (dominant under load) -- parked INSIDE
+        #   create_subprocess_exec, before its result is assigned to
+        #   `process`. The horizon leader has already forked its grandchild,
+        #   but our coroutine never received the Process handle, so a naive
+        #   `except CancelledError: reap(process)` would have no `process` to
+        #   reap -- the handle is lost and the subtree orphans.
+        #
+        # Fix for A: run the spawn as its own task (`launch`) and await it
+        # through asyncio.shield. shield detaches the *waiter* from
+        # cancellation: when our drain task is cancelled mid-spawn, our await
+        # raises CancelledError but `launch` keeps running and still produces
+        # the Process. In the cancel arm we recover that handle from `launch`
+        # (see _recover_cancelled_spawn) and reap the whole group before
+        # re-raising, so the subtree cannot outlive the daemon. The
+        # uncancelled path is behaviourally unchanged: shield(launch) awaits
+        # the spawn and returns the same Process a bare
+        # `await create_subprocess_exec(...)` would have, and an OSError from
+        # the spawn still surfaces here.
+        launch: asyncio.Future[asyncio.subprocess.Process] = asyncio.ensure_future(
+            asyncio.create_subprocess_exec(
                 "horizon",
                 "cast",
                 "--mantle",
@@ -484,6 +519,18 @@ class PipeDrain:
                 # the leader -- the same hardening run_shell_source uses.
                 start_new_session=True,
             )
+        )
+        try:
+            process = await asyncio.shield(launch)
+        except asyncio.CancelledError:
+            # WINDOW A reap: the spawn was in flight when we were cancelled,
+            # so `process` above is unbound. Recover the handle the shielded
+            # spawn still produced and SIGKILL+reap the whole horizon process
+            # group before re-raising, so the subtree cannot be orphaned.
+            orphan = await _recover_cancelled_spawn(launch)
+            if orphan is not None:
+                await _kill_and_reap(orphan)
+            raise
         except OSError as exc:
             return None, f"chronicler launch failed: {exc}"
         try:
@@ -550,6 +597,45 @@ class PipeDrain:
             if channel_count >= per_channel:
                 return True
         return False
+
+
+async def _recover_cancelled_spawn(
+    launch: asyncio.Future[asyncio.subprocess.Process],
+) -> asyncio.subprocess.Process | None:
+    """Recover the Process handle from a shielded `horizon` spawn whose
+    awaiting task was cancelled mid-flight, so the caller can reap it.
+
+    See _render_llm_body's WINDOW A note for why the spawn is shielded. By
+    the time we get here the calling drain task has already taken a
+    CancelledError at `await asyncio.shield(launch)`, but `launch` itself was
+    never cancelled (shield detaches only the waiter), so it still runs to
+    completion and yields the real Process -- we just have to wait for it.
+
+    We can be cancelled *again* while waiting: the daemon's shutdown-finally
+    cancels each in-flight drain task on top of the AsyncIOExecutor cancel
+    that started this. So a re-cancel simply loops. We wait via asyncio.wait
+    rather than `await launch` / `await shield(launch)` deliberately:
+    asyncio.wait resolves when `launch` is done WITHOUT propagating its
+    result or exception, so a spawn that failed with OSError does not surface
+    here and mask the CancelledError the caller is mid-handling -- we inspect
+    `launch`'s state below instead. asyncio.wait also does not cancel the
+    futures it waits on when it is itself cancelled, so `launch` keeps
+    running and always finishes; the loop terminates.
+
+    create_subprocess_exec returns in milliseconds in practice, so this does
+    not meaningfully delay shutdown; the daemon's bounded shutdown gather
+    (_DRAIN_SHUTDOWN_TIMEOUT) is the outer ceiling if a spawn ever genuinely
+    wedges.
+
+    Returns None if the spawn itself failed (e.g. OSError) -- nothing was
+    started, so there is nothing to reap.
+    """
+    while not launch.done():
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait({launch})
+    if launch.cancelled() or launch.exception() is not None:
+        return None
+    return launch.result()
 
 
 def _parse_hourly_limit(value: str | None) -> int | None:

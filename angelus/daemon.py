@@ -30,6 +30,13 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_BELFRY_SENTINEL_FILENAME = "belfry-pinged-at"
 DEFAULT_BELFRY_STALE_AFTER_SEC = 1200
 
+# Hard ceiling on awaiting cancelled digest-drain tasks during shutdown.
+# Set above _kill_and_reap's own _REAP_TIMEOUT (5.0s) so a drain cancelled
+# mid-render gets to run its reap arm to completion, while a genuinely
+# wedged drain still cannot hang shutdown past this bound. Kept comfortably
+# under the integration fell's 8.0s no-hang assertion.
+_DRAIN_SHUTDOWN_TIMEOUT = 6.0
+
 
 class AngelusDaemon:
     def __init__(self, root: Path) -> None:
@@ -63,6 +70,14 @@ class AngelusDaemon:
         # on cadence change without disturbing others, and so cancelled tasks
         # don't accumulate in self.tasks across pipe churn.
         self._pipe_loop_tasks: dict[str, asyncio.Task[None]] = {}
+        # In-flight non-immediate (cron/interval) digest-drain job tasks.
+        # AsyncIOExecutor.shutdown() cancels these on shutdown but does not
+        # await them, and they are not in `pending` -- so a cancelled drain's
+        # reap arm (_render_llm_body -> _kill_and_reap) would race event-loop
+        # teardown and orphan the horizon cast subtree. Each drain registers
+        # its task here on entry and discards on exit; run()'s finally cancels
+        # and awaits the set. Mirrors _triage_loop's in_flight handling.
+        self._drain_tasks: set[asyncio.Task[None]] = set()
         self.pipe_drains: dict[str, PipeDrain] = {
             name: PipeDrain(
                 self.catalog,
@@ -170,6 +185,29 @@ class AngelusDaemon:
                 await self.reloader.stop()
             if scheduler_started:
                 self.scheduler.shutdown(wait=True)
+            # AsyncIOExecutor.shutdown() above cancels in-flight digest-drain
+            # job tasks but does not await them, and they are not in `pending`.
+            # Cancel (idempotent) and await them here so each cancelled drain's
+            # reap arm (_render_llm_body -> _kill_and_reap) runs before the loop
+            # closes -- otherwise the horizon cast subtree is orphaned. Same
+            # cancel-then-gather shape _triage_loop uses for its in-flight
+            # tasks; bounded by wait_for so a wedged drain cannot hang shutdown
+            # forever (the reap itself is already bounded at _REAP_TIMEOUT).
+            if self._drain_tasks:
+                in_flight = list(self._drain_tasks)
+                for task in in_flight:
+                    task.cancel()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*in_flight, return_exceptions=True),
+                        timeout=_DRAIN_SHUTDOWN_TIMEOUT,
+                    )
+                except TimeoutError:
+                    LOGGER.warning(
+                        "drain task shutdown exceeded %.1fs; %d still in-flight",
+                        _DRAIN_SHUTDOWN_TIMEOUT,
+                        len(self._drain_tasks),
+                    )
             pending = [*self.tasks, *self._pipe_loop_tasks.values()]
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
@@ -401,14 +439,36 @@ class AngelusDaemon:
     def _add_pipe_job(self, pipe_name: str, cadence: str) -> None:
         trigger = _make_trigger(cadence)
         self.scheduler.add_job(
-            self.pipe_drains[pipe_name].drain_once,
+            self._run_drain_job,
             trigger,
+            args=[pipe_name],
             id=f"pipe:{pipe_name}",
             max_instances=1,
             coalesce=True,
             replace_existing=True,
         )
         LOGGER.info("registered pipe %s on %s", pipe_name, cadence)
+
+    async def _run_drain_job(self, pipe_name: str) -> None:
+        """Scheduler job body for a non-immediate (cron/interval) pipe.
+
+        Wraps drain.drain_once() so the running asyncio task is tracked in
+        self._drain_tasks for its whole lifetime. AsyncIOExecutor.shutdown()
+        cancels this task on daemon shutdown but does not await it, and it is
+        not in run()'s `pending`; the tracking lets run()'s finally cancel and
+        await it so the CancelledError reap arm runs before the loop closes.
+        """
+        drain = self.pipe_drains.get(pipe_name)
+        if drain is None:
+            return
+        task = asyncio.current_task()
+        if task is not None:
+            self._drain_tasks.add(task)
+        try:
+            await drain.drain_once()
+        finally:
+            if task is not None:
+                self._drain_tasks.discard(task)
 
     def _remove_job(self, job_id: str) -> None:
         try:
