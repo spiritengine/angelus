@@ -1221,6 +1221,44 @@ def test_last_code_commit_epoch_fails_open_on_non_repo(tmp_path) -> None:
     assert belfry.last_code_commit_epoch(tmp_path) is None
 
 
+def test_last_code_commit_epoch_no_angelus_commit_fails_open(tmp_path) -> None:
+    """A real repo whose history never touches angelus/ -> `git log` exits 0
+    with empty stdout -> float('') ValueError -> fail open (None), not crash.
+    Pins the broad `except Exception`: the empty-output case is a ValueError,
+    which a narrower OSError/SubprocessError except would let escape and
+    abort the belfry tick."""
+    belfry = _load_belfry()
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    run = lambda *a: subprocess.run(  # noqa: E731
+        ["git", "-C", str(tmp_path), *a], check=True, capture_output=True, env=env
+    )
+    run("init", "-q")
+    (tmp_path / "README.md").write_text("not python, not angelus", encoding="utf-8")
+    run("add", "README.md")
+    run("commit", "-qm", "docs only")
+    assert belfry.last_code_commit_epoch(tmp_path) is None
+
+
+def test_starttime_ticks_parse_survives_comm_with_spaces_and_parens() -> None:
+    """The /proc/<pid>/stat field-22 parse must split on the FINAL ')': comm
+    can contain spaces and parens (a process can rename itself), which a live
+    `python3` process never exercises. Field 22 (starttime) is token index 19
+    after the closing paren."""
+    belfry = _load_belfry()
+    # comm = "weird (proc) name"; fields 3..22 follow, starttime (22) = 987654.
+    line = (
+        "1234 (weird (proc) name) S 1 1234 1234 0 -1 4194560 "
+        "100 0 0 0 5 6 0 0 20 0 1 0 987654 0 0\n"
+    )
+    assert belfry._starttime_ticks_from_proc_stat(line) == 987654
+
+
 def test_process_start_epoch_reads_self(tmp_path) -> None:
     """process_start_epoch reads /proc for a live pid and returns a sane
     epoch (after boot, not in the future). Linux-only path."""

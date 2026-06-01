@@ -760,7 +760,7 @@ def drift_failure(pid_file: Path) -> str | None:
 
 
 def last_code_commit_epoch(root: Path) -> float | None:
-    """Epoch of the most recent commit touching Python code, or None.
+    """Epoch of the most recent commit to the daemon's runtime package, or None.
 
     Uses git rather than working-tree mtimes deliberately: an editable
     install runs the files on disk, so flagging on every uncommitted edit
@@ -769,10 +769,24 @@ def last_code_commit_epoch(root: Path) -> float | None:
     fixer_actions on 2026-05-31 while the daemon kept running pre-merge
     code. Fails open (None) outside a git repo or if git is unavailable, so
     an un-interrogable repo never reports a false DOWN.
+
+    The pathspec is scoped to ``angelus/`` -- the package the daemon imports
+    -- NOT a repo-wide ``*.py``. A commit touching only tests/, belfry/, or
+    docs/ does not change what the running daemon executes, so it must not
+    flip this check to DOWN and nag every tick. Belfry itself runs fresh
+    from cron each tick, so belfry.py is never "stale" the way the
+    long-lived daemon can be.
+
+    Caveat: %ct is the committer date, used as a proxy for "landing time."
+    This repo's shard workflow re-stamps commits at merge (committer date ~=
+    landing time), so the proxy holds. A future move to fast-forward merges
+    of older-authored commits could carry a stale %ct and under-report (a
+    false negative) -- but never a false positive, since that needs a
+    future-dated commit. If merge policy changes, revisit this.
     """
     try:
         result = subprocess.run(
-            ["git", "-C", str(root), "log", "-1", "--format=%ct", "--", "*.py"],
+            ["git", "-C", str(root), "log", "-1", "--format=%ct", "--", "angelus"],
             capture_output=True,
             text=True,
             timeout=10,
@@ -791,19 +805,31 @@ def last_code_commit_epoch(root: Path) -> float | None:
         return None
 
 
+def _starttime_ticks_from_proc_stat(stat_line: str) -> int:
+    """Field 22 (starttime, in clock ticks) from a /proc/<pid>/stat line.
+
+    comm (field 2) is wrapped in parens and may itself contain spaces or
+    parens, so we split on the text after the FINAL ')'. There, token index
+    19 is field 22 (field N -> index N-3, since field 3 -- state -- lands at
+    index 0). Pulled out so the parse can be unit-tested against a comm with
+    embedded spaces/parens, which a live process named `python3` cannot
+    exercise.
+    """
+    after_comm = stat_line.rpartition(")")[2].split()
+    return int(after_comm[19])
+
+
 def process_start_epoch(pid: int) -> float | None:
     """Wall-clock start time of PID from /proc/<pid>/stat, or None.
 
     Field 22 (starttime) is in clock ticks since boot; combined with btime
-    from /proc/stat it yields an epoch. comm (field 2) may contain spaces or
-    parens, so we read the tail after the final ')': there, token index 19
-    is field 22. Linux-only and fail-open, consistent with belfry's other
-    checks -- a kernel that does not expose /proc never reports a false DOWN.
+    from /proc/stat it yields an epoch. Linux-only and fail-open, consistent
+    with belfry's other checks -- a kernel that does not expose /proc never
+    reports a false DOWN.
     """
     try:
         stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-        after_comm = stat.rpartition(")")[2].split()
-        starttime_ticks = int(after_comm[19])
+        starttime_ticks = _starttime_ticks_from_proc_stat(stat)
         clk_tck = os.sysconf("SC_CLK_TCK")
         if clk_tck <= 0:
             return None

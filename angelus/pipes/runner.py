@@ -659,6 +659,11 @@ def _prune_digest_staging(
     limit. The timestamp prefix is fixed-width, so lexical name order is
     chronological. Pruning is housekeeping, not correctness -- any IO error
     is swallowed so it can never fail a render.
+
+    ``keep`` is a budget across ALL digest pipes that share this directory,
+    not per-pipe: the glob is dir-wide, so with multiple digest pipes their
+    prompts prune each other and per-pipe history is shorter than ``keep``.
+    Fine for the single daily digest; revisit if more digest pipes land.
     """
     if keep <= 0:
         return
