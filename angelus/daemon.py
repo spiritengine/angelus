@@ -160,6 +160,7 @@ class AngelusDaemon:
             # counter populated would let a single subsequent failure cross
             # the threshold immediately on the new generation.
             self.catalog.clear_digest_channel_attempts()
+            self._reconcile_lodging_incidents()
             self._register_initial_jobs()
             self.scheduler.start()
             scheduler_started = True
@@ -224,6 +225,44 @@ class AngelusDaemon:
                     exc_info=True,
                 )
             self.connection.close()
+
+    def _reconcile_lodging_incidents(self) -> None:
+        """Clear any internal/lodging incident left open across a restart.
+
+        internal/lodging incidents recover off filesystem CHANGE events: the
+        reloader's _clear_rejection fires only from _apply_swap /
+        _apply_removal, i.e. a watchdog change *after* reloader.start(). But a
+        broken lodging file crashes startup (load_lodging in __init__ raises),
+        so the operator fixes the file WHILE THE DAEMON IS DOWN. On restart the
+        watchdog sees an already-correct file, no change event fires, and the
+        pre-restart internal/lodging incident stays open forever -- silently
+        suppressing the next real lodging breakage under the B30 gate.
+
+        load_lodging succeeded in __init__ before we got here, which proves
+        every watched lodging file is currently valid, so reconcile: clear each
+        open internal/lodging incident through the same clearance path the
+        reloader uses (write_internal_clearance), so recent_closures stays
+        correct and the gate re-arms. The clearance is a no-op for keys with
+        nothing open, so this is safe and idempotent.
+        """
+        known_pipes = set(self.lodging.pipes)
+        reconciled = 0
+        for incident in self.catalog.open_incidents():
+            if incident["source"] != "internal/lodging":
+                continue
+            self.catalog.write_internal_clearance(
+                "internal/lodging",
+                incident["entity"],
+                f"{incident['entity']} OK at startup",
+                known_pipes,
+            )
+            reconciled += 1
+        if reconciled:
+            LOGGER.info(
+                "startup recovery: cleared %d orphaned internal/lodging "
+                "incident(s)",
+                reconciled,
+            )
 
     def request_stop(self) -> None:
         self.stop_event.set()

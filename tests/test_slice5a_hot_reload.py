@@ -629,3 +629,86 @@ def test_push_channel_kills_subprocess_on_timeout(tmp_path) -> None:
     pid = int(pid_file.read_text(encoding="utf-8"))
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
+
+
+def test_startup_reconciles_orphaned_lodging_incident(tmp_path) -> None:
+    """An internal/lodging incident left open across a restart is cleared
+    on boot, so a subsequent re-failure re-emits.
+
+    Motivating scenario: a broken lodging file crashes startup
+    (load_lodging raises), the operator fixes it while the daemon is DOWN,
+    and on restart the watchdog sees an already-correct file -- so the
+    reloader's change-driven _clear_rejection never fires. Without the
+    startup reconcile, the pre-restart incident stays open forever and the
+    B30 gate silently suppresses the next real lodging breakage. This pins
+    that the startup reconcile closes it and re-arms the gate.
+    """
+    _write_lodging(tmp_path)
+    daemon = AngelusDaemon(tmp_path)
+    known_pipes = set(daemon.lodging.pipes)
+    try:
+        # Pre-restart failure: open an internal/lodging incident.
+        first = daemon.catalog.write_internal_finding(
+            "internal/lodging",
+            "load_failed",
+            "pipes/now.yaml",
+            "broken yaml",
+            known_pipes,
+        )
+        assert first != 0
+        open_lodging = [
+            i
+            for i in daemon.catalog.open_incidents()
+            if i["source"] == "internal/lodging"
+        ]
+        assert len(open_lodging) == 1
+        assert open_lodging[0]["entity"] == "pipes/now.yaml"
+
+        # A repeat while the incident is open is dropped by the gate (no
+        # change event would fire after an in-down fix, so this models the
+        # incident simply persisting).
+        repeat = daemon.catalog.write_internal_finding(
+            "internal/lodging",
+            "load_failed",
+            "pipes/now.yaml",
+            "still broken",
+            known_pipes,
+        )
+        assert repeat == first
+
+        # Boot reconcile: the file is valid now, so the orphaned incident
+        # must close.
+        daemon._reconcile_lodging_incidents()
+        assert [
+            i
+            for i in daemon.catalog.open_incidents()
+            if i["source"] == "internal/lodging"
+        ] == []
+        # The clearance is recorded so recent_closures stays correct.
+        closures = [
+            c
+            for c in daemon.catalog.clearance_findings_since(None)
+            if c["entity"] == "pipes/now.yaml"
+        ]
+        assert len(closures) == 1
+
+        # Gate re-armed: a genuine subsequent re-failure opens a NEW
+        # incident and emits a fresh finding (not suppressed).
+        reopened = daemon.catalog.write_internal_finding(
+            "internal/lodging",
+            "load_failed",
+            "pipes/now.yaml",
+            "broke again",
+            known_pipes,
+        )
+        assert reopened != 0
+        assert reopened != first
+        reopen_lodging = [
+            i
+            for i in daemon.catalog.open_incidents()
+            if i["source"] == "internal/lodging"
+        ]
+        assert len(reopen_lodging) == 1
+        assert reopen_lodging[0]["latest_finding_id"] == reopened
+    finally:
+        daemon.connection.close()
