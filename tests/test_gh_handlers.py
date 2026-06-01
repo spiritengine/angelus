@@ -227,6 +227,8 @@ def test_stale_pr_first_cycle_emits_one_finding_per_stale_pr() -> None:
     # Deterministic numeric ordering keeps the daily digest stable for
     # the chronicler LLM and for log reading.
     assert [f["body"]["text"].split("#")[1].split(" ")[0] for f in findings] == ["7", "9"]
+    # Each stale PR opens its own per-PR incident, keyed "{repo}#{number}".
+    assert [f["entity"] for f in findings] == ["skein#7", "skein#9"]
     for f in findings:
         assert f["type"] == "stale_pr"
         assert f["severity"] == "low"
@@ -253,14 +255,13 @@ def test_stale_pr_already_alerted_not_repeated() -> None:
     assert out["new_state"] == {"alerted_prs": [7, 9]}
 
 
-def test_stale_pr_partial_recovery_no_finding_keeps_incident_open() -> None:
+def test_stale_pr_partial_recovery_clears_only_recovered_pr() -> None:
     """One PR clears (merged/closed/refreshed) while another remains
-    stale. The (single, per-repo) stale_pr incident must stay open --
-    emitting a clearance here would close the incident prematurely
-    because the catalog close path closes ALL incidents on (source,
-    entity), not by dedup_key (storage/catalog.py:_close_incident).
-    State just drops the recovered PR silently; the chronicler still
-    has the original stale_pr finding in `findings_since_last_drain`."""
+    stale. With per-PR incidents, the recovered PR (#7) gets its own
+    clearance — closing only its incident — while the still-stale PR
+    (#9) keeps its incident open and emits no new finding (already
+    alerted). This is the per-PR visibility the gate change is for: the
+    old per-repo model dropped the #7 recovery silently."""
     observation = {
         "entity": "skein",
         "prs": [
@@ -278,17 +279,20 @@ def test_stale_pr_partial_recovery_no_finding_keeps_incident_open() -> None:
             "clearance_pipe": "daily",
         },
     )
-    assert out["findings"] == []
+    findings = out["findings"]
+    assert len(findings) == 1
+    assert findings[0]["type"] == "clearance"
+    assert findings[0]["entity"] == "skein#7"
+    assert "#7" in findings[0]["body"]["text"]
     assert out["new_state"] == {"alerted_prs": [9]}
 
 
-def test_stale_pr_full_recovery_emits_single_clearance() -> None:
-    """When the LAST stale PR clears, emit one clearance finding (type
-    must be 'clearance' so storage.catalog._close_incident actually
-    closes the per-repo stale_pr incident -- fell-r1 BLOCK #1). The
-    body lists which PRs cleared, so the daily digest's recent_closures
-    section is informative without per-PR finding spam during partial
-    recoveries."""
+def test_stale_pr_recovery_emits_per_pr_clearance() -> None:
+    """When a stale PR recovers (refreshed/merged/closed), emit a
+    clearance keyed to that PR's entity (type must be 'clearance' so
+    storage.catalog._close_incident closes the PR's incident -- fell-r1
+    BLOCK #1). The clearance is per-PR, so its entity is "{repo}#{number}"
+    and the catalog closes exactly that PR's incident."""
     observation = {
         "entity": "skein",
         "prs": [
@@ -311,18 +315,18 @@ def test_stale_pr_full_recovery_emits_single_clearance() -> None:
     assert findings[0]["type"] == "clearance"
     assert findings[0]["severity"] == "info"
     assert findings[0]["target_pipes"] == ["daily"]
+    assert findings[0]["entity"] == "skein#7"
     assert "#7" in findings[0]["body"]["text"]
-    assert "cleared" in findings[0]["body"]["text"]
     assert out["new_state"] == {"alerted_prs": []}
 
 
-def test_stale_pr_full_recovery_with_new_stale_emits_only_stale_finding() -> None:
-    """Old alerts cleared but a different PR is now stale: just emit
-    the new stale_pr finding, no clearance. The per-repo incident
-    stays open (now tracking the new stale PR). Without this guard a
-    clearance would fire and close the incident the same cycle the
-    new stale_pr finding reopens it -- a flapping (open, close) pair
-    that confuses the catalog's incident lifecycle."""
+def test_stale_pr_old_cleared_and_new_stale_emit_independently() -> None:
+    """Old alert (#7) cleared while a different PR (#14) is now stale:
+    with per-PR incidents these are distinct entities, so emit BOTH a
+    stale_pr for #14 (opens its incident) and a clearance for #7 (closes
+    its incident). The old per-repo flapping concern (a close+open pair
+    on the same incident in one cycle) doesn't apply -- the two findings
+    touch different incidents."""
     observation = {
         "entity": "skein",
         "prs": [
@@ -336,9 +340,12 @@ def test_stale_pr_full_recovery_with_new_stale_emits_only_stale_finding() -> Non
         {"entity": "skein", "severity": "low", "target_pipe": "daily"},
     )
     findings = out["findings"]
-    assert len(findings) == 1
-    assert findings[0]["type"] == "stale_pr"
-    assert "#14" in findings[0]["body"]["text"]
+    assert len(findings) == 2
+    by_type = {f["type"]: f for f in findings}
+    assert by_type["stale_pr"]["entity"] == "skein#14"
+    assert "#14" in by_type["stale_pr"]["body"]["text"]
+    assert by_type["clearance"]["entity"] == "skein#7"
+    assert "#7" in by_type["clearance"]["body"]["text"]
     assert out["new_state"] == {"alerted_prs": [14]}
 
 
@@ -380,8 +387,8 @@ def test_stale_pr_check_failed_no_change() -> None:
 
 def test_stale_pr_empty_listing_clears_old_alerts() -> None:
     """A repo with no open PRs after previously having stale ones emits
-    one clearance finding (the per-repo incident closes) and lists the
-    PR numbers in the body so the daily digest knows what cleared."""
+    one clearance finding PER previously-alerted PR (each closes its own
+    per-PR incident), in number order."""
     out = _invoke(
         STALE_HANDLER,
         {"entity": "skein", "prs": []},
@@ -389,10 +396,11 @@ def test_stale_pr_empty_listing_clears_old_alerts() -> None:
         {"entity": "skein", "severity": "low", "target_pipe": "daily"},
     )
     findings = out["findings"]
-    assert len(findings) == 1
-    assert findings[0]["type"] == "clearance"
+    assert len(findings) == 2
+    assert all(f["type"] == "clearance" for f in findings)
+    assert [f["entity"] for f in findings] == ["skein#7", "skein#9"]
     assert "#7" in findings[0]["body"]["text"]
-    assert "#9" in findings[0]["body"]["text"]
+    assert "#9" in findings[1]["body"]["text"]
     assert out["new_state"] == {"alerted_prs": []}
 
 
@@ -600,9 +608,9 @@ def test_stale_pr_incident_lifecycle_through_handler_and_catalog(
     past (fell-r2 NIT #1).
 
     Run sequence: handler emits stale_pr findings (cycle 1) -> writes
-    them to catalog -> handler emits clearance (cycle 2) -> writes to
+    them to catalog -> handler emits clearances (cycle 2) -> writes to
     catalog -> assert open_incidents drops to zero and
-    clearance_findings_since reports the recovery."""
+    clearance_findings_since reports each recovery."""
     connection = init_db(tmp_path / "angelus.sqlite3")
     catalog = Catalog(connection, tmp_path)
     metadata = {
@@ -611,10 +619,19 @@ def test_stale_pr_incident_lifecycle_through_handler_and_catalog(
         "target_pipe": "daily",
         "clearance_pipe": "daily",
     }
+
+    def _skein_incidents() -> list[dict]:
+        return [
+            i
+            for i in catalog.open_incidents()
+            if i["entity"].startswith("skein#")
+        ]
+
     try:
         # Cycle 1: two PRs cross staleness threshold. Handler emits two
-        # stale_pr findings; we write each through the catalog. They
-        # upsert into ONE open incident (unique source/type/entity).
+        # stale_pr findings; we write each through the catalog. With
+        # per-PR keying each opens its OWN incident (unique
+        # source/type/entity on "skein#7" and "skein#9").
         cycle1 = _invoke(
             STALE_HANDLER,
             {
@@ -639,47 +656,46 @@ def test_stale_pr_incident_lifecycle_through_handler_and_catalog(
         for finding in cycle1["findings"]:
             catalog.write_finding(None, finding, known_pipes={"daily"})
 
-        open_after_stale = [
-            i for i in catalog.open_incidents() if i["entity"] == "skein"
-        ]
-        assert len(open_after_stale) == 1
-        assert open_after_stale[0]["type"] == "stale_pr"
+        open_after_stale = _skein_incidents()
+        assert len(open_after_stale) == 2
+        assert {i["entity"] for i in open_after_stale} == {"skein#7", "skein#9"}
+        assert all(i["type"] == "stale_pr" for i in open_after_stale)
 
         # Cycle 2: both PRs recovered (no longer in listing). Handler
-        # emits one clearance finding; writing it through catalog must
-        # close the open incident. A regression to type='pr_recovered'
-        # here would land in the else-branch of write_finding and OPEN
-        # a new incident, leaving the stale_pr one open -- the test
-        # would see two opens and fail.
+        # emits one clearance finding per PR; writing each through the
+        # catalog must close its incident. A regression to a non-clearance
+        # type would land in the else-branch of write_finding and OPEN a
+        # new incident instead of closing -- the test would see opens
+        # remaining and fail.
         cycle2 = _invoke(
             STALE_HANDLER,
             {"entity": "skein", "prs": []},
             cycle1["new_state"],
             metadata,
         )
-        assert len(cycle2["findings"]) == 1
-        finding = cycle2["findings"][0]
-        # Explicit pin: the catalog only fires _close_incident on this
-        # exact type string. If the handler ever stops emitting it, the
-        # assertion below catches it before the catalog write.
-        assert finding["type"] == "clearance", (
-            "handler must emit type='clearance' so catalog._close_incident "
-            f"fires (got {finding['type']!r})"
-        )
-        catalog.write_finding(None, finding, known_pipes={"daily"})
+        assert len(cycle2["findings"]) == 2
+        for finding in cycle2["findings"]:
+            # Explicit pin: the catalog only fires _close_incident on this
+            # exact type string. If the handler ever stops emitting it, the
+            # assertion below catches it before the catalog write.
+            assert finding["type"] == "clearance", (
+                "handler must emit type='clearance' so catalog._close_incident "
+                f"fires (got {finding['type']!r})"
+            )
+            catalog.write_finding(None, finding, known_pipes={"daily"})
 
-        open_after_clear = [
-            i for i in catalog.open_incidents() if i["entity"] == "skein"
-        ]
+        open_after_clear = _skein_incidents()
         assert open_after_clear == [], (
-            "handler's clearance finding must close the per-repo stale_pr "
-            f"incident through the catalog; got still-open: {open_after_clear}"
+            "each clearance finding must close its PR's stale_pr incident "
+            f"through the catalog; got still-open: {open_after_clear}"
         )
 
         closures = catalog.clearance_findings_since(None)
-        skein_closures = [c for c in closures if c["entity"] == "skein"]
-        assert len(skein_closures) == 1, (
-            "clearance must appear in clearance_findings_since (feeds the "
+        skein_closures = [
+            c for c in closures if c["entity"].startswith("skein#")
+        ]
+        assert {c["entity"] for c in skein_closures} == {"skein#7", "skein#9"}, (
+            "each clearance must appear in clearance_findings_since (feeds the "
             "chronicler's recent_closures input); a non-clearance type "
             "would silently miss this filter"
         )

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -821,6 +821,21 @@ def test_pipe_state_updates_and_scopes_next_drain(tmp_path, monkeypatch) -> None
     monkeypatch.setattr(PipeDrain, "_render_llm_body", fake_llm)
 
     try:
+        # Open an incident for `site` first so the clearance has something to
+        # close -- under the B30 recovery gate a clearance with nothing open
+        # is a no-op. Route the opening `down` to `now`, not `daily`, so it
+        # stays out of the daily findings_since_last_drain this test scopes.
+        catalog.write_finding(
+            None,
+            {
+                "source": "scheduled/test",
+                "type": "down",
+                "entity": "site",
+                "severity": "high",
+                "target_pipes": ["now"],
+            },
+            {"now", "daily"},
+        )
         catalog.write_finding(
             None,
             {
@@ -1097,6 +1112,20 @@ def test_clearance_dedup_excludes_clearance_from_findings(tmp_path, monkeypatch)
             "target_pipes": ["daily"],
         },
         {"daily"},
+    )
+    # Open an incident for site-b first so its clearance has something to
+    # close (B30 recovery gate). Routed to `now`, so it does not appear in the
+    # daily findings_since_last_drain that this test asserts holds only site-a.
+    catalog.write_finding(
+        None,
+        {
+            "source": "scheduled/test",
+            "type": "down",
+            "entity": "site-b",
+            "severity": "high",
+            "target_pipes": ["now"],
+        },
+        {"now", "daily"},
     )
     catalog.write_finding(
         None,

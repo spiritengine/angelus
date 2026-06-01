@@ -158,10 +158,10 @@ def test_dep_record_healthy_is_idempotent(tmp_path) -> None:
         assert rows[0]["detail"] == "ok"
 
 
-# --- dep_record unhealthy: a fresh now-finding EVERY time ----------------
+# --- dep_record unhealthy: edge-triggered, ONE finding while open --------
 
 
-def test_dep_record_unhealthy_emits_a_finding_per_record(tmp_path) -> None:
+def test_dep_record_unhealthy_emits_one_finding_while_incident_open(tmp_path) -> None:
     @_serve(tmp_path)
     async def _(daemon):
         for _i in range(2):
@@ -187,10 +187,21 @@ def test_dep_record_unhealthy_emits_a_finding_per_record(tmp_path) -> None:
         )
         assert [r["status"] for r in dep_rows] == ["unhealthy"]
 
-        # TWO findings: repeats are NOT deduped. This fails if the second
-        # unhealthy record is suppressed (the wrong cleverness).
+        # ONE finding under the B30 emission gate: the first unhealthy record
+        # opens the internal/dep incident and emits; the second, while that
+        # incident is still open, is dropped entirely (no row, no now-enqueue).
+        # This is the amplifier the gate exists to kill -- a stuck-down dep
+        # polled repeatedly must not flood. Duration lives on incidents.
         findings = _now_findings(daemon.connection, "mill-wheel")
-        assert len(findings) == 2
+        assert len(findings) == 1
+
+        # The single open incident carries the condition; the repeat refreshed
+        # nothing visible to the operator beyond it.
+        opens = [
+            i for i in daemon.catalog.open_incidents()
+            if i["entity"] == "mill-wheel" and i["type"] == "dependency_unhealthy"
+        ]
+        assert len(opens) == 1
 
 
 def test_dep_record_recovery_emits_no_finding(tmp_path) -> None:

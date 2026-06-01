@@ -26,6 +26,12 @@ TRUST_RETRY_DELAYS = (
 )
 MAX_RETRY_ATTEMPTS = 5
 
+# Sentinel finding_id returned when the B30 emission/recovery gate drops a
+# write (a clearance with no open incident to close). sqlite rowids start at
+# 1, so 0 can never collide with a real finding row and reads cleanly as
+# "no finding was written".
+_NO_FINDING = 0
+
 
 def _format_time(value: datetime) -> str:
     return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
@@ -261,6 +267,28 @@ class Catalog:
         finding: dict[str, Any],
         known_pipes: set[str],
     ) -> int:
+        """Write a finding, gated on incident transitions (B30).
+
+        A finding registers (a row + pipe enqueue) only when it moves an
+        incident across an edge:
+
+        - A non-clearance finding emits only when it OPENS a NEW incident for
+          its key (source, type, entity). A repeat while that incident is
+          already open is dropped ENTIRELY -- no row, no body, no pipe
+          enqueue, no occurrence count. Duration is recoverable from
+          incidents.opened_at; a per-poll occurrence counter would itself be
+          the write-per-poll amplification this gate exists to kill. The
+          return is the existing open incident's latest_finding_id so callers
+          that log/track a finding_id still reference the real opening row.
+        - A clearance finding emits only when it CLOSES an open incident for
+          (source, entity). A clearance with nothing open is a no-op and is
+          dropped; it returns _NO_FINDING (0).
+
+        The pre-check is a plain SELECT before any write, so the dropped
+        (common, under-a-flood) case touches neither the findings table nor
+        the body store. This whole class is synchronous and self-committing,
+        so the check-then-write below cannot interleave with another finding.
+        """
         source = str(finding["source"])
         finding_type = str(finding["type"])
         entity = str(finding["entity"])
@@ -268,6 +296,23 @@ class Catalog:
         target_pipes = list(finding.get("target_pipes") or [])
         body = finding.get("body")
         body_obj = body if isinstance(body, dict) else {"text": body} if body else {}
+
+        # --- EMISSION / RECOVERY GATE (B30) ---------------------------------
+        if finding_type == "clearance":
+            # Recovery edge. _close_incident closes by (source, entity)
+            # regardless of type, so the gate mirrors that key: a clearance
+            # fires only when some open incident exists for the entity.
+            if not self._has_open_incident_for_entity(source, entity):
+                return _NO_FINDING
+        else:
+            existing_open = self._open_incident_for_key(source, finding_type, entity)
+            if existing_open is not None:
+                # Repeat while the incident is open: drop entirely. Hand back
+                # the opening finding's id so the contract (an int finding_id)
+                # holds for callers that log it.
+                latest = existing_open["latest_finding_id"]
+                return int(latest) if latest is not None else _NO_FINDING
+
         now = self._clock.now_iso()
         cursor = self.connection.execute(
             """
@@ -302,7 +347,22 @@ class Catalog:
         if finding_type == "clearance":
             self._close_incident(source, entity, finding_id)
         else:
-            self._upsert_incident(source, finding_type, entity, dedup_key, finding_id)
+            opened_new = self._upsert_incident(
+                source, finding_type, entity, dedup_key, finding_id
+            )
+            # The pre-check above already established no open incident exists
+            # for this key, so the upsert must have opened a fresh one. If it
+            # ever reported a refresh instead, the gate and the incident table
+            # have drifted apart -- surface it rather than silently flood.
+            if not opened_new:
+                LOGGER.error(
+                    "write_finding gate drift: %s/%s/%s passed the open-incident "
+                    "pre-check but _upsert_incident refreshed an existing open "
+                    "incident",
+                    source,
+                    finding_type,
+                    entity,
+                )
         for pipe in target_pipes:
             if pipe in known_pipes:
                 self.connection.execute(
@@ -856,6 +916,45 @@ class Catalog:
             known_pipes,
         )
 
+    def write_internal_clearance(
+        self, source: str, entity: str, body: str, known_pipes: set[str]
+    ) -> int:
+        """Emit a recovery clearance for an internal source (B30).
+
+        Pairs with write_internal_finding: where that opens an incident on a
+        failure edge, this closes it on the recovery edge so the emission gate
+        re-arms and a genuine re-failure can alert again. The clearance is the
+        REQUIRED counterpart to every internal failure finding -- a source
+        that can open but never clear goes silent forever under the gate.
+
+        Callers may fire this unconditionally on their success path (a
+        healthy dep_record, a successful send/render, a file that loads OK):
+        write_finding's recovery gate drops it to a no-op when no incident is
+        open, so an unconditional call is edge-triggered for free and never
+        floods. Returns the clearance finding_id, or _NO_FINDING when nothing
+        was open to clear.
+
+        target_pipes is empty by design: the clearance's load-bearing job is
+        closing the incident (re-arming the gate), not paging. It still
+        surfaces in the daily digest's recent_closures, which reads the
+        findings table by type via clearance_findings_since regardless of
+        pipe routing, so the recovery is reported without adding `now`-pipe
+        noise -- preserving the long-standing "recovery is silent on now"
+        contract for internal sources.
+        """
+        return self.write_finding(
+            None,
+            {
+                "source": source,
+                "type": "clearance",
+                "entity": entity,
+                "severity": "info",
+                "target_pipes": [],
+                "body": body,
+            },
+            known_pipes,
+        )
+
     def recover_triage_processing_rows(self) -> int:
         """Delete observation_triage rows left at status='processing' from
         a prior daemon's hard exit (SIGKILL, OS kill, host crash). Returns
@@ -927,10 +1026,56 @@ class Catalog:
             item["target_pipes"] = []
         return item
 
+    def _open_incident_for_key(
+        self, source: str, finding_type: str, entity: str
+    ) -> sqlite3.Row | None:
+        """The open incident for the exact key (source, type, entity), or None.
+
+        This is the emission-gate authority for a non-clearance finding: the
+        key matches the one-open-per-entity unique index, so a hit means the
+        condition is already being tracked and a repeat must be dropped.
+        """
+        return self.connection.execute(
+            """
+            SELECT id, latest_finding_id
+            FROM incidents
+            WHERE source = ? AND type = ? AND entity = ? AND status = 'open'
+            LIMIT 1
+            """,
+            (source, finding_type, entity),
+        ).fetchone()
+
+    def _has_open_incident_for_entity(self, source: str, entity: str) -> bool:
+        """Whether any open incident exists for (source, entity), any type.
+
+        Mirrors _close_incident's (source, entity) close key: a clearance
+        clears whatever is open for the entity regardless of which failure
+        type opened it, so the recovery gate asks the same question.
+        """
+        row = self.connection.execute(
+            """
+            SELECT 1 FROM incidents
+            WHERE source = ? AND entity = ? AND status = 'open'
+            LIMIT 1
+            """,
+            (source, entity),
+        ).fetchone()
+        return row is not None
+
     def _upsert_incident(
         self, source: str, finding_type: str, entity: str, dedup_key: str, finding_id: int
-    ) -> None:
+    ) -> bool:
+        """Open or refresh the incident for (source, type, entity).
+
+        Returns True when this call OPENED a new incident (no open row existed
+        for the key), False when it refreshed an already-open one. The caller
+        (write_finding's gate) relies on this transition signal: under the
+        B30 gate every non-clearance finding that reaches here has passed the
+        open-incident pre-check, so a True is expected; a False means the gate
+        and the table have drifted.
+        """
         now = self._clock.now_iso()
+        opened_new = self._open_incident_for_key(source, finding_type, entity) is None
         self.connection.execute(
             """
             INSERT INTO incidents (
@@ -944,6 +1089,7 @@ class Catalog:
             """,
             (source, finding_type, entity, dedup_key, now, finding_id),
         )
+        return opened_new
 
     def _close_incident(self, source: str, entity: str, finding_id: int) -> None:
         now = self._clock.now_iso()
