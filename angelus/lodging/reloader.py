@@ -340,11 +340,12 @@ class LodgingReloader:
 
         existing = _existing(self.daemon.lodging, identified.kind, identified.key)
         if existing == item:
-            # Content unchanged; nothing to swap. Drop any stale rejection.
-            self.rejected.pop(identified.yaml_path, None)
+            # Content unchanged; nothing to swap. The file is valid, so this
+            # is also a recovery edge for any prior load failure.
+            self._clear_rejection(identified.yaml_path)
             return
 
-        self.rejected.pop(identified.yaml_path, None)
+        self._clear_rejection(identified.yaml_path)
         await self.daemon.apply_lodging(prospective)
         LOGGER.info(
             "lodging reload: %s %s -> applied",
@@ -355,14 +356,17 @@ class LodgingReloader:
     async def _apply_removal(self, identified: _Identified, reason: str) -> None:
         existing = _existing(self.daemon.lodging, identified.kind, identified.key)
         if existing is None:
-            self.rejected.pop(identified.yaml_path, None)
+            # The entry is already absent (a file that never loaded, e.g. one
+            # that failed to parse). Removing it resolves any open load
+            # failure, so clear.
+            self._clear_rejection(identified.yaml_path)
             return
         prospective = _without(self.daemon.lodging, identified.kind, identified.key)
         errors = validate_cross_refs(prospective)
         if errors:
             self._reject_cross_ref(identified.yaml_path, "; ".join(errors))
             return
-        self.rejected.pop(identified.yaml_path, None)
+        self._clear_rejection(identified.yaml_path)
         await self.daemon.apply_lodging(prospective)
         LOGGER.info(
             "lodging reload: %s %s -> removed (%s)",
@@ -374,6 +378,29 @@ class LodgingReloader:
     async def _retry_rejected(self) -> None:
         for path in list(self.rejected):
             await self._handle_path(path)
+
+    def _clear_rejection(self, yaml_path: Path) -> None:
+        """A lodging file resolved to a non-failing state -> drop its
+        in-memory rejection and emit a clearance so the catalog closes any
+        open internal/lodging incident for it (B30 recovery edge).
+
+        Fired unconditionally on every success path, not only when the file
+        was in self.rejected: self.rejected is in-process and empties on a
+        daemon restart, but an incident opened before the restart is still
+        open in the durable incidents table. Driving recovery off the
+        catalog's gate (which reads that table) is what guarantees a file
+        that failed before a restart and loads OK after it still clears --
+        rather than going silent forever. When nothing is open the catalog's
+        recovery gate drops the clearance to a no-op, so the unconditional
+        call never floods."""
+        rel = yaml_path.relative_to(self.root)
+        was_rejected = self.rejected.pop(yaml_path, None) is not None
+        self.daemon.catalog.write_internal_clearance(
+            "internal/lodging",
+            str(rel),
+            f"{rel} loaded OK" if was_rejected else f"{rel} OK",
+            set(self.daemon.lodging.pipes),
+        )
 
     def _reject_load(self, yaml_path: Path, message: str) -> None:
         rel = yaml_path.relative_to(self.root)

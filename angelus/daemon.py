@@ -379,10 +379,14 @@ class AngelusDaemon:
         trusting a format from the unprivileged probe process.
 
         On status='unhealthy' an internal/dep finding is emitted to `now`
-        AFTER the upsert (still no `await`). Each unhealthy record emits a
-        fresh finding -- repeats are NOT deduped, mirroring the slice-3
-        digest-failure contract: the operator keeps being told a
-        dependency is down until it recovers.
+        AFTER the upsert (still no `await`). Under the B30 emission gate the
+        first unhealthy record opens the internal/dep incident and emits; a
+        repeat while it stays open is dropped at the catalog. On a healthy
+        record a clearance is emitted (also gate-dropped to a no-op when no
+        dependency_unhealthy incident is open), which closes the incident and
+        re-arms the gate so a later genuine re-failure alerts again. Without
+        that clearance the dependency would alert once and then go silent
+        forever.
         """
         name = args.get("name")
         status = args.get("status")
@@ -402,6 +406,13 @@ class AngelusDaemon:
                 "dependency_unhealthy",
                 name,
                 detail or "",
+                set(self.lodging.pipes),
+            )
+        else:
+            self.catalog.write_internal_clearance(
+                "internal/dep",
+                name,
+                detail or f"{name} healthy",
                 set(self.lodging.pipes),
             )
         return {"name": name, "status": status}
@@ -702,6 +713,16 @@ class AngelusDaemon:
                 )
                 LOGGER.info("finding %s ready from observation %s", finding_id, observation_id)
             self.catalog.mark_triage_success(observation_id, triager.name)
+            # Recovery edge for the internal/triage incident: a triager whose
+            # retries were exhausted (below) opened a triage_failed incident;
+            # a later successful run clears it so the gate re-arms. Dropped to
+            # a no-op by the recovery gate when nothing is open.
+            self.catalog.write_internal_clearance(
+                "internal/triage",
+                triager.name,
+                f"{triager.name} triage succeeded",
+                set(self.lodging.pipes),
+            )
         except Exception as exc:
             LOGGER.exception("triage failed for observation %s", observation_id)
             exhausted = self.catalog.mark_triage_failed(

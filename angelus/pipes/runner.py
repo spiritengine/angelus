@@ -33,6 +33,15 @@ LLM_FALLBACK_FOOTER = "LLM digest body unavailable — see structured data below
 DEFAULT_DIGEST_STAGING_DIRNAME = "digest-staging"
 DEFAULT_DIGEST_STAGING_KEEP = 30
 
+# Defense-in-depth backstop (B30): the per-collection item budget for every
+# digest input. The B30 emission gate stops floods at the source, so in normal
+# operation no collection comes close to this; the cap only bites if some
+# upstream path ever produces a runaway list (the 2026-06-01 15MB chronicler
+# prompt came from ~114k findings_since_last_drain rows). Each over-budget
+# collection is truncated to this many items with a trailing marker row so the
+# omission is visible in both the preamble and the chronicler prompt.
+DEFAULT_DIGEST_MAX_ITEMS_PER_INPUT = 200
+
 
 class PipeDrain:
     def __init__(
@@ -200,6 +209,19 @@ class PipeDrain:
                         "sent",
                         source=row["source"],
                     )
+                    # Recovery edge for internal/dispatch channel_unhealthy: a
+                    # successful send proves the channel is back. The gate
+                    # drops this to a no-op unless an incident is open, and the
+                    # first send after recovery closes it; later sends in the
+                    # same drain find nothing open and no-op. Load-bearing
+                    # after a daemon restart, when channel_health is cleared
+                    # (so this path runs again) but the incident is still open.
+                    self.catalog.write_internal_clearance(
+                        "internal/dispatch",
+                        channel.name,
+                        f"{channel.name} delivery recovered",
+                        known_pipes,
+                    )
 
     def _render(self, pipe: Pipe, row) -> str:
         body = self.catalog.read_body(row["body_ref"])
@@ -246,6 +268,16 @@ class PipeDrain:
                 "llm_render_failed",
                 pipe.name,
                 llm_error,
+                known_pipes,
+            )
+        else:
+            # Recovery edge for internal/render llm_render_failed: a clean
+            # render clears any open render incident for this pipe so the gate
+            # re-arms. Gate-dropped to a no-op when nothing is open.
+            self.catalog.write_internal_clearance(
+                "internal/render",
+                pipe.name,
+                f"{pipe.name} digest render recovered",
                 known_pipes,
             )
         # Reversed from the original (preamble, body) order: Patrick wants
@@ -345,6 +377,17 @@ class PipeDrain:
                 # intermittent channel does not gradually accumulate to
                 # threshold across many mostly-succeeding cycles.
                 self.catalog.record_digest_send_success(pipe.name, channel.name)
+                # Recovery edge for internal/dispatch channel_unhealthy. The
+                # digest path attempts even a known-unhealthy channel (see the
+                # note above), so this is the primary place a channel that
+                # failed N cycles clears once it sends again. Gate-dropped to a
+                # no-op when nothing is open.
+                self.catalog.write_internal_clearance(
+                    "internal/dispatch",
+                    channel.name,
+                    f"{channel.name} delivery recovered",
+                    known_pipes,
+                )
         if any_channel_succeeded:
             self.catalog.mark_pipe_items_dispatched(pipe.name, finding_ids)
             self.catalog.mark_pipe_drained(pipe.name, drained_at)
@@ -370,6 +413,13 @@ class PipeDrain:
                 _fixer_log_path(self.workdir), last_drain_at
             ),
         }
+        # Backstop cap (B30): bound every input before it reaches the
+        # preamble templates and the chronicler prompt, so no upstream flood
+        # can blow the digest up regardless of the emission gate. Applied
+        # before timestamp attachment so the marker row (which carries no
+        # timestamps) is the only added item.
+        for name, collection in raw.items():
+            raw[name] = _cap_digest_input(collection, name)
         # Add local-time strings alongside the UTC originals so both the
         # jinja templates and the chronicler prompt can use human-readable
         # timestamps without re-implementing the conversion. The UTC
@@ -672,6 +722,38 @@ _LOCAL_TS_FIELDS = (
     "opened_at",
     "closed_at",
 )
+
+
+def _cap_digest_input(
+    items: list[dict[str, Any]],
+    name: str,
+    max_items: int = DEFAULT_DIGEST_MAX_ITEMS_PER_INPUT,
+) -> list[dict[str, Any]]:
+    """Truncate a digest input list to ``max_items`` with an omission marker.
+
+    Returns ``items`` unchanged when it is already within budget. When it is
+    over, returns the first ``max_items`` followed by a single marker dict
+    whose fields render cleanly in every preamble template (severity / type /
+    entity / body_text) and read clearly in the chronicler JSON, so the
+    operator always sees that N items were dropped rather than a silently
+    short list. The marker is a plain dict, not a finding row -- nothing is
+    written to the catalog.
+    """
+    if len(items) <= max_items:
+        return items
+    omitted = len(items) - max_items
+    capped = items[:max_items]
+    capped.append(
+        {
+            "severity": "info",
+            "type": "omitted",
+            "entity": f"[{omitted} more {name} omitted]",
+            "body_text": (
+                f"{omitted} additional {name} omitted to bound the digest"
+            ),
+        }
+    )
+    return capped
 
 
 def _attach_local_timestamps(item: dict[str, Any]) -> None:
