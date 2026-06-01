@@ -1109,6 +1109,127 @@ def test_drift_failure_missing_pid_file_returns_none(tmp_path) -> None:
     assert belfry.drift_failure(tmp_path / "state" / "angelus.pid") is None
 
 
+def _write_pid(root: Path, pid: int) -> Path:
+    (root / "state").mkdir(exist_ok=True)
+    pid_file = root / "state" / "angelus.pid"
+    pid_file.write_text(str(pid), encoding="utf-8")
+    return pid_file
+
+
+def test_stale_deployment_code_newer_than_start_flags(tmp_path, monkeypatch) -> None:
+    """Code committed after the daemon started -> the running process is on
+    stale code -> a reason naming the pid and both timestamps."""
+    belfry = _load_belfry()
+    pid_file = _write_pid(tmp_path, 4321)
+    monkeypatch.setattr(belfry, "process_start_epoch", lambda _pid: 1_000.0)
+    monkeypatch.setattr(belfry, "last_code_commit_epoch", lambda _root: 2_000.0)
+
+    reason = belfry.stale_deployment(pid_file, tmp_path)
+    assert reason is not None
+    assert reason.startswith("stale-deploy:")
+    assert "4321" in reason
+
+
+def test_stale_deployment_code_older_than_start_returns_none(
+    tmp_path, monkeypatch
+) -> None:
+    """Daemon started after the last commit -> it is running current code ->
+    no reason."""
+    belfry = _load_belfry()
+    pid_file = _write_pid(tmp_path, 4321)
+    monkeypatch.setattr(belfry, "process_start_epoch", lambda _pid: 2_000.0)
+    monkeypatch.setattr(belfry, "last_code_commit_epoch", lambda _root: 1_000.0)
+
+    assert belfry.stale_deployment(pid_file, tmp_path) is None
+
+
+def test_stale_deployment_fails_open_when_signal_unreadable(
+    tmp_path, monkeypatch
+) -> None:
+    """If either the commit time or the start time is unknowable, the check
+    fails open (None) -- never a false DOWN. Mirrors drift's fail-open."""
+    belfry = _load_belfry()
+    pid_file = _write_pid(tmp_path, 4321)
+    monkeypatch.setattr(belfry, "process_start_epoch", lambda _pid: 2_000.0)
+    monkeypatch.setattr(belfry, "last_code_commit_epoch", lambda _root: None)
+    assert belfry.stale_deployment(pid_file, tmp_path) is None
+
+    monkeypatch.setattr(belfry, "last_code_commit_epoch", lambda _root: 2_000.0)
+    monkeypatch.setattr(belfry, "process_start_epoch", lambda _pid: None)
+    assert belfry.stale_deployment(pid_file, tmp_path) is None
+
+
+def test_stale_deployment_missing_pid_file_returns_none(tmp_path) -> None:
+    """No pid file -> pid_failure owns the dead/missing case; stale has
+    nothing to compare and fails open."""
+    belfry = _load_belfry()
+    assert belfry.stale_deployment(tmp_path / "state" / "angelus.pid", tmp_path) is None
+
+
+def test_stale_deployment_pings_down_alert_only(tmp_path, monkeypatch) -> None:
+    """A live but stale daemon pings DOWN naming the stale reason, and does
+    NOT trigger a restart -- stale-deploy is an alert-only OTHER reason (a
+    restart is a deliberate deploy action, never autoremediated)."""
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    _alive_for_drift(tmp_path)
+    pings, calls = _record_mocks(belfry, monkeypatch)
+    monkeypatch.setattr(belfry, "last_code_commit_epoch", lambda _root: 2_000.0)
+    monkeypatch.setattr(belfry, "process_start_epoch", lambda _pid: 1_000.0)
+    # Guard against any restart slipping through: fail loudly if invoked.
+    monkeypatch.setattr(
+        belfry,
+        "_autoremediate_absence",
+        lambda *a, **k: pytest.fail("stale-deploy must not restart"),
+    )
+
+    assert belfry.main([str(tmp_path)]) == 1
+    assert pings[-1] == "https://hc.example/down"
+    assert "stale-deploy" in " ".join(calls[-1])
+
+
+def test_stale_deployment_does_not_fire_when_fresh(tmp_path, monkeypatch) -> None:
+    """A live daemon started after the last commit pings SUCCESS -- no stale
+    reason, no restart."""
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    _alive_for_drift(tmp_path)
+    pings, calls = _record_mocks(belfry, monkeypatch)
+    monkeypatch.setattr(belfry, "last_code_commit_epoch", lambda _root: 1_000.0)
+    monkeypatch.setattr(belfry, "process_start_epoch", lambda _pid: 2_000.0)
+
+    assert belfry.main([str(tmp_path)]) == 0
+    assert pings == ["https://hc.example/success"]
+    assert calls == []
+
+
+def test_last_code_commit_epoch_parses_ct(tmp_path, monkeypatch) -> None:
+    """last_code_commit_epoch returns the git %ct as a float."""
+    belfry = _load_belfry()
+
+    def fake_run(args, **kwargs):
+        return subprocess.CompletedProcess(args, 0, stdout="1700000000\n", stderr="")
+
+    monkeypatch.setattr(belfry.subprocess, "run", fake_run)
+    assert belfry.last_code_commit_epoch(tmp_path) == 1700000000.0
+
+
+def test_last_code_commit_epoch_fails_open_on_non_repo(tmp_path) -> None:
+    """Outside a git repo (non-zero exit), the check fails open to None."""
+    belfry = _load_belfry()
+    # tmp_path is not a git repo; real git returns non-zero -> None.
+    assert belfry.last_code_commit_epoch(tmp_path) is None
+
+
+def test_process_start_epoch_reads_self(tmp_path) -> None:
+    """process_start_epoch reads /proc for a live pid and returns a sane
+    epoch (after boot, not in the future). Linux-only path."""
+    belfry = _load_belfry()
+    start = belfry.process_start_epoch(os.getpid())
+    assert start is not None
+    assert 0 < start <= time.time() + 1
+
+
 def test_systemd_main_pid_parses_value(monkeypatch) -> None:
     """systemd_main_pid shells out to systemctl and returns the integer
     MainPID on a clean exit."""

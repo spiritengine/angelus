@@ -16,6 +16,9 @@ state/*
 !state/sre-reports/
 state/sre-reports/*
 !state/sre-reports/.gitkeep
+!state/digest-staging/
+state/digest-staging/*
+!state/digest-staging/.gitkeep
 observations/
 findings/
 dispatches.log

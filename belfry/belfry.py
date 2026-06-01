@@ -115,7 +115,7 @@ def main(argv: list[str] | None = None) -> int:
     # untouched here).
     touch_sentinel(sentinel_path(state))
 
-    # Four checks, split by what they imply for autoremediation:
+    # Five checks, split by what they imply for autoremediation:
     #
     # ABSENCE reasons (daemon not running / not delivering):
     #   pid_failure  -- dead process: restart is the right tool.
@@ -127,6 +127,9 @@ def main(argv: list[str] | None = None) -> int:
     #   drift_failure -- alive but mis-launched outside the systemd unit:
     #       alerting only (a systemctl restart while a hand-launched instance
     #       holds the pid is messy; that's a human/SRE fix).
+    #   stale_deployment -- alive but running code older than the latest
+    #       commit: alerting only (a restart is a deliberate deploy action;
+    #       auto-restarting could load half-merged code mid-edit).
     #
     # A dead process short-circuits the live-daemon checks: with no daemon a
     # stale sqlite tells us nothing useful, and there is no live pid to
@@ -150,6 +153,9 @@ def main(argv: list[str] | None = None) -> int:
         drift_reason = drift_failure(state / "angelus.pid")
         if drift_reason:
             other_reasons.append(drift_reason)
+        stale_reason = stale_deployment(state / "angelus.pid", root)
+        if stale_reason:
+            other_reasons.append(stale_reason)
 
     all_reasons = absence_reasons + other_reasons
     if all_reasons:
@@ -750,6 +756,99 @@ def drift_failure(pid_file: Path) -> str | None:
         f"drift: daemon PID {pid} does not match systemd unit "
         f"'{systemd_unit()}' MainPID {main_pid}; an instance is running "
         f"outside its unit"
+    )
+
+
+def last_code_commit_epoch(root: Path) -> float | None:
+    """Epoch of the most recent commit touching Python code, or None.
+
+    Uses git rather than working-tree mtimes deliberately: an editable
+    install runs the files on disk, so flagging on every uncommitted edit
+    would nag constantly during development. A commit (and the merge that
+    follows) is the deployment event that matters -- it is what landed
+    fixer_actions on 2026-05-31 while the daemon kept running pre-merge
+    code. Fails open (None) outside a git repo or if git is unavailable, so
+    an un-interrogable repo never reports a false DOWN.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "log", "-1", "--format=%ct", "--", "*.py"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        return float(result.stdout.strip())
+    except Exception as exc:
+        # Fail open on anything -- a belfry tick must never crash on the
+        # stale check, or it would suppress every other health ping. This is
+        # the same "never a false DOWN / never abort the tick" contract the
+        # other checks honor; the stale check is the lowest-stakes of them.
+        # Covers git being absent, a non-repo root, a timeout, and unparseable
+        # output (empty/garbled %ct -> ValueError).
+        log_err(f"angelus belfry: stale-deploy git failed: {exc}")
+        return None
+
+
+def process_start_epoch(pid: int) -> float | None:
+    """Wall-clock start time of PID from /proc/<pid>/stat, or None.
+
+    Field 22 (starttime) is in clock ticks since boot; combined with btime
+    from /proc/stat it yields an epoch. comm (field 2) may contain spaces or
+    parens, so we read the tail after the final ')': there, token index 19
+    is field 22. Linux-only and fail-open, consistent with belfry's other
+    checks -- a kernel that does not expose /proc never reports a false DOWN.
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        after_comm = stat.rpartition(")")[2].split()
+        starttime_ticks = int(after_comm[19])
+        clk_tck = os.sysconf("SC_CLK_TCK")
+        if clk_tck <= 0:
+            return None
+        btime: int | None = None
+        for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines():
+            if line.startswith("btime "):
+                btime = int(line.split()[1])
+                break
+        if btime is None:
+            return None
+        return btime + starttime_ticks / clk_tck
+    except (OSError, ValueError, IndexError) as exc:
+        log_err(f"angelus belfry: stale-deploy /proc read failed: {exc}")
+        return None
+
+
+def stale_deployment(pid_file: Path, root: Path) -> str | None:
+    """Flag when committed code is newer than the running daemon.
+
+    Called only when a daemon is alive (pid_failure already returned None).
+    Python imports each module once at startup and an editable install does
+    NOT hot-reload, so a daemon that started before code landed is executing
+    stale code. This is exactly the 2026-06-01 failure: fixer_actions merged
+    2026-05-31 but the daemon, up since before the merge, kept rejecting
+    daily.yaml every tick.
+
+    Alert-only (an OTHER reason, like drift): a restart deploys current code,
+    but that is a deliberate human/SRE action -- auto-restarting could load
+    half-merged code mid-edit. Fails open on any unreadable signal.
+    """
+    try:
+        pid = int(pid_file.read_text(encoding="utf-8").strip())
+    except (FileNotFoundError, ValueError):
+        return None
+    code_at = last_code_commit_epoch(root)
+    start_at = process_start_epoch(pid)
+    if code_at is None or start_at is None:
+        return None
+    if code_at <= start_at:
+        return None
+    code_iso = datetime.fromtimestamp(code_at).strftime("%Y-%m-%d %H:%M")
+    start_iso = datetime.fromtimestamp(start_at).strftime("%Y-%m-%d %H:%M")
+    return (
+        f"stale-deploy: daemon PID {pid} started {start_iso} but Python code "
+        f"was last committed {code_iso}; restart to load current code"
     )
 
 

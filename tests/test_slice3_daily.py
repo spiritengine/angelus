@@ -1002,15 +1002,22 @@ def test_digest_body_inputs_filter_chronicler_payload(tmp_path, monkeypatch) -> 
     )
     captured: dict[str, object] = {}
 
-    real_create = pipe_runner.asyncio.create_subprocess_exec
-
+    # The prompt rides a temp file now (it embeds the inputs JSON, which would
+    # blow past the argv size limit), passed via --message-file; capture it by
+    # reading that file rather than from argv.
     async def capture_create(*args, **kwargs):
-        for idx, token in enumerate(args):
-            if token == "--message" and idx + 1 < len(args):
-                captured["message"] = args[idx + 1]
-        return await real_create(
-            "sh", "-c", "echo 'chronicler output text here.'", **kwargs
-        )
+        argv = list(args)
+        captured["argv"] = argv
+        idx = argv.index("--message-file")
+        captured["message"] = Path(argv[idx + 1]).read_text(encoding="utf-8")
+
+        class _Proc:
+            returncode = 0
+
+            async def communicate(self, stdin_bytes=None):
+                return b'{"result": "chronicler output text here."}', b""
+
+        return _Proc()
 
     async def fake_push(_channel, _message: str, _workdir: Path) -> None:
         return None
@@ -1470,18 +1477,26 @@ def test_chronicler_prompt_constrains_output_to_plain_paragraph(
         tmp_path,
         {"now", "daily"},
     )
-    captured: dict[str, str] = {}
+    captured: dict[str, object] = {}
 
-    real_create = pipe_runner.asyncio.create_subprocess_exec
-
+    # The prompt rides a temp file now, not argv; capture it from the
+    # --message-file path.
     async def capture_create(*args, **kwargs):
-        for idx, token in enumerate(args):
-            if token == "--message" and idx + 1 < len(args):
-                captured["message"] = args[idx + 1]
-        return await real_create(
-            "sh", "-c", 'echo \'{"result": "body paragraph here, several characters wide."}\'',
-            **kwargs,
-        )
+        argv = list(args)
+        captured["argv"] = argv
+        idx = argv.index("--message-file")
+        captured["message"] = Path(argv[idx + 1]).read_text(encoding="utf-8")
+
+        class _Proc:
+            returncode = 0
+
+            async def communicate(self, stdin_bytes=None):
+                return (
+                    b'{"result": "body paragraph here, several characters wide."}',
+                    b"",
+                )
+
+        return _Proc()
 
     async def fake_push(_channel, _message: str, _workdir: Path) -> None:
         return None
@@ -1507,6 +1522,13 @@ def test_chronicler_prompt_constrains_output_to_plain_paragraph(
     finally:
         connection.close()
 
+    # Pin the off-argv contract: the prompt must NOT ride argv (that path blew
+    # past the OS arg-length limit and degraded the digest on 2026-06-01). It
+    # travels via --message-file; the bare --message flag must be absent.
+    argv = captured["argv"]
+    assert "--message-file" in argv
+    assert "--message" not in argv
+
     message = captured.get("message")
     assert message is not None, "expected the chronicler prompt to be captured"
     # Each of these must appear: they're the load-bearing constraints
@@ -1521,6 +1543,78 @@ def test_chronicler_prompt_constrains_output_to_plain_paragraph(
         assert phrase in message, (
             f"chronicler prompt missing constraint {phrase!r}"
         )
+
+
+def test_digest_stages_chronicler_prompt_and_retains_it(tmp_path, monkeypatch) -> None:
+    """The chronicler prompt is staged in state/digest-staging/ named
+    <stamp>-<pipe>.txt and RETAINED after the drain (not a throwaway tmp
+    file), so 'what did the digest ask for' is auditable after the fact."""
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    _write_templates(tmp_path)
+    drain = PipeDrain(
+        catalog,
+        _daily_pipe(inputs=["findings_since_last_drain"]),
+        {"push": Channel(name="push", kind="push", command="notify-pat")},
+        tmp_path,
+        {"now", "daily"},
+    )
+
+    async def capture_create(*args, **kwargs):
+        class _Proc:
+            returncode = 0
+
+            async def communicate(self, stdin_bytes=None):
+                return b'{"result": "chronicler output text here."}', b""
+
+        return _Proc()
+
+    async def fake_push(_channel, _message: str, _workdir: Path) -> None:
+        return None
+
+    monkeypatch.setattr(pipe_runner, "send_push", fake_push)
+    monkeypatch.setattr(pipe_runner.asyncio, "create_subprocess_exec", capture_create)
+
+    catalog.write_finding(
+        None,
+        {
+            "source": "scheduled/test",
+            "type": "down",
+            "entity": "site",
+            "severity": "high",
+            "target_pipes": ["daily"],
+        },
+        {"daily"},
+    )
+    try:
+        asyncio.run(drain.drain_once())
+    finally:
+        connection.close()
+
+    staging = tmp_path / "state" / "digest-staging"
+    staged = list(staging.glob("*-daily.txt"))
+    assert len(staged) == 1, f"expected one retained staged prompt, got {staged}"
+    body = staged[0].read_text(encoding="utf-8")
+    assert "Structured inputs (JSON):" in body
+    # Fixed-width UTC stamp prefix so names sort chronologically.
+    assert staged[0].name.endswith("-daily.txt")
+    assert len(staged[0].name) == len("20260601T080000Z-daily.txt")
+
+
+def test_prune_digest_staging_keeps_last_n(tmp_path) -> None:
+    """_prune_digest_staging keeps only the most recent N staged prompts
+    (lexical name order == chronological) and is best-effort."""
+    staging = tmp_path / "digest-staging"
+    staging.mkdir()
+    names = [f"2026060{i}T080000Z-daily.txt" for i in range(1, 6)]
+    for name in names:
+        (staging / name).write_text("x", encoding="utf-8")
+    pipe_runner._prune_digest_staging(staging, keep=2)
+    remaining = sorted(p.name for p in staging.glob("*.txt"))
+    assert remaining == names[-2:]
+    # keep<=0 is a no-op guard (never wipes the folder).
+    pipe_runner._prune_digest_staging(staging, keep=0)
+    assert len(list(staging.glob("*.txt"))) == 2
 
 
 def test_drain_message_body_synthesis_precedes_preamble(tmp_path, monkeypatch) -> None:

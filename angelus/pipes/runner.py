@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -27,6 +28,10 @@ LOGGER = logging.getLogger(__name__)
 # this message points downward. If a future change re-reverses the
 # order, flip this string too. fell-r1 BLOCK #1.
 LLM_FALLBACK_FOOTER = "LLM digest body unavailable — see structured data below."
+
+# Where each digest drain stages the chronicler prompt, and how many to keep.
+DEFAULT_DIGEST_STAGING_DIRNAME = "digest-staging"
+DEFAULT_DIGEST_STAGING_KEEP = 30
 
 
 class PipeDrain:
@@ -431,14 +436,39 @@ class PipeDrain:
             "Structured inputs (JSON):\n"
             + json.dumps(inputs, sort_keys=True, default=str)
         )
+        # The prompt embeds json.dumps(inputs), which grows with the backlog.
+        # Passed via --message (argv) it blew past the OS single-argument
+        # limit (MAX_ARG_STRLEN, ~128KB) on a busy day -- exec failed with
+        # E2BIG ("Argument list too long") and the digest silently degraded
+        # to LLM_FALLBACK_FOOTER (2026-06-01). Stage the prompt in a file and
+        # hand it to horizon via --message-file: no argv limit, and -- unlike
+        # stdin -- it leaves the subprocess I/O (a plain communicate() with no
+        # stdin pipe) byte-for-byte identical to the proven shutdown-reap
+        # path, so it introduces no new cancel/reap race.
+        #
+        # The staging area is retained, not a throwaway tmp file: the prompt
+        # is the load-bearing input to the morning email, so keeping the last
+        # N (parallel to state/sre-reports/) makes "what did the digest
+        # actually ask the chronicler for" auditable after the fact -- which
+        # is exactly what was missing when the 2026-06-01 digest degraded.
+        staging_dir = _digest_staging_dir(self.workdir)
+        prompt_path = staging_dir / (
+            f"{self._clock.now().strftime('%Y%m%dT%H%M%SZ')}-{pipe.name}.txt"
+        )
+        try:
+            staging_dir.mkdir(parents=True, exist_ok=True)
+            prompt_path.write_text(prompt, encoding="utf-8")
+        except OSError as exc:
+            return None, f"chronicler prompt staging failed: {exc}"
+        _prune_digest_staging(staging_dir)
         try:
             process = await asyncio.create_subprocess_exec(
                 "horizon",
                 "cast",
                 "--mantle",
                 str(mantle),
-                "--message",
-                prompt,
+                "--message-file",
+                str(prompt_path),
                 # Without --json the cast stdout has a preamble ("New strand
                 # created: ...", three help lines about cast --omlet) and a
                 # footer block (Omlet: / Strand: / Status: / Bearing: /
@@ -457,7 +487,9 @@ class PipeDrain:
         except OSError as exc:
             return None, f"chronicler launch failed: {exc}"
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=120)
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=120
+            )
         except asyncio.TimeoutError:
             await _kill_and_reap(process)
             return None, "chronicler timed out after 120s"
@@ -601,6 +633,45 @@ def _fixer_log_path(workdir: Path) -> Path:
     if override:
         return Path(override)
     return workdir / "state" / "fixers.log"
+
+
+def _digest_staging_dir(workdir: Path) -> Path:
+    """Directory where each digest drain stages the chronicler prompt.
+
+    A retained, inspectable area (parallel to state/sre-reports/) rather than
+    a throwaway tmp file: the prompt is the load-bearing input to the morning
+    email, so keeping the recent ones makes "what did the digest actually ask
+    for" auditable after the fact. Default state/digest-staging;
+    ANGELUS_DIGEST_STAGING_DIR overrides for tests and alternate deployments.
+    """
+    override = os.environ.get("ANGELUS_DIGEST_STAGING_DIR")
+    if override:
+        return Path(override)
+    return workdir / "state" / DEFAULT_DIGEST_STAGING_DIRNAME
+
+
+def _prune_digest_staging(
+    staging_dir: Path, keep: int = DEFAULT_DIGEST_STAGING_KEEP
+) -> None:
+    """Keep only the most recent ``keep`` staged prompts; best-effort.
+
+    Bounds the folder so a daily (or replayed) digest cannot grow it without
+    limit. The timestamp prefix is fixed-width, so lexical name order is
+    chronological. Pruning is housekeeping, not correctness -- any IO error
+    is swallowed so it can never fail a render.
+    """
+    if keep <= 0:
+        return
+    try:
+        staged = sorted(
+            (p for p in staging_dir.glob("*.txt") if p.is_file()),
+            key=lambda p: p.name,
+        )
+    except OSError:
+        return
+    for stale in staged[:-keep]:
+        with contextlib.suppress(OSError):
+            stale.unlink()
 
 
 def _gather_fixer_actions(
