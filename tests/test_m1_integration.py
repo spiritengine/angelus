@@ -357,6 +357,180 @@ def test_full_daemon_shutdown_reaps_digest_llm_subprocess(
         )
 
 
+def test_digest_drain_task_is_tracked_in_flight_and_awaited_on_shutdown(
+    tmp_path, monkeypatch,
+) -> None:
+    """Directly pins the Option-2 fix: a non-immediate (interval) digest
+    pipe's drain registers its asyncio task in daemon._drain_tasks for the
+    duration of the drain, and daemon.run()'s shutdown-finally cancels and
+    awaits that set so the CancelledError reap arm runs before the loop
+    closes.
+
+    Where the reaps-orphan test only observes the *effect* (grandchild
+    reaped), this test observes the *mechanism*: the in-flight set is
+    populated while the horizon subprocess is mid-render, and the same task
+    is done (awaited) with the set drained after shutdown. Discrimination:
+    scheduling drain_once directly (untracked, the pre-fix shape) leaves
+    _drain_tasks empty mid-drain -> the first assertion fails.
+    """
+    marker = tmp_path / "hz_child.pid"
+    _base_lodging(tmp_path)
+    (tmp_path / "pipes" / "daily.yaml").write_text(
+        "cadence: 1s\nchannels: [email]\n"
+        "render:\n  preamble: []\n  body:\n    kind: llm\n"
+        "    mantle: chronicler\n    inputs: [open_incidents]\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "channels" / "email.yaml").write_text(
+        "kind: email\ncommand: 'true'\nto: x@example.com\n", encoding="utf-8"
+    )
+    (tmp_path / "render-templates").mkdir()
+    stub = tmp_path / "horizon"
+    stub.write_text(f"#!/bin/sh\nsleep 30 & echo $! > {marker}\nwait\n")
+    stub.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    monkeypatch.setenv("ANGELUS_DRY_RUN", "1")
+
+    async def driver() -> tuple[int, asyncio.Task]:
+        daemon = AngelusDaemon(tmp_path)
+        task = asyncio.create_task(daemon.run())
+        try:
+            for _ in range(400):
+                if marker.exists() and marker.read_text().strip():
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                raise AssertionError("digest job never launched horizon")
+            gc_pid = int(marker.read_text().strip())
+            assert _alive(gc_pid)
+            # The drain is mid-render (horizon launched): its task must be
+            # registered in the daemon-owned in-flight set.
+            assert daemon._drain_tasks, (
+                "drain task not tracked in _drain_tasks while mid-drain"
+            )
+            (drain_task,) = tuple(daemon._drain_tasks)
+            assert not drain_task.done()
+
+            daemon.request_stop()
+            await asyncio.wait_for(task, timeout=15.0)
+            # The tracked drain task was awaited (done) and the set drained
+            # by its own finally during the shutdown gather.
+            assert drain_task.done()
+            assert not daemon._drain_tasks
+            return gc_pid, drain_task
+        finally:
+            if not task.done():
+                daemon.request_stop()
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    gc_pid, _ = asyncio.run(driver())
+    for _ in range(200):
+        if not _alive(gc_pid):
+            break
+        time.sleep(0.01)
+    else:
+        os.kill(gc_pid, 9)
+        raise AssertionError(
+            f"horizon grandchild {gc_pid} survived shutdown -- "
+            "tracked digest drain was not reaped"
+        )
+
+
+def test_render_llm_body_reaps_horizon_when_cancelled_inside_spawn(
+    tmp_path, monkeypatch,
+) -> None:
+    """WINDOW A regression: cancel the drain while it is parked *inside*
+    create_subprocess_exec -- before the Process handle is bound in
+    _render_llm_body -- and the forking `horizon` subtree must still be
+    reaped, not orphaned.
+
+    The reaps-orphan test (test_full_daemon_shutdown_reaps_digest_llm_
+    subprocess) and the in-flight-tracking test both leave the *timing* of
+    the cancellation to chance: under load the cancel usually lands in
+    Window A (mid-spawn), but on a quiet machine it can land in Window B
+    (mid-communicate), so neither pins Window A deterministically. This test
+    forces Window A by wrapping create_subprocess_exec in a stub that spawns
+    the real horizon (so a real process group + grandchild exists), signals
+    the test, and only THEN -- still 'inside' the spawn coroutine -- pauses
+    before returning the handle. The cancel arrives during that pause, so
+    `process` is provably unbound when CancelledError is raised.
+
+    Discrimination: drop the asyncio.shield / _recover_cancelled_spawn
+    recovery (revert to a bare `process = await create_subprocess_exec(...)`)
+    and the except arm has no handle to reap -- the grandchild survives and
+    the final liveness check fails. The shield is what makes the handle
+    recoverable after a mid-spawn cancel.
+    """
+    marker = tmp_path / "hz_child.pid"
+    _base_lodging(tmp_path)
+    (tmp_path / "pipes" / "daily.yaml").write_text(
+        "cadence: 1s\nchannels: [email]\n"
+        "render:\n  preamble: []\n  body:\n    kind: llm\n"
+        "    mantle: chronicler\n    inputs: [open_incidents]\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "channels" / "email.yaml").write_text(
+        "kind: email\ncommand: 'true'\nto: x@example.com\n", encoding="utf-8"
+    )
+    (tmp_path / "render-templates").mkdir()
+    stub = tmp_path / "horizon"
+    stub.write_text(f"#!/bin/sh\nsleep 30 & echo $! > {marker}\nwait\n")
+    stub.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    monkeypatch.setenv("ANGELUS_DRY_RUN", "1")
+
+    real_exec = asyncio.create_subprocess_exec
+
+    async def driver() -> int:
+        spawn_started = asyncio.Event()
+
+        async def slow_spawn(*args, **kwargs):
+            # Spawn the real horizon stub so a genuine process group +
+            # forked grandchild exists, then hang BEFORE returning the
+            # handle. This is exactly the Window A shape: the child is alive
+            # but the caller has not yet received `process`. A real
+            # create_subprocess_exec returns in ms; the sleep only widens
+            # the window so the test can land its cancel inside it.
+            proc = await real_exec(*args, **kwargs)
+            spawn_started.set()
+            await asyncio.sleep(0.3)
+            return proc
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", slow_spawn)
+
+        daemon = AngelusDaemon(tmp_path)
+        try:
+            drain = daemon.pipe_drains["daily"]
+            pipe = daemon.lodging.pipes["daily"]
+            task = asyncio.create_task(
+                drain._render_llm_body(pipe, {"open_incidents": []})
+            )
+            await asyncio.wait_for(spawn_started.wait(), timeout=5.0)
+            gc_pid = int(marker.read_text().strip())
+            assert _alive(gc_pid)
+            # Cancel while the spawn coroutine is still suspended inside
+            # create_subprocess_exec: `process` is unbound in the drain.
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=10.0)
+            return gc_pid
+        finally:
+            daemon.connection.close()
+
+    gc_pid = asyncio.run(driver())
+    for _ in range(200):
+        if not _alive(gc_pid):
+            break
+        time.sleep(0.01)
+    else:
+        os.kill(gc_pid, 9)
+        raise AssertionError(
+            f"horizon grandchild {gc_pid} survived a mid-spawn (Window A) "
+            "cancel -- the shielded handle was not recovered and reaped"
+        )
+
+
 def test_full_daemon_shutdown_reaps_python_triager_subprocess(
     tmp_path, monkeypatch,
 ) -> None:
