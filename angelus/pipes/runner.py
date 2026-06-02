@@ -57,9 +57,13 @@ DEFAULT_COMPACT_MAX_ITEMS_PER_SECTION = 10
 # until an operator provisions the check and exports the URL.
 DIGEST_HEARTBEAT_URL_ENV = "ANGELUS_DIGEST_HEARTBEAT_URL"
 
-# Hard ceiling on the dead-man ping so a slow/hung healthcheck endpoint can
-# never stall a digest drain (and, by extension, daemon shutdown, since the
-# drain job is awaited on teardown). Kept short -- the ping is best-effort.
+# Per-operation socket timeout for the dead-man ping (passed to urlopen, which
+# applies it to each connect/recv -- NOT as a single total wall-clock bound).
+# Kept short because the ping is best-effort and runs inside the digest drain,
+# which the daemon awaits on shutdown: a fast endpoint (healthchecks.io) returns
+# well within this, so the drain (and shutdown's bounded await of it) is not
+# delayed in practice. A pathological trickle from the operator's own healthcheck
+# URL is the only residual -- bounded per-recv, capped read below, accepted.
 DIGEST_HEARTBEAT_TIMEOUT_SEC = 5.0
 
 
@@ -430,8 +434,11 @@ class PipeDrain:
         Inert unless ``ANGELUS_DIGEST_HEARTBEAT_URL`` is set. Never raises:
         the digest has already been delivered and recorded by the time this
         runs, so a ping failure must not turn a delivered digest into an
-        error. Run in a thread so the blocking urlopen cannot stall the loop;
-        bounded by a short timeout so it cannot delay shutdown.
+        error. Run in a thread so the blocking urlopen cannot stall the event
+        loop. The per-operation socket timeout (not a single total bound) plus
+        the capped read in ``_get_url`` keep a misbehaving endpoint from
+        meaningfully delaying the drain; a fast healthcheck endpoint returns
+        well under it.
         """
         url = os.environ.get(DIGEST_HEARTBEAT_URL_ENV)
         if not url:
@@ -440,9 +447,12 @@ class PipeDrain:
             await asyncio.to_thread(_get_url, url, DIGEST_HEARTBEAT_TIMEOUT_SEC)
             LOGGER.info("digest heartbeat pinged %s", DIGEST_HEARTBEAT_URL_ENV)
         except asyncio.CancelledError:
-            # Shutdown cancelled the drain task mid-ping; the urlopen thread
-            # finishes on its own (bounded by its timeout). Re-raise so the
-            # daemon's teardown sees the cancellation.
+            # Shutdown cancelled the drain task mid-ping. asyncio cannot cancel
+            # a running thread, so this await defers the cancellation until the
+            # urlopen thread returns (bounded per-operation by the socket
+            # timeout) and then raises CancelledError; re-raise so teardown
+            # sees it. Worst case it adds one socket-timeout to the daemon's
+            # already-bounded drain-shutdown wait.
             raise
         except Exception as exc:
             LOGGER.warning(
@@ -464,6 +474,10 @@ class PipeDrain:
         closures = structured.get("recent_closures") or []
         suppressed = structured.get("suppressed_findings") or []
 
+        # Closures are counted in the summary line but deliberately not listed
+        # as their own section: resolved items are good news, and the compact
+        # leg reserves its limited headline space for what still needs eyes
+        # (open incidents, new findings). The email leg lists closures in full.
         lines = [
             subject,
             (
@@ -826,12 +840,16 @@ def _parse_utc(value: str) -> datetime:
 def _get_url(url: str, timeout: float) -> None:
     """Blocking best-effort GET for the digest dead-man ping.
 
-    Runs in a worker thread (see PipeDrain._ping_digest_heartbeat). Reads and
-    discards the response so the connection closes; a non-2xx status raises so
-    the caller logs it. Network/HTTP errors propagate to the caller's handler.
+    Runs in a worker thread (see PipeDrain._ping_digest_heartbeat). Restricts
+    the scheme to http/https (the URL is env-sourced; reject file:// and other
+    schemes outright). Reads only a small bounded prefix of the response to
+    bound the read and let the connection close; a non-2xx status raises so the
+    caller logs it. Network/HTTP errors propagate to the caller's handler.
     """
+    if not url.startswith(("http://", "https://")):
+        raise RuntimeError(f"healthcheck URL must be http(s): {url!r}")
     with urllib.request.urlopen(url, timeout=timeout) as response:  # noqa: S310
-        response.read()
+        response.read(64)  # capped: a healthcheck ack is tiny; don't drain a flood
         status = getattr(response, "status", 200)
     if not 200 <= int(status) < 300:
         raise RuntimeError(f"healthcheck ping returned HTTP {status}")

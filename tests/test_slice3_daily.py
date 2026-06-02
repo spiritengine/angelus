@@ -2043,3 +2043,10 @@ def test_digest_heartbeat_failure_does_not_break_delivery(tmp_path, monkeypatch)
 
     assert push_sent, "digest must still be delivered despite a failed heartbeat ping"
     assert drained is not None and drained["last_drain_at"]
+
+
+def test_get_url_rejects_non_http_scheme() -> None:
+    """The dead-man ping URL is env-sourced; _get_url must reject non-http(s)
+    schemes (e.g. file://) before opening anything."""
+    with pytest.raises(RuntimeError, match="must be http"):
+        pipe_runner._get_url("file:///etc/passwd", 1.0)
