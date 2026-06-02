@@ -451,7 +451,8 @@ class PipeDrain:
             # a running thread, so this await defers the cancellation until the
             # urlopen thread returns (bounded per-operation by the socket
             # timeout) and then raises CancelledError; re-raise so teardown
-            # sees it. Worst case it adds one socket-timeout to the daemon's
+            # sees it. Worst case it adds up to a few sequential socket-timeouts
+            # (connect + header recv + the capped read) to the daemon's
             # already-bounded drain-shutdown wait.
             raise
         except Exception as exc:
