@@ -761,10 +761,15 @@ def test_startup_reconciles_orphaned_render_and_dispatch_incidents(tmp_path) -> 
         }
         assert {"daily", "email"} <= closed_entities
 
-        # Gate re-armed: a genuine re-failure opens a NEW incident and emits.
+        # Gate re-armed for BOTH sources: a genuine re-failure opens a NEW
+        # incident and emits (not suppressed) for each.
         render_again = daemon.catalog.write_internal_finding(
             "internal/render", "llm_render_failed", "daily", "broke again", known_pipes
         )
         assert render_again not in (0, render_first)
+        dispatch_again = daemon.catalog.write_internal_finding(
+            "internal/dispatch", "channel_unhealthy", "email", "down again", known_pipes
+        )
+        assert dispatch_again not in (0, dispatch_first)
     finally:
         daemon.connection.close()

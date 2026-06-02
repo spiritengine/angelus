@@ -35,6 +35,16 @@ DEFAULT_BELFRY_STALE_AFTER_SEC = 1200
 # orphans and the B30 gate then suppresses the next genuine failure. See
 # AngelusDaemon._reconcile_orphaned_internal_incidents for the per-source
 # justification (and why internal/render is the weakest of the three).
+#
+# The other two internal sources are DELIBERATELY excluded: internal/dep
+# persists its unhealthy state in dep_health across a restart (nothing wipes
+# that table at boot) and recovers off an external dep_record push the restart
+# does not skip -- an open dep incident is consistent, not orphaned.
+# internal/triage recovers off the next observation the triager handles, which
+# a restart does not skip while the source keeps firing -- so it is not blind-
+# cleared (which would reintroduce the false-green render accepts). The one
+# residual: a one-shot / removed / very-long-cadence triager whose observation
+# went terminal can orphan like render; bounded by source cadence, left as-is.
 _RESTART_RECONCILED_INTERNAL_SOURCES = (
     "internal/lodging",
     "internal/dispatch",
@@ -255,8 +265,10 @@ class AngelusDaemon:
         - internal/dispatch: clear_channel_health() just reset every channel to
           healthy (channel health is restart-scoped, slice 2), so an open
           channel_unhealthy incident is now inconsistent and orphaned. The next
-          send re-opens it if the channel is still broken -- fast on the `now`
-          pipe.
+          send re-opens it if the channel is still broken -- fast when the
+          channel is on the `now` pipe; a digest-only channel re-verifies at the
+          next daily digest (the inconsistency-with-reset-health is the
+          justification regardless of re-verify speed).
         - internal/render: a digest render failure from a now-replaced
           execution context (e.g. incident 10 -- a pre-E2BIG-fix render that
           stayed open across the deploy restart). This is the weakest claim:
