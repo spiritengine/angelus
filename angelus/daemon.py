@@ -30,6 +30,27 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_BELFRY_SENTINEL_FILENAME = "belfry-pinged-at"
 DEFAULT_BELFRY_STALE_AFTER_SEC = 1200
 
+# Internal incident sources reconciled at daemon startup. Each recovers only
+# off a live edge a restart can skip, so an incident open across a restart
+# orphans and the B30 gate then suppresses the next genuine failure. See
+# AngelusDaemon._reconcile_orphaned_internal_incidents for the per-source
+# justification (and why internal/render is the weakest of the three).
+#
+# The other two internal sources are DELIBERATELY excluded: internal/dep
+# persists its unhealthy state in dep_health across a restart (nothing wipes
+# that table at boot) and recovers off an external dep_record push the restart
+# does not skip -- an open dep incident is consistent, not orphaned.
+# internal/triage recovers off the next observation the triager handles, which
+# a restart does not skip while the source keeps firing -- so it is not blind-
+# cleared (which would reintroduce the false-green render accepts). The one
+# residual: a one-shot / removed / very-long-cadence triager whose observation
+# went terminal can orphan like render; bounded by source cadence, left as-is.
+_RESTART_RECONCILED_INTERNAL_SOURCES = (
+    "internal/lodging",
+    "internal/dispatch",
+    "internal/render",
+)
+
 # Hard ceiling on awaiting cancelled digest-drain tasks during shutdown.
 # Set above _kill_and_reap's own _REAP_TIMEOUT (5.0s) so a drain cancelled
 # mid-render gets to run its reap arm to completion, while a genuinely
@@ -160,7 +181,7 @@ class AngelusDaemon:
             # counter populated would let a single subsequent failure cross
             # the threshold immediately on the new generation.
             self.catalog.clear_digest_channel_attempts()
-            self._reconcile_lodging_incidents()
+            self._reconcile_orphaned_internal_incidents()
             self._register_initial_jobs()
             self.scheduler.start()
             scheduler_started = True
@@ -226,42 +247,60 @@ class AngelusDaemon:
                 )
             self.connection.close()
 
-    def _reconcile_lodging_incidents(self) -> None:
-        """Clear any internal/lodging incident left open across a restart.
+    def _reconcile_orphaned_internal_incidents(self) -> None:
+        """Clear internal incidents left open across a restart.
 
-        internal/lodging incidents recover off filesystem CHANGE events: the
-        reloader's _clear_rejection fires only from _apply_swap /
-        _apply_removal, i.e. a watchdog change *after* reloader.start(). But a
-        broken lodging file crashes startup (load_lodging in __init__ raises),
-        so the operator fixes the file WHILE THE DAEMON IS DOWN. On restart the
-        watchdog sees an already-correct file, no change event fires, and the
-        pre-restart internal/lodging incident stays open forever -- silently
-        suppressing the next real lodging breakage under the B30 gate.
+        Internal incidents recover off LIVE edges (a filesystem change, a
+        successful render, a successful send) -- never at startup. So an
+        incident opened before a restart can orphan: the recovery edge that
+        would close it fires only from a later event a restart can skip, and
+        the B30 gate then silently suppresses the next genuine failure of that
+        (source, entity). This sweep reconciles the restart-scoped internal
+        sources after the startup state is re-established:
 
-        load_lodging succeeded in __init__ before we got here, which proves
-        every watched lodging file is currently valid, so reconcile: clear each
-        open internal/lodging incident through the same clearance path the
-        reloader uses (write_internal_clearance), so recent_closures stays
-        correct and the gate re-arms. The clearance is a no-op for keys with
-        nothing open, so this is safe and idempotent.
+        - internal/lodging: load_lodging succeeded in __init__, which PROVES
+          every watched lodging file is currently valid (the original FIX 1
+          case: a file fixed while the daemon was DOWN emits no change event,
+          so the reloader's change-driven _clear_rejection never fires).
+        - internal/dispatch: clear_channel_health() just reset every channel to
+          healthy (channel health is restart-scoped, slice 2), so an open
+          channel_unhealthy incident is now inconsistent and orphaned. The next
+          send re-opens it if the channel is still broken -- fast when the
+          channel is on the `now` pipe; a digest-only channel re-verifies at the
+          next daily digest (the inconsistency-with-reset-health is the
+          justification regardless of re-verify speed).
+        - internal/render: a digest render failure from a now-replaced
+          execution context (e.g. incident 10 -- a pre-E2BIG-fix render that
+          stayed open across the deploy restart). This is the weakest claim:
+          the render is NOT re-verified at startup, so it is cleared on the bet
+          that a restart is a clean slate, and the next digest re-opens it if
+          the render is still broken (up to one cadence later). A brief
+          false-green is preferred over a stale incident keeping belfry red and
+          masking every OTHER signal until the once-daily digest runs.
+
+        Each closes through write_internal_clearance -- the same path the live
+        recovery edges use, so recent_closures stays correct and the gate
+        re-arms. Gate-safe and idempotent: a no-op for any (source, entity)
+        with nothing open. Must run AFTER clear_channel_health so the dispatch
+        reconcile matches the freshly-reset health.
         """
         known_pipes = set(self.lodging.pipes)
-        reconciled = 0
+        reconciled: dict[str, int] = {}
         for incident in self.catalog.open_incidents():
-            if incident["source"] != "internal/lodging":
+            source = incident["source"]
+            if source not in _RESTART_RECONCILED_INTERNAL_SOURCES:
                 continue
             self.catalog.write_internal_clearance(
-                "internal/lodging",
+                source,
                 incident["entity"],
-                f"{incident['entity']} OK at startup",
+                f"{incident['entity']} reconciled at startup",
                 known_pipes,
             )
-            reconciled += 1
+            reconciled[source] = reconciled.get(source, 0) + 1
         if reconciled:
             LOGGER.info(
-                "startup recovery: cleared %d orphaned internal/lodging "
-                "incident(s)",
-                reconciled,
+                "startup recovery: reconciled orphaned internal incidents (%s)",
+                ", ".join(f"{s}={n}" for s, n in sorted(reconciled.items())),
             )
 
     def request_stop(self) -> None:

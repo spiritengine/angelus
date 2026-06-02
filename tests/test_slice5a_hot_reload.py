@@ -678,7 +678,7 @@ def test_startup_reconciles_orphaned_lodging_incident(tmp_path) -> None:
 
         # Boot reconcile: the file is valid now, so the orphaned incident
         # must close.
-        daemon._reconcile_lodging_incidents()
+        daemon._reconcile_orphaned_internal_incidents()
         assert [
             i
             for i in daemon.catalog.open_incidents()
@@ -710,5 +710,66 @@ def test_startup_reconciles_orphaned_lodging_incident(tmp_path) -> None:
         ]
         assert len(reopen_lodging) == 1
         assert reopen_lodging[0]["latest_finding_id"] == reopened
+    finally:
+        daemon.connection.close()
+
+
+def test_startup_reconciles_orphaned_render_and_dispatch_incidents(tmp_path) -> None:
+    """internal/render and internal/dispatch incidents left open across a
+    restart are reconciled on boot alongside internal/lodging.
+
+    Motivating scenario: incident 10 -- a digest render that failed on
+    pre-fix code (E2BIG) opened an internal/render incident that stayed open
+    across the deploy restart (the next render is once-daily), keeping belfry
+    red and masking other signals. Dispatch is the same shape but stronger:
+    clear_channel_health() resets channels to healthy at startup, so an open
+    channel_unhealthy incident is inconsistent. This pins that both close on
+    reconcile and the gate re-arms.
+    """
+    _write_lodging(tmp_path)
+    daemon = AngelusDaemon(tmp_path)
+    known_pipes = set(daemon.lodging.pipes)
+    try:
+        render_first = daemon.catalog.write_internal_finding(
+            "internal/render", "llm_render_failed", "daily", "E2BIG", known_pipes
+        )
+        dispatch_first = daemon.catalog.write_internal_finding(
+            "internal/dispatch", "channel_unhealthy", "email", "smtp down", known_pipes
+        )
+        assert render_first != 0 and dispatch_first != 0
+        open_now = {
+            (i["source"], i["entity"])
+            for i in daemon.catalog.open_incidents()
+            if i["source"] in ("internal/render", "internal/dispatch")
+        }
+        assert open_now == {
+            ("internal/render", "daily"),
+            ("internal/dispatch", "email"),
+        }
+
+        daemon._reconcile_orphaned_internal_incidents()
+
+        still_open = [
+            i
+            for i in daemon.catalog.open_incidents()
+            if i["source"] in ("internal/render", "internal/dispatch")
+        ]
+        assert still_open == []
+        # Clearances recorded so recent_closures stays correct.
+        closed_entities = {
+            c["entity"] for c in daemon.catalog.clearance_findings_since(None)
+        }
+        assert {"daily", "email"} <= closed_entities
+
+        # Gate re-armed for BOTH sources: a genuine re-failure opens a NEW
+        # incident and emits (not suppressed) for each.
+        render_again = daemon.catalog.write_internal_finding(
+            "internal/render", "llm_render_failed", "daily", "broke again", known_pipes
+        )
+        assert render_again not in (0, render_first)
+        dispatch_again = daemon.catalog.write_internal_finding(
+            "internal/dispatch", "channel_unhealthy", "email", "down again", known_pipes
+        )
+        assert dispatch_again not in (0, dispatch_first)
     finally:
         daemon.connection.close()
