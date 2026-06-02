@@ -111,12 +111,34 @@ details — rotation policy, severity levels, how to tail — in
 ### Transport separation
 
 Urgent and routine alerts ride different transports, so a dead transport can't
-swallow the alerts that matter most. The routine digest pipe (`daily`) uses
-email; the urgent/immediate pipe (`now`) and any escalation path use push
-(`notify-pat`). Don't point the `now` pipe — or any future escalation pipe — at
-the same channel as the digest. The 2026-05-29 incident was exactly this failure
-mode: email silently broke and the alerts that would have surfaced it were also
-riding email.
+swallow the alerts that matter most. The urgent/immediate pipe (`now`) and any
+escalation path use push (`notify-pat`); email is the long-form transport. The
+2026-05-29 incident was exactly this failure mode: email silently broke and the
+alerts that would have surfaced it were also riding email — so urgent alerts
+must never depend on email alone.
+
+The routine digest pipe (`daily`, 07:00 local) is **additive across both
+transports**: the email leg carries the full long-form digest (LLM synthesis
+plus the structured preamble) and the push leg carries a compact summary
+(`PipeDrain._render_compact` — a heartbeat header plus per-section counts and
+capped headlines). They are rendered separately because telegram caps a message
+at 4096 chars; the runner routes the full message to non-push channels and the
+compact one to push. The point is that telegram **acks delivery** where SMTP
+only hands off, so the push leg is the reliable receipt and email is the
+nice-to-have full prose — if email keeps flaking it can be dropped without
+losing the daily report. The cost of additive is that push now carries both the
+urgent `now` alerts and the routine digest; the off-box dead-man below is the
+backstop if push itself ever dies.
+
+**Digest dead-man.** After a digest drain delivers on at least one channel, the
+daemon pings `ANGELUS_DIGEST_HEARTBEAT_URL` (best-effort, last, never blocks or
+fails the digest). Point this at a healthchecks.io check with a ~daily expected
+cadence: if the digest ever silently stops firing, that off-box third party —
+independent of the daemon *and* belfry — alerts directly. Unset, the ping is
+skipped and the feature is inert, so it is safe to ship before the check is
+provisioned. This closes the "the digest never ran and nobody noticed" gap;
+it does not by itself prove inbox receipt (that residual is covered for push by
+telegram's delivery ack, and is a known, accepted gap for the email leg).
 
 The belfry is the external reliability layer. It runs outside the daemon from
 raw cron, checks `state/angelus.pid`, reads `source_fires` from
