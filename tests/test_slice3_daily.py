@@ -16,13 +16,16 @@ from angelus.pipes import PipeDrain
 from angelus.storage import Catalog, init_db
 
 
-def _daily_pipe(inputs: list[str] | None = None) -> Pipe:
+def _daily_pipe(
+    inputs: list[str] | None = None,
+    channels: list[str] | None = None,
+) -> Pipe:
     return Pipe(
         name="daily",
-        cadence="0 8 * * *",
+        cadence="0 7 * * *",
         render_kind="digest",
         template=None,
-        channels=["push"],
+        channels=channels if channels is not None else ["push"],
         render={
             "preamble": [
                 {"kind": "structured", "template": "rate-limit-callout"},
@@ -213,8 +216,8 @@ def test_two_zone_render_dispatches_preamble_then_llm_body(tmp_path, monkeypatch
     _write_templates(tmp_path)
     drain = PipeDrain(
         catalog,
-        _daily_pipe(),
-        {"push": Channel(name="push", kind="push", command="notify-pat")},
+        _daily_pipe(channels=["email"]),
+        {"email": Channel(name="email", kind="email", command="true", to="x@y")},
         tmp_path,
         {"now", "daily"},
     )
@@ -232,13 +235,13 @@ def test_two_zone_render_dispatches_preamble_then_llm_body(tmp_path, monkeypatch
     )
     sent: list[str] = []
 
-    async def fake_push(_channel, message: str, _workdir: Path) -> None:
-        sent.append(message)
+    async def fake_email(_channel, _subject: str, body: str, _workdir: Path) -> None:
+        sent.append(body)
 
     async def fake_llm(self, _pipe, _structured):
         return "This is the chronicler body.", None
 
-    monkeypatch.setattr(pipe_runner, "send_push", fake_push)
+    monkeypatch.setattr(pipe_runner, "send_email", fake_email)
     monkeypatch.setattr(PipeDrain, "_render_llm_body", fake_llm)
 
     try:
@@ -247,8 +250,9 @@ def test_two_zone_render_dispatches_preamble_then_llm_body(tmp_path, monkeypatch
         connection.close()
 
     assert sent
-    # Body ordering reversed 2026-05-27: chronicler synthesis paragraph
-    # leads, structured preamble items follow. The preamble was the
+    # The full long-form digest rides the email leg (push gets the compact
+    # render). Body ordering reversed 2026-05-27: chronicler synthesis
+    # paragraph leads, structured preamble items follow. The preamble was the
     # source of structured-data-twice-rendered messes; the llm is now
     # constrained to a short paragraph and the preamble owns items.
     assert sent[0].index("This is the chronicler body.") < sent[0].index("Suppressed:")
@@ -443,14 +447,14 @@ def test_llm_nonzero_fallback_dispatches_and_emits_internal_finding(
     monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
     sent: list[str] = []
 
-    async def fake_push(_channel, message: str, _workdir: Path) -> None:
-        sent.append(message)
+    async def fake_email(_channel, _subject: str, body: str, _workdir: Path) -> None:
+        sent.append(body)
 
-    monkeypatch.setattr(pipe_runner, "send_push", fake_push)
+    monkeypatch.setattr(pipe_runner, "send_email", fake_email)
     drain = PipeDrain(
         catalog,
-        _daily_pipe(),
-        {"push": Channel(name="push", kind="push", command="notify-pat")},
+        _daily_pipe(channels=["email"]),
+        {"email": Channel(name="email", kind="email", command="true", to="x@y")},
         tmp_path,
         {"now", "daily"},
     )
@@ -767,14 +771,14 @@ def test_llm_timeout_kills_subprocess_and_falls_back(tmp_path, monkeypatch) -> N
     monkeypatch.setattr(pipe_runner.asyncio, "wait_for", short_wait)
     sent: list[str] = []
 
-    async def fake_push(_channel, message: str, _workdir: Path) -> None:
-        sent.append(message)
+    async def fake_email(_channel, _subject: str, body: str, _workdir: Path) -> None:
+        sent.append(body)
 
-    monkeypatch.setattr(pipe_runner, "send_push", fake_push)
+    monkeypatch.setattr(pipe_runner, "send_email", fake_email)
     drain = PipeDrain(
         catalog,
-        _daily_pipe(),
-        {"push": Channel(name="push", kind="push", command="notify-pat")},
+        _daily_pipe(channels=["email"]),
+        {"email": Channel(name="email", kind="email", command="true", to="x@y")},
         tmp_path,
         {"now", "daily"},
     )
@@ -1293,14 +1297,14 @@ def test_llm_body_unwraps_horizon_cast_envelope(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
     sent: list[str] = []
 
-    async def fake_push(_channel, message: str, _workdir: Path) -> None:
-        sent.append(message)
+    async def fake_email(_channel, _subject: str, body: str, _workdir: Path) -> None:
+        sent.append(body)
 
-    monkeypatch.setattr(pipe_runner, "send_push", fake_push)
+    monkeypatch.setattr(pipe_runner, "send_email", fake_email)
     drain = PipeDrain(
         catalog,
-        _daily_pipe(),
-        {"push": Channel(name="push", kind="push", command="notify-pat")},
+        _daily_pipe(channels=["email"]),
+        {"email": Channel(name="email", kind="email", command="true", to="x@y")},
         tmp_path,
         {"now", "daily"},
     )
@@ -1656,8 +1660,8 @@ def test_drain_message_body_synthesis_precedes_preamble(tmp_path, monkeypatch) -
     _write_templates(tmp_path)
     drain = PipeDrain(
         catalog,
-        _daily_pipe(),
-        {"push": Channel(name="push", kind="push", command="notify-pat")},
+        _daily_pipe(channels=["email"]),
+        {"email": Channel(name="email", kind="email", command="true", to="x@y")},
         tmp_path,
         {"now", "daily"},
     )
@@ -1675,13 +1679,13 @@ def test_drain_message_body_synthesis_precedes_preamble(tmp_path, monkeypatch) -
     )
     sent: list[str] = []
 
-    async def fake_push(_channel, message: str, _workdir: Path) -> None:
-        sent.append(message)
+    async def fake_email(_channel, _subject: str, body: str, _workdir: Path) -> None:
+        sent.append(body)
 
     async def fake_llm(self, _pipe, _structured):
         return "Synthesis: one site went down.", None
 
-    monkeypatch.setattr(pipe_runner, "send_push", fake_push)
+    monkeypatch.setattr(pipe_runner, "send_email", fake_email)
     monkeypatch.setattr(PipeDrain, "_render_llm_body", fake_llm)
     try:
         asyncio.run(drain.drain_once())
@@ -1716,8 +1720,8 @@ def test_chronicler_quiet_day_short_reply_is_not_rejected(
     _write_templates(tmp_path)
     drain = PipeDrain(
         catalog,
-        _daily_pipe(),
-        {"push": Channel(name="push", kind="push", command="notify-pat")},
+        _daily_pipe(channels=["email"]),
+        {"email": Channel(name="email", kind="email", command="true", to="x@y")},
         tmp_path,
         {"now", "daily"},
     )
@@ -1734,8 +1738,8 @@ def test_chronicler_quiet_day_short_reply_is_not_rejected(
     )
     sent: list[str] = []
 
-    async def fake_push(_channel, message: str, _workdir: Path) -> None:
-        sent.append(message)
+    async def fake_email(_channel, _subject: str, body: str, _workdir: Path) -> None:
+        sent.append(body)
 
     real_create = pipe_runner.asyncio.create_subprocess_exec
 
@@ -1747,7 +1751,7 @@ def test_chronicler_quiet_day_short_reply_is_not_rejected(
             **kwargs,
         )
 
-    monkeypatch.setattr(pipe_runner, "send_push", fake_push)
+    monkeypatch.setattr(pipe_runner, "send_email", fake_email)
     monkeypatch.setattr(
         pipe_runner.asyncio, "create_subprocess_exec", short_chronicler
     )
@@ -1852,3 +1856,197 @@ def test_shipped_jinja_templates_render_one_bullet_per_line() -> None:
         f"expected two suppressed-finding bullets on separate lines; "
         f"got {len(rl_lines)}.\nRendered:\n{out3!r}"
     )
+
+
+def test_digest_additive_email_full_push_compact(tmp_path, monkeypatch) -> None:
+    """Additive transports (2026-06-02): the email leg carries the full
+    long-form digest (LLM synthesis + structured preamble); the push leg
+    carries a compact summary with no LLM prose. One drain, two renders."""
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    _write_templates(tmp_path)
+    drain = PipeDrain(
+        catalog,
+        _daily_pipe(channels=["email", "push"]),
+        {
+            "email": Channel(name="email", kind="email", command="true", to="x@y"),
+            "push": Channel(name="push", kind="push", command="notify-pat"),
+        },
+        tmp_path,
+        {"now", "daily"},
+    )
+    catalog.write_finding(
+        None,
+        {
+            "source": "scheduled/test",
+            "type": "down",
+            "entity": "site",
+            "severity": "high",
+            "target_pipes": ["daily"],
+            "body": "site went away",
+        },
+        {"daily"},
+    )
+    email_sent: list[str] = []
+    push_sent: list[str] = []
+
+    async def fake_email(_channel, _subject: str, body: str, _workdir: Path) -> None:
+        email_sent.append(body)
+
+    async def fake_push(_channel, message: str, _workdir: Path) -> None:
+        push_sent.append(message)
+
+    async def fake_llm(self, _pipe, _structured):
+        return "Synthesis: one site went down.", None
+
+    monkeypatch.setattr(pipe_runner, "send_email", fake_email)
+    monkeypatch.setattr(pipe_runner, "send_push", fake_push)
+    monkeypatch.setattr(PipeDrain, "_render_llm_body", fake_llm)
+    try:
+        asyncio.run(drain.drain_once())
+    finally:
+        connection.close()
+
+    assert email_sent and push_sent
+    # Email = full digest: LLM synthesis paragraph + structured preamble.
+    assert "Synthesis: one site went down." in email_sent[0]
+    assert "Incidents:" in email_sent[0]
+    # Push = compact: heartbeat header + counts, NO LLM prose, NO raw preamble.
+    compact = push_sent[0]
+    assert compact.startswith("Angelus Observances for ")
+    assert "new finding(s)" in compact
+    assert "Synthesis: one site went down." not in compact
+    assert "Suppressed:" not in compact
+
+
+def test_compact_render_caps_sections_with_more_tail(tmp_path) -> None:
+    """The compact push render lists at most N items per section and prints a
+    '+K more' tail so a busy day cannot blow past telegram's message cap."""
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    drain = PipeDrain(
+        catalog,
+        _daily_pipe(channels=["push"]),
+        {"push": Channel(name="push", kind="push", command="notify-pat")},
+        tmp_path,
+        {"now", "daily"},
+    )
+    cap = pipe_runner.DEFAULT_COMPACT_MAX_ITEMS_PER_SECTION
+    structured = {
+        "open_incidents": [
+            {"severity": "high", "type": "down", "entity": f"e{i}"}
+            for i in range(cap + 3)
+        ],
+        "findings_since_last_drain": [],
+        "recent_closures": [],
+        "suppressed_findings": [],
+    }
+    out = drain._render_compact("Angelus Observances for Day", structured)
+
+    assert out.startswith("Angelus Observances for Day")
+    assert f"{cap + 3} open incident(s)" in out
+    listed = [line for line in out.splitlines() if line.startswith("high down: ")]
+    assert len(listed) == cap
+    assert "+3 more" in out
+
+
+def test_digest_heartbeat_pings_when_url_set(tmp_path, monkeypatch) -> None:
+    """A successful digest drain pings the dead-man URL exactly once."""
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    _write_templates(tmp_path)
+    drain = PipeDrain(
+        catalog,
+        _daily_pipe(channels=["push"]),
+        {"push": Channel(name="push", kind="push", command="notify-pat")},
+        tmp_path,
+        {"now", "daily"},
+    )
+    monkeypatch.setenv("ANGELUS_DIGEST_HEARTBEAT_URL", "http://hc.example/ping-uuid")
+    pinged: list[str] = []
+
+    def fake_get(url: str, _timeout: float) -> None:
+        pinged.append(url)
+
+    async def fake_push(_channel, _message: str, _workdir: Path) -> None:
+        pass
+
+    monkeypatch.setattr(pipe_runner, "_get_url", fake_get)
+    monkeypatch.setattr(pipe_runner, "send_push", fake_push)
+    try:
+        asyncio.run(drain.drain_once())
+    finally:
+        connection.close()
+
+    assert pinged == ["http://hc.example/ping-uuid"]
+
+
+def test_digest_heartbeat_inert_when_url_unset(tmp_path, monkeypatch) -> None:
+    """With no heartbeat URL the ping is skipped entirely (feature inert)."""
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    _write_templates(tmp_path)
+    drain = PipeDrain(
+        catalog,
+        _daily_pipe(channels=["push"]),
+        {"push": Channel(name="push", kind="push", command="notify-pat")},
+        tmp_path,
+        {"now", "daily"},
+    )
+    monkeypatch.delenv("ANGELUS_DIGEST_HEARTBEAT_URL", raising=False)
+
+    def fail_get(_url: str, _timeout: float) -> None:
+        raise AssertionError("_get_url must not be called when URL is unset")
+
+    async def fake_push(_channel, _message: str, _workdir: Path) -> None:
+        pass
+
+    monkeypatch.setattr(pipe_runner, "_get_url", fail_get)
+    monkeypatch.setattr(pipe_runner, "send_push", fake_push)
+    try:
+        asyncio.run(drain.drain_once())
+    finally:
+        connection.close()
+
+
+def test_digest_heartbeat_failure_does_not_break_delivery(tmp_path, monkeypatch) -> None:
+    """A failing dead-man ping must not turn a delivered digest into an error:
+    the ping runs last, after the drain is recorded."""
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    _write_templates(tmp_path)
+    drain = PipeDrain(
+        catalog,
+        _daily_pipe(channels=["push"]),
+        {"push": Channel(name="push", kind="push", command="notify-pat")},
+        tmp_path,
+        {"now", "daily"},
+    )
+    monkeypatch.setenv("ANGELUS_DIGEST_HEARTBEAT_URL", "http://hc.example/ping-uuid")
+    push_sent: list[str] = []
+
+    def boom_get(_url: str, _timeout: float) -> None:
+        raise RuntimeError("healthcheck endpoint down")
+
+    async def fake_push(_channel, message: str, _workdir: Path) -> None:
+        push_sent.append(message)
+
+    monkeypatch.setattr(pipe_runner, "_get_url", boom_get)
+    monkeypatch.setattr(pipe_runner, "send_push", fake_push)
+    try:
+        asyncio.run(drain.drain_once())  # must not raise
+        drained = connection.execute(
+            "SELECT last_drain_at FROM pipe_state WHERE pipe_name = 'daily'"
+        ).fetchone()
+    finally:
+        connection.close()
+
+    assert push_sent, "digest must still be delivered despite a failed heartbeat ping"
+    assert drained is not None and drained["last_drain_at"]
+
+
+def test_get_url_rejects_non_http_scheme() -> None:
+    """The dead-man ping URL is env-sourced; _get_url must reject non-http(s)
+    schemes (e.g. file://) before opening anything."""
+    with pytest.raises(RuntimeError, match="must be http"):
+        pipe_runner._get_url("file:///etc/passwd", 1.0)

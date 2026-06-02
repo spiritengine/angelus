@@ -1125,7 +1125,12 @@ def test_rate_limit_overflow_routes_excess_to_daily_and_renders_suppressed_callo
         encoding="utf-8",
     )
     (tmp_path / "pipes" / "daily.yaml").write_text(
-        "cadence: '0 8 * * *'\nchannels: [push]\n"
+        # The full long-form digest (preamble callout + LLM body) rides the
+        # email leg; the push leg carries only the compact summary (no entity
+        # list). Axes C/D below assert the suppressed entities and their
+        # severities in the digest, so this fixture routes the digest to email
+        # and the assertions capture the email leg.
+        "cadence: '0 7 * * *'\nchannels: [email]\n"
         "render:\n"
         "  preamble:\n"
         "    - kind: structured\n      template: rate-limit-callout\n"
@@ -1137,6 +1142,9 @@ def test_rate_limit_overflow_routes_excess_to_daily_and_renders_suppressed_callo
     (tmp_path / "channels").mkdir()
     (tmp_path / "channels" / "push.yaml").write_text(
         "kind: push\ncommand: 'true'\n", encoding="utf-8"
+    )
+    (tmp_path / "channels" / "email.yaml").write_text(
+        "kind: email\ncommand: 'true'\nto: 'x@y'\n", encoding="utf-8"
     )
     (tmp_path / "render-templates").mkdir()
     (tmp_path / "render-templates" / "rate-limit-callout.j2").write_text(
@@ -1162,11 +1170,16 @@ def test_rate_limit_overflow_routes_excess_to_daily_and_renders_suppressed_callo
     # reach the real subprocess because of this monkeypatch -- which also
     # keeps the test off the file-system DRY_RUN log code path.
     push_sends: list[str] = []
+    email_sends: list[str] = []
 
     async def fake_push(_channel, message: str, _workdir: Path) -> None:
         push_sends.append(message)
 
+    async def fake_email(_channel, _subject: str, body: str, _workdir: Path) -> None:
+        email_sends.append(body)
+
     monkeypatch.setattr(pipe_runner, "send_push", fake_push)
+    monkeypatch.setattr(pipe_runner, "send_email", fake_email)
 
     # The digest LLM body is unrelated to the rate-limit axes; mock it to
     # avoid spawning a `horizon` subprocess in the test. The mocked body
@@ -1246,7 +1259,7 @@ def test_rate_limit_overflow_routes_excess_to_daily_and_renders_suppressed_callo
             ]
 
             await daemon.pipe_drains["daily"].drain_once()
-            state["daily_message"] = push_sends[-1]
+            state["daily_message"] = email_sends[-1]
         finally:
             daemon.connection.close()
 
@@ -1254,13 +1267,14 @@ def test_rate_limit_overflow_routes_excess_to_daily_and_renders_suppressed_callo
 
     # --- axis A: send rail -- exactly 2 findings made it through `now` ---
     # `true` succeeded on both, recorded as 'sent' dispatches against the
-    # `push` channel. push_sends carries 3 messages total (2 now + 1 daily
-    # digest).
+    # `push` channel. push_sends carries the 2 immediate `now` messages; the
+    # daily digest rides the email leg (email_sends), captured separately.
     now_sent = [d for d in state["now_dispatches"] if d == ("push", "sent")]
     assert len(now_sent) == 2, state["now_dispatches"]
-    # axis A is also pinned by the count of immediate dispatches in
-    # push_sends (the daily digest message is the 3rd).
-    assert len(push_sends) == 3, push_sends
+    # axis A is also pinned by the count of immediate dispatches: exactly the
+    # 2 `now` messages on push, with the daily digest on email.
+    assert len(push_sends) == 2, push_sends
+    assert len(email_sends) == 1, email_sends
 
     # --- axis B: suppress rail -- 2 finding rows re-routed to daily ----
     # Findings 1+2 dispatched on `now`; findings 3+4 transitioned to

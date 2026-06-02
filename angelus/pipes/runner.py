@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,29 @@ DEFAULT_DIGEST_STAGING_KEEP = 30
 # collection is truncated to this many items with a trailing marker row so the
 # omission is visible in both the preamble and the chronicler prompt.
 DEFAULT_DIGEST_MAX_ITEMS_PER_INPUT = 200
+
+# Per-section item budget for the compact push (telegram) digest. Telegram caps
+# a message at 4096 chars and notify-pat splits longer bodies on newlines, so
+# the push leg lists at most this many items per section and prints a "+N more"
+# tail; the full item list always rides the email leg. Compact is a heartbeat-
+# plus-headlines summary, not the full report.
+DEFAULT_COMPACT_MAX_ITEMS_PER_SECTION = 10
+
+# Env var holding the healthchecks.io (or any URL) dead-man ping for the daily
+# digest. Pinged once per successful digest drain so an off-box third party
+# alerts if the digest ever stops firing (the "digest silently never ran"
+# gap belfry can't see). Unset -> the ping is skipped, so the feature is inert
+# until an operator provisions the check and exports the URL.
+DIGEST_HEARTBEAT_URL_ENV = "ANGELUS_DIGEST_HEARTBEAT_URL"
+
+# Per-operation socket timeout for the dead-man ping (passed to urlopen, which
+# applies it to each connect/recv -- NOT as a single total wall-clock bound).
+# Kept short because the ping is best-effort and runs inside the digest drain,
+# which the daemon awaits on shutdown: a fast endpoint (healthchecks.io) returns
+# well within this, so the drain (and shutdown's bounded await of it) is not
+# delayed in practice. A pathological trickle from the operator's own healthcheck
+# URL is the only residual -- bounded per-recv, capped read below, accepted.
+DIGEST_HEARTBEAT_TIMEOUT_SEC = 5.0
 
 
 class PipeDrain:
@@ -303,10 +327,16 @@ class PipeDrain:
             f"{local_now.strftime('%A %B')} "
             f"{local_now.day}, {local_now.year}"
         )
+        # The push (telegram) leg rides a separate compact render, not the full
+        # long-form `message`: telegram caps at 4096 chars and the digest prose
+        # would split into many messages. Built once; selected per channel kind
+        # below. Email (and any non-push channel) keeps the full message.
+        compact = self._render_compact(subject, structured)
 
         any_channel_succeeded = False
         for channel_name in pipe.channels:
             channel = channels[channel_name]
+            payload = compact if channel.kind == "push" else message
             # Product decision: the digest path does NOT consult
             # is_channel_unhealthy before attempting send, even though the
             # immediate path does. The digest is the consolidation/audit
@@ -322,7 +352,7 @@ class PipeDrain:
             # counter and the channel could never recover without a daemon
             # restart.
             try:
-                await self._send_channel(channel, message, subject)
+                await self._send_channel(channel, payload, subject)
             except Exception as exc:
                 # The daily digest is the routine-delivery contract; a failed
                 # send here is the exact 2026-05-29 silent-failure shape, so
@@ -391,6 +421,104 @@ class PipeDrain:
         if any_channel_succeeded:
             self.catalog.mark_pipe_items_dispatched(pipe.name, finding_ids)
             self.catalog.mark_pipe_drained(pipe.name, drained_at)
+            # Dead-man heartbeat: the digest demonstrably went out on at least
+            # one channel this cycle, so ping the off-box check. A missing ping
+            # is the signal "the digest never fired" -- a gap belfry (on-box,
+            # liveness-only) cannot see. Best-effort and last, after the drain
+            # is fully recorded, so a slow endpoint cannot affect delivery.
+            await self._ping_digest_heartbeat()
+
+    async def _ping_digest_heartbeat(self) -> None:
+        """Best-effort dead-man ping after a successful digest drain.
+
+        Inert unless ``ANGELUS_DIGEST_HEARTBEAT_URL`` is set. Never raises:
+        the digest has already been delivered and recorded by the time this
+        runs, so a ping failure must not turn a delivered digest into an
+        error. Run in a thread so the blocking urlopen cannot stall the event
+        loop. The per-operation socket timeout (not a single total bound) plus
+        the capped read in ``_get_url`` keep a misbehaving endpoint from
+        meaningfully delaying the drain; a fast healthcheck endpoint returns
+        well under it.
+        """
+        url = os.environ.get(DIGEST_HEARTBEAT_URL_ENV)
+        if not url:
+            return
+        try:
+            await asyncio.to_thread(_get_url, url, DIGEST_HEARTBEAT_TIMEOUT_SEC)
+            LOGGER.info("digest heartbeat pinged %s", DIGEST_HEARTBEAT_URL_ENV)
+        except asyncio.CancelledError:
+            # Shutdown cancelled the drain task mid-ping. asyncio cannot cancel
+            # a running thread, so this await defers the cancellation until the
+            # urlopen thread returns (bounded per-operation by the socket
+            # timeout) and then raises CancelledError; re-raise so teardown
+            # sees it. Worst case it adds up to a few sequential socket-timeouts
+            # (connect + header recv + the capped read) to the daemon's
+            # already-bounded drain-shutdown wait.
+            raise
+        except Exception as exc:
+            LOGGER.warning(
+                "digest heartbeat ping to %s failed: %s",
+                DIGEST_HEARTBEAT_URL_ENV,
+                exc,
+            )
+
+    def _render_compact(self, subject: str, structured: dict[str, Any]) -> str:
+        """Render the compact push (telegram) digest.
+
+        A heartbeat header (the email subject line, so its presence alone
+        confirms the digest fired) plus one-line counts and a capped headline
+        list per non-empty section. Plain text, one item per line, screen-
+        reader friendly; the full item list always rides the email leg.
+        """
+        open_incidents = structured.get("open_incidents") or []
+        new_findings = structured.get("findings_since_last_drain") or []
+        closures = structured.get("recent_closures") or []
+        suppressed = structured.get("suppressed_findings") or []
+
+        # Closures are counted in the summary line but deliberately not listed
+        # as their own section: resolved items are good news, and the compact
+        # leg reserves its limited headline space for what still needs eyes
+        # (open incidents, new findings). The email leg lists closures in full.
+        lines = [
+            subject,
+            (
+                f"{len(new_findings)} new finding(s), "
+                f"{len(open_incidents)} open incident(s), "
+                f"{len(closures)} closed since last digest."
+            ),
+        ]
+        cap = DEFAULT_COMPACT_MAX_ITEMS_PER_SECTION
+
+        def _section(title: str, items: list[dict[str, Any]], fmt) -> None:
+            if not items:
+                return
+            lines.append("")
+            lines.append(f"{title} ({len(items)}):")
+            for item in items[:cap]:
+                lines.append(fmt(item))
+            if len(items) > cap:
+                lines.append(f"+{len(items) - cap} more")
+
+        _section(
+            "Open incidents",
+            open_incidents,
+            lambda i: (
+                f"{i.get('severity') or 'unknown'} "
+                f"{i.get('type') or ''}: {i.get('entity') or ''}".rstrip()
+            ),
+        )
+        _section(
+            "New findings",
+            new_findings,
+            lambda f: (
+                f"{f.get('severity') or 'unknown'} "
+                f"{f.get('type') or ''} on {f.get('entity') or ''}".rstrip()
+            ),
+        )
+        if suppressed:
+            lines.append("")
+            lines.append(f"Rate-limit overflow ({len(suppressed)}).")
+        return "\n".join(lines)
 
     async def _send_channel(self, channel: Channel, message: str, subject: str) -> None:
         if channel.kind == "push":
@@ -708,6 +836,24 @@ def _is_same_utc_day(left: str | None, right: str | None) -> bool:
 
 def _parse_utc(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _get_url(url: str, timeout: float) -> None:
+    """Blocking best-effort GET for the digest dead-man ping.
+
+    Runs in a worker thread (see PipeDrain._ping_digest_heartbeat). Restricts
+    the scheme to http/https (the URL is env-sourced; reject file:// and other
+    schemes outright). Reads only a small bounded prefix of the response to
+    bound the read and let the connection close; a non-2xx status raises so the
+    caller logs it. Network/HTTP errors propagate to the caller's handler.
+    """
+    if not url.startswith(("http://", "https://")):
+        raise RuntimeError(f"healthcheck URL must be http(s): {url!r}")
+    with urllib.request.urlopen(url, timeout=timeout) as response:  # noqa: S310
+        response.read(64)  # capped: a healthcheck ack is tiny; don't drain a flood
+        status = getattr(response, "status", 200)
+    if not 200 <= int(status) < 300:
+        raise RuntimeError(f"healthcheck ping returned HTTP {status}")
 
 
 # Timestamp fields the catalog returns on findings + incidents. Listed
