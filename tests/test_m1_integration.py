@@ -1760,3 +1760,82 @@ def test_sigkill_mid_drain_recovery_three_axis(tmp_path) -> None:
         )
     finally:
         conn.close()
+
+
+# --- Risk 3 (B11): fixer subprocess shutdown ----------------------------
+
+
+def test_full_daemon_shutdown_reaps_fixer_handler_subprocess(
+    tmp_path, monkeypatch,
+) -> None:
+    """A B11 fixer's handler is a forking subprocess (its documented job is
+    to shell out to systemctl/notify-pat/curl). The fixer-evaluation loop
+    blocks INLINE on that handler, so run() shutdown must CANCEL the loop --
+    not merely await it -- for run_python_fixer's CancelledError reap arm to
+    run. Otherwise a slow handler hangs teardown until its timeout.
+
+    Discrimination (recorded in FELL_NOTES): leaving the fixer loop in
+    self.tasks (await-only on shutdown) instead of cancelling it makes this
+    hang ~handler_timeout -> the <8s assertion fails; dropping the
+    CancelledError arm from run_python_fixer orphans the grandchild.
+    """
+    marker = tmp_path / "fixer_child.pid"
+    _base_lodging(tmp_path)
+    (tmp_path / "fixers" / "handlers").mkdir(parents=True)
+    (tmp_path / "fixers" / "handlers" / "fork_hang.py").write_text(
+        "import subprocess, sys\n"
+        "sys.stdin.read()\n"
+        f"subprocess.run(['sh', '-c', 'sleep 30 & echo $! > {marker}; wait'])\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "fixers" / "dep.yaml").write_text(
+        "condition:\n  kind: open_internal_incident\n  source: internal/dep\n"
+        "handler:\n  kind: python\n  path: fixers/handlers/fork_hang.py\n"
+        "  timeout_seconds: 60\n"
+        "guardrails:\n  max_attempts: 5\n  window_seconds: 3600\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ANGELUS_DRY_RUN", "1")
+
+    async def driver() -> int:
+        daemon = AngelusDaemon(tmp_path)
+        # Open the matching condition before run() so the first fixer pass
+        # fires immediately.
+        daemon.catalog.write_internal_finding(
+            "internal/dep", "dependency_unhealthy", "dep.example.com",
+            "down", set(daemon.lodging.pipes),
+        )
+        task = asyncio.create_task(daemon.run())
+        try:
+            for _ in range(400):
+                if marker.exists() and marker.read_text().strip():
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                raise AssertionError("fixer never launched its handler child")
+            gc_pid = int(marker.read_text().strip())
+            assert _alive(gc_pid)
+
+            started = time.monotonic()
+            daemon.request_stop()
+            await asyncio.wait_for(task, timeout=15.0)
+            elapsed = time.monotonic() - started
+            assert elapsed < 8.0, f"shutdown took {elapsed:.1f}s (hang)"
+            return gc_pid
+        finally:
+            if not task.done():
+                daemon.request_stop()
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+    gc_pid = asyncio.run(driver())
+    for _ in range(200):
+        if not _alive(gc_pid):
+            break
+        time.sleep(0.01)
+    else:
+        os.kill(gc_pid, 9)
+        raise AssertionError(
+            f"fixer handler grandchild {gc_pid} survived shutdown -- "
+            "cancelled fixer subprocess was orphaned"
+        )

@@ -1524,3 +1524,62 @@ class Catalog:
             """
         )
         return [dict(row) for row in rows]
+
+    def record_fixer_attempt(
+        self, fixer_name: str, condition_key: str, outcome: str
+    ) -> str:
+        """Append one fixer attempt to the ledger and return its timestamp (B11).
+
+        Written for every attempt the dispatcher actually makes (the guardrails
+        having allowed it), so the rolling-window count and the backoff spacing
+        both read off real attempts. Append-only, self-committing like the rest
+        of this class."""
+        attempted_at = self._clock.now_iso()
+        self.connection.execute(
+            """
+            INSERT INTO fixer_attempts (
+                fixer_name, condition_key, attempted_at, outcome
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (fixer_name, condition_key, attempted_at, outcome),
+        )
+        self.connection.commit()
+        return attempted_at
+
+    def fixer_attempt_count_in_window(
+        self, fixer_name: str, condition_key: str, window_seconds: int
+    ) -> int:
+        """Count attempts for (fixer, condition) within the trailing window.
+
+        The guardrail's max_attempts is compared against this. The window is
+        measured from the catalog clock's now, so a FakeClock test controls it.
+        Read-only."""
+        cutoff = _format_time(self._clock.now() - timedelta(seconds=window_seconds))
+        row = self.connection.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM fixer_attempts
+            WHERE fixer_name = ? AND condition_key = ? AND attempted_at >= ?
+            """,
+            (fixer_name, condition_key, cutoff),
+        ).fetchone()
+        return int(row["n"])
+
+    def last_fixer_attempt_at(
+        self, fixer_name: str, condition_key: str
+    ) -> str | None:
+        """Most recent attempt timestamp for (fixer, condition), or None.
+
+        Backoff spacing is measured against this. Deliberately unwindowed: the
+        last attempt governs spacing even if it predates the count window, so
+        a long backoff is honored regardless of window length. Read-only."""
+        row = self.connection.execute(
+            """
+            SELECT MAX(attempted_at) AS last_at
+            FROM fixer_attempts
+            WHERE fixer_name = ? AND condition_key = ?
+            """,
+            (fixer_name, condition_key),
+        ).fetchone()
+        return None if row is None else row["last_at"]

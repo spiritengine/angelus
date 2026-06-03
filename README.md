@@ -259,6 +259,54 @@ The script alerts when the sentinel is missing or older than
 dependency check or any new angelus product behavior; the operator owns the
 outermost watchdog wiring.
 
+### Autoremediation (fixers)
+
+Detection makes a failure loud; a **fixer** lets the daemon *act* on one. A
+fixer is a lodging entry under `fixers/` — discovered at load like
+`triagers/`/`pipes/`, hot-reloadable, `.disabled`-honoring — that binds a
+**condition** to a **handler** under **guardrails**:
+
+```yaml
+# fixers/<name>.yaml
+condition:
+  kind: open_internal_incident   # or channel_unhealthy
+  source: internal/dep           # exact match; incident_type/entity narrow it
+handler:
+  kind: python                   # run as a subprocess, like a triager
+  path: fixers/handlers/<x>.py
+  timeout_seconds: 60
+guardrails:
+  max_attempts: 3                # within window_seconds, per condition instance
+  window_seconds: 3600
+  backoff_seconds: 300           # minimum spacing between attempts
+```
+
+The condition is matched against live catalog state on each evaluation pass —
+`open_internal_incident` against the daemon's own open `internal/*` incidents,
+`channel_unhealthy` against a channel marked unhealthy by real-traffic failures.
+Daemon-death is deliberately **not** a fixer condition: the in-daemon loop can't
+observe its own death, so that stays belfry's out-of-band job (it restarts on
+*absence*; fixers handle *live* errors). The handler runs out-of-process and
+remediates by shelling out, so a buggy fixer can't corrupt daemon state; it
+reads the matched condition as JSON on stdin and reports `{"outcome": "...",
+"note": "..."}` on stdout.
+
+The guardrails are the contract that autoremediation never makes things worse:
+at most `max_attempts` within `window_seconds` for a given condition instance,
+spaced at least `backoff_seconds` apart, enforced before the handler ever runs —
+this is what keeps a fixer from restart-looping a misconfiguration. When a fixer
+exhausts its budget it simply stops firing (quietly): the underlying condition
+stays loud through belfry and `angelus health`, and making the *giving-up*
+itself escalate is the escalation ladder's job, not the registry's. Every
+attempt is recorded and appended to the shared `state/fixers.log` audit trail —
+the same file belfry's restart-fixer writes — so fixer actions flow into the
+daily digest's `fixer_actions` section and any postmortem with no extra
+plumbing.
+
+`fixers/observe-internal-incident.yaml.disabled` ships as a documented, inert
+template (and the `observe.py` handler it points at is the copy-me starting
+point for a real fixer).
+
 ## Storage
 
 SQLite is the authoritative lifecycle store. Migrations live in `migrations/` as ordered SQL files named `<NNNN>_<name>.sql`. The storage initializer enables WAL mode and applies pending migrations in order, with each migration and its `schema_migrations` bookkeeping recorded atomically.

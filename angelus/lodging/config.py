@@ -35,6 +35,21 @@ SUPPORTED_DIGEST_INPUTS = (
 
 DISABLED_SUFFIX = ".disabled"
 
+# Condition kinds a fixer (B11) may bind to. Both are evaluated against live
+# catalog state on each fixer-evaluation pass, so they are the conditions the
+# in-daemon registry can actually observe about itself:
+#   - open_internal_incident: an open incident (the daemon's own self-reported
+#     failure, source like internal/dep) matching a declared source.
+#   - channel_unhealthy: a channel marked unhealthy by real-traffic failures.
+# "daemon-dead" is deliberately NOT here: the in-daemon loop cannot observe its
+# own death, so that condition stays belfry's out-of-band domain (B12). Adding
+# a kind is a code change (a new matcher in the daemon), exactly like adding a
+# channel kind -- dropping a fixer YAML that binds an existing kind needs none.
+SUPPORTED_FIXER_CONDITIONS = (
+    "open_internal_incident",
+    "channel_unhealthy",
+)
+
 
 @dataclass(frozen=True)
 class ScheduledSource:
@@ -87,12 +102,54 @@ class Dependency:
 
 
 @dataclass(frozen=True)
+class FixerCondition:
+    """What a fixer binds to, matched against live catalog state (B11).
+
+    kind is one of SUPPORTED_FIXER_CONDITIONS. The other fields are matchers
+    interpreted per kind:
+      - open_internal_incident: `source` (required) is matched exactly against
+        an open incident's source; `incident_type` and `entity` (both optional)
+        narrow it further when set.
+      - channel_unhealthy: `channel` (optional) names a specific channel; when
+        omitted the condition matches any unhealthy channel.
+    """
+
+    kind: str
+    source: str | None = None
+    incident_type: str | None = None
+    entity: str | None = None
+    channel: str | None = None
+
+
+@dataclass(frozen=True)
+class Fixer:
+    """An autoremediation binding discovered under fixers/ (B11).
+
+    A condition (above) bound to a python handler run as a subprocess -- the
+    same isolation model as triagers/watches, so a fixer remediates by shelling
+    out and can never corrupt live daemon state. The guardrails cap the blast
+    radius: at most max_attempts within window_seconds for a given condition
+    instance, and at least backoff_seconds between attempts. The dispatcher
+    enforces them before ever invoking the handler.
+    """
+
+    name: str
+    condition: FixerCondition
+    handler_path: Path
+    handler_timeout: float
+    max_attempts: int
+    window_seconds: int
+    backoff_seconds: int
+
+
+@dataclass(frozen=True)
 class Lodging:
     sources: dict[str, ScheduledSource]
     triagers: dict[str, Triager]
     pipes: dict[str, Pipe]
     channels: dict[str, Channel]
     dependencies: dict[str, Dependency]
+    fixers: dict[str, Fixer] = field(default_factory=dict)
 
 
 def load_lodging(root: Path) -> Lodging:
@@ -146,6 +203,7 @@ def load_lodging(root: Path) -> Lodging:
         pipes=_load_pipes(root),
         channels=_load_channels(root),
         dependencies=_load_dependencies(root),
+        fixers=_load_fixers(root),
     )
     errors = validate_cross_refs(lodging)
     if errors:
@@ -202,6 +260,24 @@ def validate_cross_refs(lodging: Lodging) -> list[str]:
             errors.append(
                 f"pipe {pipe.name} rate_limit.overflow references unknown pipe "
                 f"{overflow!r}"
+            )
+    for fixer in lodging.fixers.values():
+        # A channel_unhealthy fixer naming a specific channel gets the same
+        # typo protection a triager's target_pipe gets: a fixer bound to
+        # `channel: psh` would silently never fire (no channel by that name can
+        # be unhealthy), the same silent-misroute class validate_cross_refs
+        # closes everywhere else. A nameless channel_unhealthy (any channel) and
+        # the open_internal_incident source are not cross-refs -- an incident
+        # source is dynamic, not a lodged entry -- so they are validated for
+        # shape at parse time, not here.
+        if (
+            fixer.condition.kind == "channel_unhealthy"
+            and fixer.condition.channel is not None
+            and fixer.condition.channel not in lodging.channels
+        ):
+            errors.append(
+                f"fixer {fixer.name} condition.channel references missing "
+                f"channel {fixer.condition.channel!r}"
             )
     return errors
 
@@ -432,6 +508,99 @@ def parse_dependency(path: Path) -> Dependency:
     )
 
 
+def parse_fixer(root: Path, path: Path) -> "Fixer":
+    """Parse a fixers/<name>.yaml lodging file (B11).
+
+    Shape::
+
+        condition:
+          kind: open_internal_incident   # or channel_unhealthy
+          source: internal/dep           # required for open_internal_incident
+          incident_type: dependency_unhealthy   # optional narrower match
+          entity: iotaschool.com         # optional narrower match
+          # channel: email               # for channel_unhealthy (optional)
+        handler:
+          kind: python
+          path: fixers/handlers/recheck.py
+          timeout_seconds: 60
+        guardrails:
+          max_attempts: 3
+          window_seconds: 3600
+          backoff_seconds: 300
+
+    The handler is a python file run as a subprocess (like triagers/watches),
+    so it remediates by shelling out. `guardrails` is required and must cap the
+    blast radius -- a fixer with no attempt ceiling is exactly the
+    restart-a-misconfig-forever failure the master brief forbids.
+    """
+    data = _read_yaml(path)
+    name = path.stem
+
+    condition_raw = _required_dict(data, "condition", path)
+    kind = _required_str(condition_raw, "kind", path)
+    if kind not in SUPPORTED_FIXER_CONDITIONS:
+        raise ValueError(
+            f"{path}: unsupported condition.kind {kind!r}; "
+            f"supported: {', '.join(SUPPORTED_FIXER_CONDITIONS)}"
+        )
+    source = _optional_str(condition_raw, "source", path)
+    incident_type = _optional_str(condition_raw, "incident_type", path)
+    entity = _optional_str(condition_raw, "entity", path)
+    channel = _optional_str(condition_raw, "channel", path)
+    if kind == "open_internal_incident":
+        if source is None:
+            raise ValueError(
+                f"{path}: condition.kind=open_internal_incident requires "
+                f"a non-empty 'source'"
+            )
+        if channel is not None:
+            raise ValueError(
+                f"{path}: condition.channel is only valid for "
+                f"kind=channel_unhealthy"
+            )
+    elif kind == "channel_unhealthy":
+        for stray, value in (
+            ("source", source),
+            ("incident_type", incident_type),
+            ("entity", entity),
+        ):
+            if value is not None:
+                raise ValueError(
+                    f"{path}: condition.{stray} is only valid for "
+                    f"kind=open_internal_incident"
+                )
+    condition = FixerCondition(
+        kind=kind,
+        source=source,
+        incident_type=incident_type,
+        entity=entity,
+        channel=channel,
+    )
+
+    handler = _required_dict(data, "handler", path)
+    if handler.get("kind") != "python":
+        raise ValueError(f"{path}: only handler.kind=python is supported")
+    handler_path = root / _required_str(handler, "path", path)
+    if not handler_path.exists():
+        raise ValueError(f"{path}: handler path does not exist: {handler_path}")
+    handler_timeout = _optional_timeout(handler, path, 60.0)
+
+    guardrails = _required_dict(data, "guardrails", path)
+    max_attempts = _required_positive_int(guardrails, "max_attempts", path)
+    window_seconds = _required_positive_int(guardrails, "window_seconds", path)
+    backoff_seconds = _optional_nonneg_int(guardrails, "backoff_seconds", path, 0)
+
+    return Fixer(
+        name=name,
+        condition=condition,
+        handler_path=handler_path,
+        handler_timeout=handler_timeout,
+        max_attempts=max_attempts,
+        window_seconds=window_seconds,
+        backoff_seconds=backoff_seconds,
+    )
+
+
 def _enabled_yaml_files(directory: Path) -> list[Path]:
     """Return *.yaml files under directory, skipping any that have a sibling
     .disabled twin (or are themselves named *.yaml.disabled)."""
@@ -482,6 +651,18 @@ def _load_dependencies(root: Path) -> dict[str, Dependency]:
     for path in _enabled_yaml_files(root / "dependencies"):
         dependency = parse_dependency(path)
         loaded[dependency.name] = dependency
+    return loaded
+
+
+def _load_fixers(root: Path) -> dict[str, Fixer]:
+    # fixers/ holds the YAML bindings; fixers/handlers/ holds the python
+    # handler files. Only the flat *.yaml layer is a fixer (handlers are
+    # *.py), so the same _enabled_yaml_files glob that scans every other
+    # lodging dir picks up exactly the bindings and ignores the handlers.
+    loaded: dict[str, Fixer] = {}
+    for path in _enabled_yaml_files(root / "fixers"):
+        fixer = parse_fixer(root, path)
+        loaded[fixer.name] = fixer
     return loaded
 
 
@@ -556,3 +737,36 @@ def _optional_timeout(data: dict[str, Any], path: Path, default: float) -> float
     if not isinstance(value, int | float) or value <= 0:
         raise ValueError(f"{path}: expected positive numeric timeout")
     return float(value)
+
+
+def _optional_str(data: dict[str, Any], key: str, path: Path) -> str | None:
+    """Return a non-empty string value for `key`, or None when absent.
+
+    A present-but-empty or non-string value is a typo, not an omission, so it
+    fails loud rather than silently collapsing to None (the same value-shape
+    leg the watch clearance_pipe parser hardened)."""
+    if key not in data:
+        return None
+    value = data[key]
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{path}: expected {key} to be a non-empty string")
+    return value
+
+
+def _required_positive_int(data: dict[str, Any], key: str, path: Path) -> int:
+    value = data.get(key)
+    # bool is an int subclass; `True`/`False` here is a YAML typo, not a count.
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{path}: expected positive integer {key}")
+    return value
+
+
+def _optional_nonneg_int(
+    data: dict[str, Any], key: str, path: Path, default: int
+) -> int:
+    if key not in data:
+        return default
+    value = data[key]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{path}: expected non-negative integer {key}")
+    return value
