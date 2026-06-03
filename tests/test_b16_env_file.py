@@ -192,3 +192,49 @@ def test_resolve_op_refs_noop_without_refs(monkeypatch):
     env = {"ANGELUS_EMAIL_TO": "x@example.com"}
     assert resolve_op_refs(env) == {}
     assert env == {"ANGELUS_EMAIL_TO": "x@example.com"}
+
+
+def test_op_read_missing_binary_raises(monkeypatch):
+    monkeypatch.setattr(envfile.shutil, "which", lambda _name: None)
+    with pytest.raises(RuntimeError, match="not on PATH"):
+        envfile._op_read("op://angelus/healthchecks-digest/credential")
+
+
+def test_op_read_empty_value_raises(monkeypatch):
+    import subprocess as sp
+
+    monkeypatch.setattr(envfile.shutil, "which", lambda _name: "/usr/bin/op")
+    monkeypatch.setattr(
+        envfile.subprocess,
+        "run",
+        lambda *a, **k: sp.CompletedProcess(a[0], 0, stdout="\n", stderr=""),
+    )
+    with pytest.raises(RuntimeError, match="empty"):
+        envfile._op_read("op://angelus/healthchecks-digest/credential")
+
+
+def test_op_read_nonzero_surfaces_stderr(monkeypatch):
+    import subprocess as sp
+
+    monkeypatch.setattr(envfile.shutil, "which", lambda _name: "/usr/bin/op")
+    monkeypatch.setattr(
+        envfile.subprocess,
+        "run",
+        lambda *a, **k: sp.CompletedProcess(a[0], 1, stdout="", stderr="vault not found"),
+    )
+    with pytest.raises(RuntimeError, match="vault not found"):
+        envfile._op_read("op://angelus/healthchecks-digest/credential")
+
+
+def test_op_read_preserves_internal_whitespace(monkeypatch):
+    # Only the trailing newline op appends is stripped; a value with significant
+    # surrounding spaces (a future password) survives.
+    import subprocess as sp
+
+    monkeypatch.setattr(envfile.shutil, "which", lambda _name: "/usr/bin/op")
+    monkeypatch.setattr(
+        envfile.subprocess,
+        "run",
+        lambda *a, **k: sp.CompletedProcess(a[0], 0, stdout="  pa ss  \n", stderr=""),
+    )
+    assert envfile._op_read("op://v/i/f") == "  pa ss  "

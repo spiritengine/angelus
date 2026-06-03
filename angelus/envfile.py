@@ -160,10 +160,17 @@ def _op_read(ref: str) -> str:
         capture_output=True,
         text=True,
         timeout=_OP_READ_TIMEOUT_SEC,
+        # No stdin: with a service-account token op is non-interactive, but if a
+        # ref is ever resolved without one, closing stdin makes op fail fast
+        # instead of inheriting the tty and blocking to the full timeout.
+        stdin=subprocess.DEVNULL,
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or f"op exited {result.returncode}")
-    value = result.stdout.strip()
+    # Strip only the single trailing newline `op read` appends -- NOT arbitrary
+    # whitespace, so a future secret (e.g. the B20 SMTP password) with
+    # significant leading/trailing spaces survives intact.
+    value = result.stdout.rstrip("\n")
     if not value:
         raise RuntimeError("op returned an empty value")
     return value
