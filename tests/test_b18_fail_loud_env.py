@@ -77,6 +77,12 @@ def test_malformed_env_marker_rejected_at_load(tmp_path) -> None:
     with pytest.raises(ValueError, match="malformed env reference"):
         parse_channel(bad)
 
+    # The guard is field-agnostic: a nameless marker in `command` is caught too.
+    bad_cmd = tmp_path / "push.yaml"
+    bad_cmd.write_text('kind: push\ncommand: "$env:"\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="malformed env reference"):
+        parse_channel(bad_cmd)
+
 
 def _lodging(*, email_in_pipe: bool) -> Lodging:
     channels = {
