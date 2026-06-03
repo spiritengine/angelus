@@ -56,6 +56,56 @@ def _drain(tmp_path) -> tuple[Catalog, PipeDrain]:
     return catalog, drain
 
 
+# The PRODUCTION now-pipe shape from pipes/now.yaml: the same push-only pipe as
+# NOW_PIPE but carrying the real rate_limit (per_channel 6/hr, per_source 4/hr,
+# overflow: daily). The immediate-drain rate-limit check runs BEFORE the fan and
+# shunts an over-budget finding off `now` onto the `daily` digest -- so without
+# the internal bypass, an internal/* distress signal during an alert storm would
+# never page immediately and never fan. Exercising that gate requires a pipe
+# that actually carries rate_limit; NOW_PIPE omits it, which is precisely why the
+# pre-bypass suite stayed green over this hole.
+NOW_PIPE_RATE_LIMITED = Pipe(
+    name="now",
+    cadence="immediate",
+    render_kind="dumb-alert",
+    template="{severity} {type}: {entity} {body}",
+    channels=["push"],
+    rate_limit={"per_channel": "6/hr", "per_source": "4/hr", "overflow": "daily"},
+)
+
+
+def _rate_limited_drain(tmp_path) -> tuple[Catalog, PipeDrain]:
+    """A now-pipe drain on the real rate-limited shape, knowing `daily` exists.
+
+    known_pipes includes `daily` so suppression has a real overflow target to
+    route to -- i.e. the pre-bypass behaviour (now -> suppressed, daily ->
+    pending) is reachable, and a test can assert it does NOT happen.
+    """
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    channels = {
+        "push": Channel(name="push", kind="push", command="notify-pat"),
+        "email": Channel(
+            name="email", kind="email", command="patbot-email", to="x@example.com"
+        ),
+    }
+    drain = PipeDrain(
+        catalog, NOW_PIPE_RATE_LIMITED, channels, tmp_path, {"now", "daily"}
+    )
+    return catalog, drain
+
+
+def _queue_rows(catalog: Catalog, finding_id: int) -> dict[str, str]:
+    """{pipe: status} for one finding's pipe_queues rows."""
+    return {
+        row["pipe"]: row["status"]
+        for row in catalog.connection.execute(
+            "SELECT pipe, status FROM pipe_queues WHERE finding_id = ?",
+            (finding_id,),
+        )
+    }
+
+
 def _dispatch_rows(catalog: Catalog) -> list[tuple[str, str]]:
     """(channel, status) for every dispatch row, in insertion order."""
     return [
@@ -188,6 +238,80 @@ def test_non_internal_finding_does_not_fan(tmp_path, monkeypatch) -> None:
     # alerts onto every transport.
     assert push.calls == ["push"]
     assert email.calls == [], "non-internal finding must not fan to email"
+
+
+# --------------------------------------------------------------------------
+# The immediate rate-limit gate runs BEFORE the fan; internal findings must
+# bypass it so a distress signal is never suppressed off `now` onto the daily
+# digest. This is the path NOW_PIPE (no rate_limit) could never exercise.
+# --------------------------------------------------------------------------
+
+
+def test_internal_findings_over_budget_still_fan_not_suppressed(
+    tmp_path, monkeypatch
+) -> None:
+    """Internal findings beyond BOTH the per_source and per_channel budgets
+    still fan to every channel on the immediate path and are NOT routed to
+    `daily`.
+
+    This pins Finding 1: the rate-limit check (_over_rate_limit ->
+    suppress_pipe_item_to) sits ahead of the fan and, on a hit, shunts the
+    finding off `now` onto the once-a-day digest. For an internal/* finding
+    that is the distress signal being silenced -- it never pages immediately
+    and never fans, and the digest may itself be what is broken. The B30
+    emission gate (one alert per open incident key) is the correct flood
+    control for internal findings, so they must skip the rate limit entirely.
+
+    Discrimination -- this FAILS against the pre-bypass code: the pre-load
+    pushes the push channel to its 6/hr cap AND the internal/dep source to
+    its 4/hr cap, so without the bypass _over_rate_limit returns True for the
+    very first internal finding and every one is suppressed (now -> suppressed,
+    daily -> pending) with push/email never called. With the bypass each
+    finding fans to push AND email and its `now` row is marked dispatched. The
+    two assertions below (fan happened; no daily routing) both invert under
+    the pre-fix behaviour. Verified failing pre-fix and passing post-fix.
+    """
+    catalog, drain = _rate_limited_drain(tmp_path)
+    push = _Recorder()
+    email = _Recorder()
+    monkeypatch.setattr(pipe_runner, "send_push", push)
+    monkeypatch.setattr(pipe_runner, "send_email", email)
+
+    # Drive BOTH gates over budget before the drain. record_dispatch stamps
+    # dispatched_at at the clock's "now", so all six land inside the 1h window
+    # the rate-limit check looks back over. Six push `sent` rows trip
+    # per_channel (>= 6/hr); the same six, stamped source=internal/dep, also
+    # trip per_source (>= 4/hr) for the findings below -- so the gate would
+    # fire on whichever tooth is checked first.
+    for idx in range(6):
+        catalog.record_dispatch(
+            "now", "push", [9000 + idx], "sent", source="internal/dep"
+        )
+
+    # Distinct internal findings: same source/type, different entity, so the
+    # emission gate opens a separate incident for each and all three emit
+    # (several deps down at once is routine, not a flood). Each routes
+    # target_pipes=["now"] via write_internal_finding, exactly as in prod.
+    finding_ids = [
+        catalog.write_internal_finding(
+            "internal/dep", "down", entity, f"dependency {entity} is down",
+            {"now", "daily"},
+        )
+        for entity in ("speakbot", "skein", "belfry")
+    ]
+
+    asyncio.run(drain.drain_once())
+
+    # Every internal finding fanned to BOTH transports despite both budgets
+    # being blown -- one push + one email call per finding, in finding order.
+    assert push.calls == ["push", "push", "push"]
+    assert email.calls == ["email", "email", "email"]
+
+    # And none was suppressed onto `daily`: each `now` row is dispatched (not
+    # suppressed) and no overflow `daily` row was ever created. Pre-fix this
+    # dict would read {"now": "suppressed", "daily": "pending"} for each.
+    for finding_id in finding_ids:
+        assert _queue_rows(catalog, finding_id) == {"now": "dispatched"}
 
 
 # --------------------------------------------------------------------------

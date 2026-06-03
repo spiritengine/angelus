@@ -138,7 +138,26 @@ class PipeDrain:
             finding_id = int(row["id"])
             message = self._render(pipe, row)
             subject = f"[angelus] {row['entity']}: {row['type']}"
-            if self._over_rate_limit(pipe, row):
+            # internal/* findings bypass the immediate rate-limit suppression
+            # entirely -- they must never be shunted off `now` onto the daily
+            # digest. An internal finding IS the system's distress signal
+            # (a dep down, a channel unhealthy, a render failed); deferring it
+            # to a once-a-day digest means it never pages immediately and, on
+            # this path, never reaches the fan below -- and the digest may
+            # itself be the broken thing. The rate limit predates the fan and
+            # mis-handles internal findings two ways: (a) per_source double-
+            # counts, because every fanned channel records a `sent` dispatch
+            # stamped with the finding's source, so each internal finding
+            # burns 2+ of the 4/hr budget; (b) per_channel keys on
+            # pipe.channels (push only), so during an alert storm push hitting
+            # 6/hr suppresses later findings even though email is wide open.
+            # The B30 emission gate (drops repeats of the same
+            # source/type/entity) is the correct flood control for internal
+            # findings; distinct internal findings -- several deps down,
+            # push+email both unhealthy -- are routine and must all get out.
+            # Detection is the same domain-agnostic source-prefix check the
+            # fan uses (_is_internal), factored once so the two cannot drift.
+            if not _is_internal(row["source"]) and self._over_rate_limit(pipe, row):
                 self.catalog.suppress_pipe_item_to(
                     finding_id,
                     pipe.name,
@@ -271,22 +290,27 @@ class PipeDrain:
         channel being down can't swallow the signal as long as one OTHER
         transport is live.
 
-        Detection is the source prefix, never a channel name, so the rule
-        stays domain-agnostic: a channel added under channels/ is fanned to
-        for free, and no email/push special-case lives here. The union is
-        ordered pipe-channels-first so the urgent transport (push, on `now`)
+        Detection is the source prefix (via the shared _is_internal helper),
+        never a channel name, so the rule stays domain-agnostic: a channel
+        added under channels/ is fanned to for free, and no email/push
+        special-case lives here. The same helper gates the immediate rate-
+        limit bypass in _drain_immediate, so "what counts as internal" is
+        defined in exactly one place and the two sites cannot drift. The union
+        is ordered pipe-channels-first so the urgent transport (push, on `now`)
         is attempted before the long-form ones, and de-duplicated via
         dict.fromkeys so an overlap between the pipe's channels and the wider
         fan set sends once, not twice.
 
         Clearances never reach this method: write_internal_clearance routes
         them with ``target_pipes=[]`` (they page nothing), so they never
-        enqueue on a pipe and never drain. The emission gate, dedup, rate
-        limiting and the mute check all run upstream in _drain_immediate
-        before the channel loop, so fanning changes only which transports a
-        finding that is *already cleared to dispatch* reaches.
+        enqueue on a pipe and never drain. The emission gate, dedup, and the
+        mute check all run upstream in _drain_immediate before the channel
+        loop; the rate-limit check there is bypassed for internal findings
+        (the emission gate is their flood control), so fanning changes only
+        which transports a finding that is *already cleared to dispatch*
+        reaches.
         """
-        if not str(row["source"]).startswith("internal/"):
+        if not _is_internal(row["source"]):
             return list(pipe.channels)
         return list(dict.fromkeys([*pipe.channels, *channels]))
 
@@ -857,6 +881,23 @@ async def _recover_cancelled_spawn(
     if launch.cancelled() or launch.exception() is not None:
         return None
     return launch.result()
+
+
+def _is_internal(source: str | None) -> bool:
+    """True for angelus's OWN self-reported failure findings.
+
+    internal/* findings are the system's distress signal -- the self-reports
+    written by write_internal_finding (internal/dispatch, internal/render,
+    internal/config, ...). Detection is the ``internal/`` source prefix and
+    nothing else, so the rule stays domain-agnostic: it never names a channel
+    or a finding type, and a new internal source under that prefix is covered
+    for free. Two immediate-path sites must agree on this definition -- the
+    rate-limit bypass in _drain_immediate (internal findings are never
+    suppressed off `now`) and the channel fan in _dispatch_channels (internal
+    findings dispatch to every channel) -- so it lives here once rather than
+    being spelled out at each site, where the two could drift apart.
+    """
+    return str(source).startswith("internal/")
 
 
 def _parse_hourly_limit(value: str | None) -> int | None:
