@@ -64,6 +64,20 @@ def test_validate_and_send_share_one_env_marker(monkeypatch) -> None:
     assert _resolve_to(channel.to) == "ops@example.com"
 
 
+def test_malformed_env_marker_rejected_at_load(tmp_path) -> None:
+    """A `$env:` with no variable name is a typo the validator can't check, so
+    it is rejected at parse time rather than passing startup green and failing
+    every send (the validate/send divergence B18 closes)."""
+    import pytest
+
+    from angelus.lodging.config import parse_channel
+
+    bad = tmp_path / "email.yaml"
+    bad.write_text('kind: email\nto: "$env:"\ncommand: /bin/true\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="malformed env reference"):
+        parse_channel(bad)
+
+
 def _lodging(*, email_in_pipe: bool) -> Lodging:
     channels = {
         "push": Channel(name="push", kind="push", command="notify-pat"),

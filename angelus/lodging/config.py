@@ -330,12 +330,37 @@ def parse_channel(path: Path) -> Channel:
         to = _required_str(data, "to", path)
     else:
         to = None
-    return Channel(
+    channel = Channel(
         name=name,
         kind=str(kind),
         command=_required_str(data, "command", path),
         to=to,
     )
+    _assert_well_formed_env_markers(channel, path)
+    return channel
+
+
+def _assert_well_formed_env_markers(channel: Channel, path: Path) -> None:
+    """Reject a `$env:` marker with no variable name (e.g. `to: $env:`).
+
+    A nameless marker is a config typo, not a runtime-absent value: it cannot
+    name a var to check, so missing_channel_config would skip it and pass
+    startup green while the channel wrapper raises at send time -- the same
+    validate/send divergence B18 exists to close. Caught here at load, it joins
+    every other structural channel-config error (a ValueError that fails the
+    load) instead of becoming a silent-healthy daemon with a dead transport.
+    """
+    for field_ in dataclasses.fields(channel):
+        value = getattr(channel, field_.name)
+        if (
+            isinstance(value, str)
+            and value.startswith(ENV_REF_PREFIX)
+            and not value[len(ENV_REF_PREFIX) :]
+        ):
+            raise ValueError(
+                f"{path}: malformed env reference {value!r} in {field_.name} -- "
+                f"missing variable name after {ENV_REF_PREFIX!r}"
+            )
 
 
 def parse_dependency(path: Path) -> Dependency:
