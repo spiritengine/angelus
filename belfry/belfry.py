@@ -156,6 +156,15 @@ def main(argv: list[str] | None = None) -> int:
         stale_reason = stale_deployment(state / "angelus.pid", root)
         if stale_reason:
             other_reasons.append(stale_reason)
+        # Delivery SLA: a pipe alive-but-not-delivering. Alert-only (OTHER),
+        # never restart -- a stalled pipe is a product/logic failure, and the
+        # wedge check already covers a source-firing wedge; restarting here
+        # would mask the cause and is the wrong tool per the autoremediation
+        # rule (restart only for absence). The exact 2026-05-29 shape: nothing
+        # errored, the pipe just silently stopped delivering.
+        sla_reason = sla_failure(state / "angelus.sqlite3")
+        if sla_reason:
+            other_reasons.append(sla_reason)
 
     all_reasons = absence_reasons + other_reasons
     if all_reasons:
@@ -646,6 +655,96 @@ def failure_surface(db_path: Path, state_path: Path) -> str | None:
         )
     if reasons:
         return "; ".join(reasons)
+    return None
+
+
+def _parse_iso(value: str) -> datetime | None:
+    """Parse one of the catalog's ISO8601-Z timestamps to an aware UTC
+    datetime. Stdlib only. Returns None on anything unparseable so the SLA
+    check can fail open per-pipe rather than manufacture a false DOWN."""
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, AttributeError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt
+
+
+def sla_failure(db_path: Path, now: datetime | None = None) -> str | None:
+    """Assert each pipe with a declared delivery SLA is delivering on cadence.
+
+    The on-box, all-pipes generalization of the off-box digest dead-man: the
+    daemon persists each pipe's expected max interval into the `pipe_sla` table
+    (belfry cannot parse the pipes/*.yaml itself -- pure stdlib, no angelus
+    imports), and here belfry reads it read-only alongside the last SUCCESSFUL
+    (status='sent') dispatch per pipe and pings DOWN if the window lapsed.
+
+    Baseline for "overdue" is the last successful dispatch if the pipe has ever
+    delivered, else tracking_since. So a pipe that has never delivered gets a
+    full window of grace from when it was first registered rather than alerting
+    immediately on deploy, while a pipe that has delivered is always measured
+    from its real last delivery (even one older than tracking_since -- the
+    stricter choice, catching a stall a window sooner after the SLA is first
+    enabled on an already-running pipe).
+
+    LEVEL-triggered: re-reports every tick until a delivery resets the window
+    (no watermark), mirroring the open-internal-incident signal. Fails open:
+    any sqlite/parse error -- including a pre-migration db with no pipe_sla
+    table -- is swallowed (returns None); the pid/wedge checks remain the
+    liveness backstop and an SLA read must never manufacture a false DOWN.
+    """
+    now = now or datetime.now(UTC)
+    quoted = urllib.parse.quote(str(db_path), safe="/:")
+    uri = f"file:{quoted}?mode=ro"
+    try:
+        connection = sqlite3.connect(uri, uri=True)
+    except sqlite3.Error as exc:
+        log_err(f"angelus belfry: sla cannot open {db_path}: {exc}")
+        return None
+    try:
+        try:
+            sla_rows = connection.execute(
+                "SELECT pipe_name, max_interval_seconds, tracking_since "
+                "FROM pipe_sla"
+            ).fetchall()
+        except sqlite3.Error:
+            # No pipe_sla table yet (db predates the B2 migration): nothing to
+            # assert. Fail open.
+            return None
+        if not sla_rows:
+            return None
+        last_sent = dict(
+            connection.execute(
+                "SELECT pipe, max(dispatched_at) FROM dispatches "
+                "WHERE status = 'sent' AND dispatched_at IS NOT NULL "
+                "GROUP BY pipe"
+            ).fetchall()
+        )
+    except sqlite3.Error as exc:
+        log_err(f"angelus belfry: sla query failed: {exc}")
+        return None
+    finally:
+        connection.close()
+
+    overdue: list[str] = []
+    for pipe_name, max_seconds, tracking_since in sla_rows:
+        delivered = last_sent.get(pipe_name)
+        baseline = _parse_iso(delivered or tracking_since)
+        if baseline is None:
+            continue  # unparseable timestamp -> fail open for this pipe
+        age_sec = (now - baseline).total_seconds()
+        if age_sec <= max_seconds:
+            continue
+        age_hr = age_sec / 3600.0
+        max_hr = max_seconds / 3600.0
+        if delivered is None:
+            detail = f"no successful delivery in {age_hr:.1f}h"
+        else:
+            detail = f"last delivery {age_hr:.1f}h ago"
+        overdue.append(f"{pipe_name} overdue: {detail} (max {max_hr:.0f}h)")
+    if overdue:
+        return "; ".join(overdue)
     return None
 
 

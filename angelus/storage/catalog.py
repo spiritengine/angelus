@@ -502,6 +502,44 @@ class Catalog:
         self.connection.commit()
         return drained_at
 
+    def sync_pipe_sla(self, slas: dict[str, int]) -> None:
+        """Reconcile the pipe_sla table to the pipes that currently declare a
+        delivery SLA (B2). `slas` maps pipe_name -> max_interval_seconds.
+
+        Belfry reads this table read-only to assert each pipe delivers on
+        cadence -- belfry cannot parse YAML, so the daemon (the single sqlite
+        writer) persists the contract here. Called at daemon startup from the
+        loaded lodging.
+
+        tracking_since is written ONCE per pipe and preserved by the upsert
+        (ON CONFLICT updates only max_interval_seconds), so it is never moved on
+        a later sync and stays the baseline for a never-delivered pipe across
+        daemon restarts (a stall spanning restarts is still caught).
+        max_interval_seconds is updated so a changed `max_interval` takes
+        effect. Pipes no longer declaring an SLA are removed so a stale row
+        can't keep belfry red after a pipe is reclassified or deleted.
+        """
+        now = self._clock.now_iso()
+        for pipe_name, seconds in slas.items():
+            self.connection.execute(
+                """
+                INSERT INTO pipe_sla (pipe_name, max_interval_seconds, tracking_since)
+                VALUES (?, ?, ?)
+                ON CONFLICT (pipe_name) DO UPDATE SET
+                    max_interval_seconds = excluded.max_interval_seconds
+                """,
+                (pipe_name, seconds, now),
+            )
+        if slas:
+            placeholders = ",".join("?" for _ in slas)
+            self.connection.execute(
+                f"DELETE FROM pipe_sla WHERE pipe_name NOT IN ({placeholders})",
+                tuple(slas),
+            )
+        else:
+            self.connection.execute("DELETE FROM pipe_sla")
+        self.connection.commit()
+
     def suppressed_findings_since(self, since: str | None) -> list[dict[str, Any]]:
         clause = "AND pq.created_at > ?" if since else ""
         params: tuple[Any, ...] = (since,) if since else ()

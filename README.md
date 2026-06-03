@@ -212,6 +212,32 @@ daemon already writes (a channel name appears only as diagnostic detail in the
 alert text), so a live-but-not-delivering daemon (the 2026-05-29 silent-email
 failure mode) no longer reads as green.
 
+**Delivery SLA.** The failed-dispatch/incident surface above only fires when
+something *errored*. The 2026-05-29 incident had no error — the daily pipe just
+silently stopped delivering. So belfry also asserts each pipe delivers on its
+**cadence**: a pipe declares an expected max interval between successful
+deliveries (`max_interval: 27h` in `pipes/<name>.yaml`), the daemon persists it
+to the `pipe_sla` table at startup (belfry is pure-stdlib and can't parse the
+YAML itself), and on each tick belfry reads that table plus the last
+`status='sent'` dispatch per pipe and pings DOWN if the window lapsed. It is
+level-triggered (re-reports until a delivery resets the window) and alert-only
+(never a restart — a stalled pipe is a product/logic failure, not absence, and
+auto-restart would mask the cause). The overdue baseline for a never-delivered
+pipe is `tracking_since`, set once when the SLA is first registered, so a fresh
+deploy gets a full window of grace instead of alarming immediately. This is the
+on-box, all-pipes generalization of the off-box digest dead-man — complementary,
+not redundant: the dead-man covers only the daily pipe but survives the whole
+box dying, while the SLA check covers every pipe but rides the same box.
+
+The expected max interval is an **explicit per-pipe field**, not derived from
+the pipe's cron `cadence`. Computing a guaranteed max gap from an arbitrary
+cron expression is fragile (DST, irregular schedules, month boundaries); an
+explicit `max_interval` is unambiguous, lets each pipe set its own grace (the
+daily pipe uses 27h = 24h cadence + 3h, matching the dead-man's healthchecks
+grace), and a malformed value fails the config load loudly rather than silently
+disabling the check. Immediate pipes (`now`) declare no interval and opt out —
+they deliver on demand with no cadence to lapse against.
+
 Setup:
 
 1. Register two healthchecks.io URLs as described in `belfry/healthchecks.example`.
