@@ -199,43 +199,69 @@ class PipeDrain:
                     pipe.name, [finding_id]
                 )
                 continue
+            # B7 fans internal/* findings to N channels through ONE pipe_queues
+            # row. That conflated two concerns the old single-counter path could
+            # not separate: per-FINDING redelivery (should THIS finding retry
+            # later?) and per-CHANNEL health escalation (is THIS channel
+            # unhealthy?). They are now split -- per-channel escalation runs off
+            # immediate_channel_attempts inside the loop; per-finding redelivery
+            # is reconciled ONCE after the loop from these two flags, so the
+            # single pipe_queues row advances at most one step per drain
+            # regardless of how many channels failed (no +N inflation).
+            delivered = False  # did >=1 live channel get this finding out?
+            last_error: str | None = None  # last attempted-channel failure, if any
             for channel_name in self._dispatch_channels(pipe, row, channels):
                 if self.catalog.is_channel_unhealthy(channel_name):
+                    # An unhealthy channel is SKIPPED, not attempted -- so it is
+                    # not a delivery attempt and must not advance the finding's
+                    # redelivery ladder below (last_error stays None on a
+                    # skip-only drain). Pre-fan behaviour preserved: a skipped
+                    # sole channel leaves the finding pending for a later drain
+                    # or a daemon restart, never burns its retry budget.
                     continue
                 channel = channels[channel_name]
                 try:
                     await self._send_channel(channel, message, subject)
                 except Exception as exc:
-                    exhausted = self.catalog.record_pipe_send_failure(
+                    last_error = str(exc)
+                    # Per-CHANNEL health escalation, driven by the per-(pipe,
+                    # channel) counter -- NOT the finding's pipe_queues row. This
+                    # is what makes a co-fanned channel's failures ladder to
+                    # threshold even when another channel succeeded and marked
+                    # the finding delivered (defect b; see
+                    # record_immediate_send_failure).
+                    channel_exhausted = self.catalog.record_immediate_send_failure(
                         pipe.name,
                         channel.name,
                         finding_id,
-                        str(exc),
+                        last_error,
                     )
-                    if exhausted:
-                        # Retries exhausted: the channel is now marked
-                        # unhealthy and an internal/dispatch finding is
-                        # written. Log at ERROR -- this is a delivery the
-                        # system has given up on (B22).
+                    if channel_exhausted:
+                        # THIS channel's retries are exhausted: it is now marked
+                        # unhealthy and an internal/dispatch finding is written.
+                        # Log at ERROR -- a delivery the system has given up on
+                        # for this channel (B22). The finding itself may still be
+                        # delivered over another (live) fanned channel this drain.
                         LOGGER.error(
-                            "pipe %s: dispatch of finding %s over channel %s "
-                            "failed and exhausted retries; marking channel "
-                            "unhealthy: %s",
+                            "pipe %s: channel %s exhausted retries (finding %s "
+                            "was the latest failure); marking channel unhealthy: "
+                            "%s",
                             pipe.name,
-                            finding_id,
                             channel.name,
+                            finding_id,
                             exc,
                         )
                         self.catalog.write_internal_finding(
                             "internal/dispatch",
                             "channel_unhealthy",
                             channel.name,
-                            str(exc),
+                            last_error,
                             known_pipes,
                         )
                     else:
-                        # Will retry on a later drain. WARNING, not ERROR --
-                        # a single transient failure is expected to recover.
+                        # This channel will retry on a later drain. WARNING, not
+                        # ERROR -- a single transient failure is expected to
+                        # recover.
                         LOGGER.warning(
                             "pipe %s: dispatch of finding %s over channel %s "
                             "failed, will retry: %s",
@@ -245,12 +271,27 @@ class PipeDrain:
                             exc,
                         )
                 else:
+                    delivered = True
+                    # mark_queue=False: the finding's pipe_queues row is marked
+                    # dispatched ONCE after the loop (the reconciliation below),
+                    # based on whether ANY channel delivered -- not as a side
+                    # effect of whichever channel happened to succeed first. The
+                    # old default (mark_queue=True) is exactly what marked the
+                    # row terminal on first success and starved a co-fanned
+                    # channel's escalation (defect b).
                     self.catalog.record_dispatch(
                         pipe.name,
                         channel.name,
                         [finding_id],
                         "sent",
                         source=row["source"],
+                        mark_queue=False,
+                    )
+                    # Per-channel recovery edge: a successful send resets this
+                    # channel's escalation counter (only CONSECUTIVE failures
+                    # ladder to unhealthy).
+                    self.catalog.record_immediate_send_success(
+                        pipe.name, channel.name
                     )
                     # Recovery edge for internal/dispatch channel_unhealthy: a
                     # successful send proves the channel is back. The gate
@@ -265,6 +306,30 @@ class PipeDrain:
                         f"{channel.name} delivery recovered",
                         known_pipes,
                     )
+            # Per-finding redelivery reconciliation -- the step the digest path
+            # never needed (it carries one channel per cycle). The channel loop
+            # above owns per-CHANNEL health; this owns the orthogonal per-FINDING
+            # question: did this finding reach a live transport this drain, and
+            # if not, should it be retried later?
+            if delivered:
+                # >=1 live channel got the finding out -> delivered. Mark the
+                # single pipe_queues row terminal so it does not redeliver. This
+                # preserves the old "first success -> dispatched" outcome, but
+                # decided ONCE for the finding here rather than as a side effect
+                # of an arbitrary channel's record_dispatch.
+                self.catalog.mark_pipe_items_dispatched(pipe.name, [finding_id])
+            elif last_error is not None:
+                # No channel delivered it AND at least one channel was actually
+                # attempted (last_error set) -> the finding is undelivered;
+                # advance its per-finding redelivery ladder exactly once. The
+                # +N-per-drain inflation is gone: each failed channel advanced
+                # its OWN per-channel counter above, while the finding's ladder
+                # moves a single step here. If every channel was SKIPPED as
+                # unhealthy (last_error is None) the row is left pending and
+                # untouched, exactly as the pre-fan path did.
+                self.catalog.record_pipe_finding_undelivered(
+                    pipe.name, finding_id, last_error
+                )
 
     def _dispatch_channels(
         self,

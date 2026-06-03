@@ -212,6 +212,13 @@ class AngelusDaemon:
             # counter populated would let a single subsequent failure cross
             # the threshold immediately on the new generation.
             self.catalog.clear_digest_channel_attempts()
+            # And the same for the immediate path's per-channel attempt counter
+            # (B7 fell-r1 Finding 3): it feeds the identical channel_health
+            # ladder for _drain_immediate, so it must reset alongside
+            # channel_health for restart-scope parity -- otherwise a populated
+            # counter from the prior generation would cross threshold on the
+            # first post-restart failure.
+            self.catalog.clear_immediate_channel_attempts()
             self._reconcile_orphaned_internal_incidents()
             self._validate_channel_config()
             self._sync_pipe_sla()
@@ -529,6 +536,11 @@ class AngelusDaemon:
             "channels": {
                 "health": self.catalog.all_channel_health(),
                 "attempts": self.catalog.digest_channel_attempts(),
+                # Immediate-path per-channel ladder, surfaced alongside the
+                # digest ladder so a channel climbing toward unhealthy on the
+                # _drain_immediate path is visible before channel_health flips
+                # (B7 fell-r1 Finding 3). Read-only SELECT.
+                "immediate_attempts": self.catalog.immediate_channel_attempts(),
             },
             # Delivery surface (B5): is each pipe actually getting content out,
             # how many dispatches failed recently, and how many of angelus's own

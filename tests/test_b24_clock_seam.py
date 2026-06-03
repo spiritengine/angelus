@@ -98,7 +98,12 @@ def test_retry_timer_window_uses_injected_clock(tmp_path: Path) -> None:
             },
             {"daily"},
         )
-        exhausted = catalog.record_pipe_send_failure("daily", "push", finding_id, "boom")
+        # record_pipe_send_failure was split (B7 fell-r1 Finding 3): the
+        # per-finding redelivery ladder this test exercises is now
+        # record_pipe_finding_undelivered (per-channel health escalation moved
+        # to record_immediate_send_failure). The next_attempt_at backoff math is
+        # unchanged, so the assertion below still pins the injected-clock window.
+        exhausted = catalog.record_pipe_finding_undelivered("daily", finding_id, "boom")
         assert exhausted is False
 
         row = connection.execute(

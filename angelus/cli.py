@@ -637,7 +637,8 @@ def _render_channels(channels: dict[str, Any]) -> None:
     click.echo("channels:")
     channel_health = channels.get("health") or []
     attempts = channels.get("attempts") or []
-    if not channel_health and not attempts:
+    immediate_attempts = channels.get("immediate_attempts") or []
+    if not channel_health and not attempts and not immediate_attempts:
         click.echo("  none")
         return
     if channel_health:
@@ -649,6 +650,14 @@ def _render_channels(channels: dict[str, Any]) -> None:
     if attempts:
         click.echo("  digest attempts:")
         for row in attempts:
+            click.echo(
+                f"    {row['pipe']}/{row['channel']}: {row['attempts']} attempts"
+            )
+            if row.get("last_error"):
+                click.echo(f"      last error: {row['last_error']}")
+    if immediate_attempts:
+        click.echo("  immediate attempts:")
+        for row in immediate_attempts:
             click.echo(
                 f"    {row['pipe']}/{row['channel']}: {row['attempts']} attempts"
             )
@@ -701,6 +710,7 @@ def _render_health_fallback(root: Path) -> None:
             {
                 "health": catalog.all_channel_health(),
                 "attempts": catalog.digest_channel_attempts(),
+                "immediate_attempts": catalog.immediate_channel_attempts(),
             }
         )
     finally:
