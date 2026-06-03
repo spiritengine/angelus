@@ -18,7 +18,12 @@ from angelus.clock import Clock
 from angelus.control import ControlServer
 from angelus.envfile import load_env_file, resolve_op_refs
 from angelus.logging_config import configure_logging
-from angelus.lodging import Lodging, ScheduledSource, load_lodging
+from angelus.lodging import (
+    Lodging,
+    ScheduledSource,
+    load_lodging,
+    missing_channel_config,
+)
 from angelus.lodging.reloader import LodgingReloader
 from angelus.pipes import PipeDrain
 from angelus.sources import run_shell_source
@@ -182,6 +187,7 @@ class AngelusDaemon:
             # the threshold immediately on the new generation.
             self.catalog.clear_digest_channel_attempts()
             self._reconcile_orphaned_internal_incidents()
+            self._validate_channel_config()
             self._register_initial_jobs()
             self.scheduler.start()
             scheduler_started = True
@@ -302,6 +308,67 @@ class AngelusDaemon:
                 "startup recovery: reconciled orphaned internal incidents (%s)",
                 ", ".join(f"{s}={n}" for s, n in sorted(reconciled.items())),
             )
+
+    def _validate_channel_config(self) -> None:
+        """B18: a misconfigured daemon must not come up silently healthy.
+
+        Validates that every channel a pipe routes to has its required env
+        config present (domain-agnostic: derived from each channel's
+        `$env:NAME` markers via missing_channel_config, so nothing about
+        email or a specific var is hardcoded).
+
+        Degraded-mode-and-alarm, NOT refuse-to-start. The systemd unit is
+        Restart=on-failure/RestartSec=5 (deploy/angelus.service), so a
+        nonzero exit on missing config would crash-loop every 5s and never
+        reach a live transport -- the brief's named exception to
+        refuse-to-start. Instead the daemon comes up, logs ERROR, and opens a
+        high-severity internal/config incident routed to `now`, which is
+        push-only (B6) -- deliberately off the very email transport a missing
+        ANGELUS_EMAIL_TO would break (don't-share-fate).
+
+        Edge-triggered and self-reconciling: every referenced channel whose
+        config IS present fires write_internal_clearance, which is a no-op
+        unless an incident is open and otherwise closes it -- so a config
+        fixed while the daemon was down clears on the next startup and the B30
+        emission gate re-arms. The audit guard in test_b30_emission_gate.py
+        enforces that this clearance exists for the internal/config source.
+
+        Runs AFTER _reconcile_orphaned_internal_incidents and before the now
+        pipe loop spawns; the finding lands in the pipe queue and drains to
+        push once that loop starts.
+        """
+        known_pipes = set(self.lodging.pipes)
+        missing = missing_channel_config(self.lodging)
+        referenced = sorted(
+            {channel for pipe in self.lodging.pipes.values() for channel in pipe.channels}
+        )
+        for name in referenced:
+            if name not in self.lodging.channels:
+                # A pipe referencing an absent channel is a cross-ref error
+                # load_lodging already raised on; never reached at runtime.
+                continue
+            if name in missing:
+                detail = ", ".join(missing[name])
+                LOGGER.error(
+                    "channel %s missing required config (%s); starting in "
+                    "degraded mode -- dispatches over this channel will fail",
+                    name,
+                    detail,
+                )
+                self.catalog.write_internal_finding(
+                    "internal/config",
+                    "channel_config_missing",
+                    name,
+                    f"channel {name!r} missing required env: {detail}",
+                    known_pipes,
+                )
+            else:
+                self.catalog.write_internal_clearance(
+                    "internal/config",
+                    name,
+                    f"channel {name!r} required config present",
+                    known_pipes,
+                )
 
     def request_stop(self) -> None:
         self.stop_event.set()
