@@ -111,6 +111,19 @@ file only fills in names that are unset.
 
 ## Reliability
 
+### Health surface (is it *working*?)
+
+`angelus health` answers "is it working", not just "is it running". Alongside
+sources, queues, deps, and channel health it carries a **delivery** section:
+the last successful send per pipe (every configured pipe, `never` if it has
+never delivered), the count of failed dispatches in the recent window (24h),
+and the count of angelus's own open internal incidents. That last-successful-
+send-per-pipe is the read the 2026-05-29 incident needed and lacked — the
+daemon was alive and "healthy" while the daily pipe silently stopped
+delivering. Output is plain text, one item per line (no tables/columns). The
+same delivery surface renders on the daemon-down read-only fallback, since it
+is built from the dispatch/incident schema rather than live daemon state.
+
 ### Logging
 
 The daemon writes one canonical, tail-able log at `state/angelus.log` (a

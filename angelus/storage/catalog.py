@@ -608,6 +608,64 @@ class Catalog:
         )
         return {row["pipe"]: int(row["n"]) for row in rows}
 
+    def last_successful_dispatch_per_pipe(self) -> dict[str, str]:
+        """Most recent SUCCESSFUL (status='sent') dispatch timestamp per pipe.
+
+        The delivery half of the health surface (B5): answers "is each pipe
+        actually getting content out", not just "is the daemon running". A
+        'muted' or 'failed' dispatch is not a delivery, so only 'sent' counts.
+        Pipes with no successful send are simply absent from the map -- the
+        caller (which knows the configured pipe set) renders those as 'never'.
+        Read-only. Reused by B2's delivery-SLA check.
+        """
+        rows = self.connection.execute(
+            """
+            SELECT pipe, max(dispatched_at) AS last_at
+            FROM dispatches
+            WHERE status = 'sent' AND dispatched_at IS NOT NULL
+            GROUP BY pipe
+            """
+        )
+        return {row["pipe"]: row["last_at"] for row in rows}
+
+    def failed_dispatch_count(self, window_hours: int = 24) -> int:
+        """Count of failed dispatches in the last `window_hours` hours.
+
+        A recent-window failure count for the health surface -- a nonzero
+        value says "delivery is actively breaking now", distinct from a single
+        open incident. Read-only. The window is measured off the injected
+        clock so a test/sim observes it deterministically.
+        """
+        cutoff = _format_time(self._clock.now() - timedelta(hours=window_hours))
+        # Inclusive `>=`, matching recently_closed_incidents (the other
+        # windowed-from-now read); the rate-limit since-queries use exclusive
+        # `>` against a caller-supplied instant. The boundary is a sub-ms edge
+        # either way and not load-bearing.
+        row = self.connection.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM dispatches
+            WHERE status = 'failed' AND dispatched_at IS NOT NULL
+              AND dispatched_at >= ?
+            """,
+            (cutoff,),
+        ).fetchone()
+        return int(row["n"])
+
+    def open_internal_incident_count(self) -> int:
+        """Count of open incidents whose source is one of angelus's own
+        internal/* failure reports. The system's self-reported-failure tally
+        for the health surface; mirrors belfry's open-internal read. Read-only.
+        """
+        row = self.connection.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM incidents
+            WHERE status = 'open' AND source LIKE 'internal/%'
+            """
+        ).fetchone()
+        return int(row["n"])
+
     def recently_closed_incidents(self, days: int = 7) -> list[dict[str, Any]]:
         """Incidents closed within the last `days` days (default 7).
         Read-only; a plain SELECT, no write."""
