@@ -15,7 +15,13 @@ from pathlib import Path
 import pytest
 
 from angelus.channels.email import _resolve_to
-from angelus.envfile import env_file_path, load_env_file, parse_env_file
+import angelus.envfile as envfile
+from angelus.envfile import (
+    env_file_path,
+    load_env_file,
+    parse_env_file,
+    resolve_op_refs,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BELFRY_PATH = REPO_ROOT / "belfry" / "belfry.py"
@@ -134,3 +140,55 @@ def test_belfry_loader_matches_semantics(tmp_path, monkeypatch):
 def test_belfry_missing_file_is_a_noop(tmp_path):
     belfry = _load_belfry()
     assert belfry.load_env_file(tmp_path / "state") == {}
+
+
+# --- op:// secret-ref resolution (daemon-only; belfry never calls this) -------
+
+def test_resolve_op_refs_resolves_with_token(monkeypatch):
+    monkeypatch.setattr(envfile, "_op_read", lambda ref: "https://hc-ping.com/uuid")
+    env = {
+        "OP_SERVICE_ACCOUNT_TOKEN": "ops_tok",
+        "ANGELUS_DIGEST_HEARTBEAT_URL": "op://angelus/healthchecks-digest/credential",
+        "ANGELUS_EMAIL_TO": "x@example.com",
+    }
+    resolved = resolve_op_refs(env)
+    assert env["ANGELUS_DIGEST_HEARTBEAT_URL"] == "https://hc-ping.com/uuid"
+    assert env["ANGELUS_EMAIL_TO"] == "x@example.com"  # literal untouched
+    assert resolved == {
+        "ANGELUS_DIGEST_HEARTBEAT_URL": "op://angelus/healthchecks-digest/credential"
+    }
+
+
+def test_resolve_op_refs_no_token_unsets_ref(monkeypatch):
+    # Fail-safe: a ref with no service-account token is unset, never left as a
+    # literal "op://..." that a consumer would treat as a real value.
+    called = []
+    monkeypatch.setattr(envfile, "_op_read", lambda ref: called.append(ref) or "x")
+    env = {"ANGELUS_DIGEST_HEARTBEAT_URL": "op://angelus/healthchecks-digest/credential"}
+    resolved = resolve_op_refs(env)
+    assert "ANGELUS_DIGEST_HEARTBEAT_URL" not in env
+    assert resolved == {}
+    assert called == []  # never shells out without a token
+
+
+def test_resolve_op_refs_read_failure_unsets(monkeypatch):
+    def boom(ref):
+        raise RuntimeError("op read failed")
+
+    monkeypatch.setattr(envfile, "_op_read", boom)
+    env = {
+        "OP_SERVICE_ACCOUNT_TOKEN": "ops_tok",
+        "ANGELUS_DIGEST_HEARTBEAT_URL": "op://angelus/healthchecks-digest/credential",
+    }
+    resolved = resolve_op_refs(env)
+    assert "ANGELUS_DIGEST_HEARTBEAT_URL" not in env  # fail-safe unset
+    assert resolved == {}
+
+
+def test_resolve_op_refs_noop_without_refs(monkeypatch):
+    monkeypatch.setattr(
+        envfile, "_op_read", lambda ref: (_ for _ in ()).throw(AssertionError("called"))
+    )
+    env = {"ANGELUS_EMAIL_TO": "x@example.com"}
+    assert resolve_op_refs(env) == {}
+    assert env == {"ANGELUS_EMAIL_TO": "x@example.com"}
