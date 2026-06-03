@@ -193,6 +193,7 @@ class AngelusDaemon:
             self.catalog.clear_digest_channel_attempts()
             self._reconcile_orphaned_internal_incidents()
             self._validate_channel_config()
+            self._sync_pipe_sla()
             self._register_initial_jobs()
             self.scheduler.start()
             scheduler_started = True
@@ -383,6 +384,31 @@ class AngelusDaemon:
                     f"channel {name!r} required config present",
                     known_pipes,
                 )
+
+    def _sync_pipe_sla(self) -> None:
+        """B2: persist each pipe's declared delivery SLA to sqlite so belfry --
+        the out-of-band, pure-stdlib layer -- can read the contract and assert
+        the pipe is actually delivering on cadence.
+
+        Only pipes that declare `max_interval` are tracked; the immediate `now`
+        pipe (no cadence to lapse against) opts out by leaving it unset.
+        Reconciles the whole set so a removed/reclassified pipe's stale row is
+        dropped. The belfry SLA check is the on-box, all-pipes generalization
+        of the off-box digest dead-man.
+        """
+        slas = {
+            name: pipe.max_interval_seconds
+            for name, pipe in self.lodging.pipes.items()
+            if pipe.max_interval_seconds is not None
+        }
+        self.catalog.sync_pipe_sla(slas)
+        if slas:
+            LOGGER.info(
+                "pipe delivery SLAs tracked: %s",
+                ", ".join(
+                    f"{name}={seconds}s" for name, seconds in sorted(slas.items())
+                ),
+            )
 
     def request_stop(self) -> None:
         self.stop_event.set()
@@ -671,6 +697,13 @@ class AngelusDaemon:
         for name in set(old.dependencies) - set(new_lodging.dependencies):
             self.catalog.delete_dep_health(name)
             LOGGER.info("pruned dep_health for removed dependency %s", name)
+
+        # Re-sync the delivery-SLA table to the new pipe set (B2). Same
+        # rationale as the dep_health prune above: a hot-changed max_interval
+        # must take effect and a hot-removed pipe's stale SLA row must not keep
+        # belfry red. Synchronous, self-committing, no await before its commit
+        # -- cancel-safe like the rest of the reload.
+        self._sync_pipe_sla()
 
         old_sources = old.sources
         new_sources = new_lodging.sources

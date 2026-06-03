@@ -64,6 +64,11 @@ class Pipe:
     channels: list[str]
     render: dict[str, Any] = field(default_factory=dict)
     rate_limit: dict[str, str] = field(default_factory=dict)
+    # B2 delivery SLA: the expected max interval (seconds) between successful
+    # deliveries. None means the pipe opts out of the SLA check (e.g. the
+    # immediate `now` pipe, which delivers on demand and has no cadence to lapse
+    # against). Declared in YAML as `max_interval: 27h`.
+    max_interval_seconds: int | None = None
 
 
 @dataclass(frozen=True)
@@ -317,7 +322,46 @@ def parse_pipe(path: Path) -> Pipe:
         channels=list(data.get("channels") or []),
         render=render,
         rate_limit=dict(data.get("rate_limit") or {}),
+        max_interval_seconds=_optional_sla_interval(data, path),
     )
+
+
+# Units for the delivery-SLA `max_interval` field. Deliberately its own
+# grammar (with a 'd' for days) like the mute-duration parser: an SLA deadline
+# is a distinct domain from scheduling cadence (no 'd') and mute silencing.
+_SLA_INTERVAL_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def _optional_sla_interval(data: dict[str, Any], path: Path) -> int | None:
+    """Parse the optional pipe `max_interval` (e.g. '27h') to seconds.
+
+    Absent -> None (the pipe opts out of the B2 delivery-SLA check). A present
+    value must be a positive integer magnitude with an s/m/h/d unit suffix; a
+    bare number or bad unit is a load-time ValueError, so a typo fails loud
+    rather than silently disabling the SLA.
+    """
+    raw = data.get("max_interval")
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError(f"{path}: max_interval must be a non-empty string like '27h'")
+    text = raw.strip().lower()
+    suffix = text[-1]
+    if suffix not in _SLA_INTERVAL_UNITS:
+        raise ValueError(
+            f"{path}: invalid max_interval {raw!r}: expected unit suffix "
+            f"(s, m, h, d)"
+        )
+    magnitude_text = text[:-1].strip()
+    try:
+        magnitude = int(magnitude_text)
+    except ValueError:
+        raise ValueError(
+            f"{path}: invalid max_interval {raw!r}: magnitude must be an integer"
+        ) from None
+    if magnitude <= 0:
+        raise ValueError(f"{path}: invalid max_interval {raw!r}: must be positive")
+    return magnitude * _SLA_INTERVAL_UNITS[suffix]
 
 
 def parse_channel(path: Path) -> Channel:
