@@ -7,7 +7,7 @@ import os
 import shlex
 from pathlib import Path
 
-from angelus.lodging import Channel
+from angelus.lodging import ENV_REF_PREFIX, Channel
 from angelus.sources.runner import _kill_and_reap
 
 DEFAULT_TIMEOUT_SECONDS = 30.0
@@ -60,8 +60,8 @@ async def send_email(
 def _resolve_to(value: str | None) -> str:
     if not value:
         raise RuntimeError("email channel missing to address")
-    if value.startswith("$env:"):
-        env_name = value.removeprefix("$env:")
+    if value.startswith(ENV_REF_PREFIX):
+        env_name = value.removeprefix(ENV_REF_PREFIX)
         resolved = os.environ.get(env_name)
         if not resolved:
             raise RuntimeError(f"email channel env var is unset: {env_name}")

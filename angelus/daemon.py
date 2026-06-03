@@ -355,6 +355,15 @@ class AngelusDaemon:
                     name,
                     detail,
                 )
+                # The incident body is the open-EDGE snapshot: under the B30
+                # gate write_internal_finding only persists a row when it opens
+                # a NEW incident, so a later partial fix (a channel needing two
+                # $env vars, one now set) does not rewrite the body -- it would
+                # still list both. That is intentional: the incident stays open
+                # (correct -- the channel is still degraded) and the live ERROR
+                # line above always carries the currently-missing set, so the
+                # operator never reads a stale specifics list as live. Only the
+                # full fix closes the incident, via the clearance branch below.
                 self.catalog.write_internal_finding(
                     "internal/config",
                     "channel_config_missing",

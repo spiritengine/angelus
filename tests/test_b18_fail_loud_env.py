@@ -41,6 +41,29 @@ def test_channel_env_requirements_empty_for_literal_config() -> None:
     assert channel_env_requirements(push) == []
 
 
+def test_validate_and_send_share_one_env_marker(monkeypatch) -> None:
+    """The validate-time requirement and the send-time resolution must key off
+    the SAME `$env:` marker, or the guard could pass while the send fails (or
+    vice-versa) -- the silent-healthy hole B18 closes. Pin both to ENV_REF_PREFIX.
+    """
+    from angelus.channels.email import _resolve_to
+    from angelus.lodging import ENV_REF_PREFIX
+
+    channel = Channel(
+        name="email", kind="email", command="/bin/true", to=f"{ENV_REF_PREFIX}FOO_ADDR"
+    )
+    # Same marker drives the requirement...
+    assert channel_env_requirements(channel) == ["FOO_ADDR"]
+    # ...and the send-time resolve: unset -> raises, set -> returns the value.
+    monkeypatch.delenv("FOO_ADDR", raising=False)
+    import pytest
+
+    with pytest.raises(RuntimeError):
+        _resolve_to(channel.to)
+    monkeypatch.setenv("FOO_ADDR", "ops@example.com")
+    assert _resolve_to(channel.to) == "ops@example.com"
+
+
 def _lodging(*, email_in_pipe: bool) -> Lodging:
     channels = {
         "push": Channel(name="push", kind="push", command="notify-pat"),
