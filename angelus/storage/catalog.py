@@ -637,6 +637,10 @@ class Catalog:
         clock so a test/sim observes it deterministically.
         """
         cutoff = _format_time(self._clock.now() - timedelta(hours=window_hours))
+        # Inclusive `>=`, matching recently_closed_incidents (the other
+        # windowed-from-now read); the rate-limit since-queries use exclusive
+        # `>` against a caller-supplied instant. The boundary is a sub-ms edge
+        # either way and not load-bearing.
         row = self.connection.execute(
             """
             SELECT COUNT(*) AS n

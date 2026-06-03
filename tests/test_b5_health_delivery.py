@@ -166,3 +166,15 @@ def test_render_delivery_is_plain_and_one_per_line(capsys) -> None:
     # Screen-reader friendly: no tables/columns (no pipe glyphs, no tabs).
     assert "|" not in out
     assert "\t" not in out
+
+
+def test_render_delivery_partial_dict_does_not_emit_none_window(capsys) -> None:
+    """A truthy-but-partial delivery dict (e.g. an old/hand-built shape missing
+    failed_dispatches) must not render '(last Noneh)'. The window falls back to
+    the default rather than printing None."""
+    from angelus.cli import _render_delivery
+
+    _render_delivery({"last_successful_send": {"now": None}})
+    out = capsys.readouterr().out
+    assert "Noneh" not in out
+    assert "(last 24h)" in out

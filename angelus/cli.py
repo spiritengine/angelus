@@ -34,6 +34,7 @@ from typing import Any
 import click
 
 from angelus.clock import SYSTEM_CLOCK
+from angelus.daemon import HEALTH_FAILED_DISPATCH_WINDOW_HOURS
 from angelus.daemon import main as daemon_main
 from angelus.lodging.config import _load_dependencies
 from angelus.sources import run_dep_check
@@ -573,7 +574,10 @@ def _render_delivery(delivery: dict[str, Any]) -> None:
     for pipe in sorted(last_sent):
         click.echo(f"    {pipe}: {last_sent[pipe] or 'never'}")
     failed = delivery.get("failed_dispatches") or {}
-    window = failed.get("window_hours")
+    # Default the window so a partial dict never renders "(last Noneh)". The
+    # daemon's _delivery_surface always populates window_hours; this only
+    # guards a hand-built/old-shape dict.
+    window = failed.get("window_hours", HEALTH_FAILED_DISPATCH_WINDOW_HOURS)
     count = failed.get("count", 0)
     click.echo(f"  failed dispatches (last {window}h): {count}")
     click.echo(
