@@ -2,13 +2,16 @@
 
 from .config import (
     DISABLED_SUFFIX,
+    ENV_REF_PREFIX,
     Channel,
     Dependency,
     Lodging,
     Pipe,
     ScheduledSource,
     Triager,
+    channel_env_requirements,
     load_lodging,
+    missing_channel_config,
     parse_channel,
     parse_dependency,
     parse_pipe,
@@ -19,13 +22,16 @@ from .config import (
 
 __all__ = [
     "DISABLED_SUFFIX",
+    "ENV_REF_PREFIX",
     "Channel",
     "Dependency",
     "Lodging",
     "Pipe",
     "ScheduledSource",
     "Triager",
+    "channel_env_requirements",
     "load_lodging",
+    "missing_channel_config",
     "parse_channel",
     "parse_dependency",
     "parse_pipe",

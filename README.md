@@ -122,6 +122,32 @@ real failures. Belfry keeps its own separate `state/belfry.log`. Full
 details — rotation policy, severity levels, how to tail — in
 [docs/logging.md](docs/logging.md).
 
+### Config integrity (fail-loud on bad env)
+
+A misconfigured daemon must not come up silently healthy — the 2026-05-29
+incident was a daemon that lost `ANGELUS_EMAIL_TO` and stayed green. At startup
+the daemon validates that every channel a pipe routes to has its required env
+config present. The requirement is derived domain-agnostically from each
+channel's `$env:NAME` config markers (the same markers the channel wrappers
+resolve at send time), so the check names no specific channel or variable:
+email's `to: $env:ANGELUS_EMAIL_TO` yields the `ANGELUS_EMAIL_TO` requirement
+for free, and a future channel that adds a `$env:` field is covered without
+code changes. Only channels a pipe actually references are checked — an
+unreferenced channel file can't dispatch.
+
+On a missing variable the daemon starts in **degraded mode and alarms**, rather
+than refusing to start. The systemd unit is `Restart=on-failure` /
+`RestartSec=5`, so a nonzero exit on missing config would crash-loop every five
+seconds and never reach a live transport — refuse-to-start fights the restart
+loop. Instead the daemon comes up, logs an ERROR naming the channel and the
+missing variable, and opens a high-severity `internal/config` incident routed
+to `now` (push-only — deliberately off the very email transport a missing
+`ANGELUS_EMAIL_TO` would break). The alarm therefore surfaces through push, the
+health surface, and belfry's open-internal-incident check. The incident is
+edge-triggered: every referenced channel whose config is present fires a paired
+clearance, so a config fixed while the daemon was down closes the incident on
+the next startup and the emission gate re-arms.
+
 ### Transport separation
 
 Urgent and routine alerts ride different transports, so a dead transport can't

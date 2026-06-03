@@ -7,7 +7,10 @@ the rest of the live state without re-walking every directory.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
+import os
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -15,6 +18,12 @@ from typing import Any
 import yaml
 
 LOGGER = logging.getLogger(__name__)
+
+# Marker a channel config field uses to defer a value to an environment
+# variable, resolved by the channel wrapper at send time (see
+# channels/email.py `_resolve_to`). B18 reuses it to derive a channel's
+# required config without hardcoding any channel kind or env name.
+ENV_REF_PREFIX = "$env:"
 
 SUPPORTED_DIGEST_INPUTS = (
     "findings_since_last_drain",
@@ -192,6 +201,54 @@ def validate_cross_refs(lodging: Lodging) -> list[str]:
     return errors
 
 
+def channel_env_requirements(channel: Channel) -> list[str]:
+    """Env var names a channel's config defers to via the `$env:NAME` marker.
+
+    Domain-agnostic by construction: every string-valued config field is
+    scanned for the marker the channel wrappers resolve at send time, so
+    nothing is hardcoded. email's `to: $env:ANGELUS_EMAIL_TO` yields
+    ANGELUS_EMAIL_TO; a future channel that adds a `$env:` field (or kind) is
+    covered without touching this code. Order-preserving and de-duplicated.
+    """
+    names: list[str] = []
+    for field_ in dataclasses.fields(channel):
+        value = getattr(channel, field_.name)
+        if isinstance(value, str) and value.startswith(ENV_REF_PREFIX):
+            name = value[len(ENV_REF_PREFIX) :]
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
+def missing_channel_config(
+    lodging: Lodging, env: Mapping[str, str] | None = None
+) -> dict[str, list[str]]:
+    """Map each pipe-referenced channel to the env vars it requires but that
+    are unset/empty in `env` (default: the process environment). An empty
+    return means every referenced channel has its required config (B18).
+
+    Only channels a pipe actually routes to are checked: an unreferenced
+    channel file cannot dispatch, so its missing config is not a startup
+    failure. A pipe referencing a channel that does not exist is left to
+    `validate_cross_refs`, which already reports it.
+    """
+    environ: Mapping[str, str] = os.environ if env is None else env
+    referenced: set[str] = set()
+    for pipe in lodging.pipes.values():
+        referenced.update(pipe.channels)
+    missing: dict[str, list[str]] = {}
+    for name in referenced:
+        channel = lodging.channels.get(name)
+        if channel is None:
+            continue
+        absent = [
+            var for var in channel_env_requirements(channel) if not environ.get(var)
+        ]
+        if absent:
+            missing[name] = absent
+    return missing
+
+
 def parse_source(path: Path) -> ScheduledSource:
     data = _read_yaml(path)
     name = path.stem
@@ -273,12 +330,37 @@ def parse_channel(path: Path) -> Channel:
         to = _required_str(data, "to", path)
     else:
         to = None
-    return Channel(
+    channel = Channel(
         name=name,
         kind=str(kind),
         command=_required_str(data, "command", path),
         to=to,
     )
+    _assert_well_formed_env_markers(channel, path)
+    return channel
+
+
+def _assert_well_formed_env_markers(channel: Channel, path: Path) -> None:
+    """Reject a `$env:` marker with no variable name (e.g. `to: $env:`).
+
+    A nameless marker is a config typo, not a runtime-absent value: it cannot
+    name a var to check, so missing_channel_config would skip it and pass
+    startup green while the channel wrapper raises at send time -- the same
+    validate/send divergence B18 exists to close. Caught here at load, it joins
+    every other structural channel-config error (a ValueError that fails the
+    load) instead of becoming a silent-healthy daemon with a dead transport.
+    """
+    for field_ in dataclasses.fields(channel):
+        value = getattr(channel, field_.name)
+        if (
+            isinstance(value, str)
+            and value.startswith(ENV_REF_PREFIX)
+            and not value[len(ENV_REF_PREFIX) :]
+        ):
+            raise ValueError(
+                f"{path}: malformed env reference {value!r} in {field_.name} -- "
+                f"missing variable name after {ENV_REF_PREFIX!r}"
+            )
 
 
 def parse_dependency(path: Path) -> Dependency:
