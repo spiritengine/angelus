@@ -11,6 +11,13 @@ WorkingDirectory=/opt/angelus
 # (the 2026-05-29 drift) gets the same config. Precedence: an explicit
 # Environment= line below, or anything inherited, wins over this file.
 EnvironmentFile=-/opt/angelus/state/angelus.env
+# Optional: inject the read-only angelus-daemon 1Password service-account token
+# so the daemon can resolve op:// secret refs in the env file above (e.g. the
+# digest heartbeat URL). The leading '-' tolerates a missing file (refs then
+# resolve to unset and the consumer degrades; startup never fails). Keep the
+# token file at mode 0600. The live --user deployment supplies this via a
+# drop-in (~/.config/systemd/user/angelus.service.d/service-account.conf).
+EnvironmentFile=-/opt/angelus/state/op-service-account.env
 ExecStart=/usr/bin/env angelus daemon
 Restart=on-failure
 RestartSec=5

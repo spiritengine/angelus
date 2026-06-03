@@ -83,6 +83,20 @@ and the belfry thresholds:
 The SMTP password is a real secret and does **not** belong here (that move is
 tracked separately as B20).
 
+**Secret references.** A value in this file may be a 1Password secret reference
+(`op://vault/item/field`) instead of a literal. The **daemon** resolves refs at
+startup (`angelus.envfile.resolve_op_refs`) via `op read`, authenticated by the
+read-only `angelus-daemon` service-account token the systemd unit injects (a
+drop-in `EnvironmentFile` pointing at a mode-`0600` token file). This keeps the
+real value out of the plaintext file while staying non-interactive — no
+biometric, no session to lapse. Resolution is **fail-safe**: a ref that can't be
+resolved (no token, `op` error) is left unset and the consumer degrades (e.g.
+the digest dead-man goes inert), so startup never blocks on it. Belfry is
+deliberately **excluded** — it is the pure-stdlib belt layer and must carry no
+1Password dependency, so its `ANGELUS_BELFRY_*` URLs must remain literals. The
+digest heartbeat URL is the first ref to use this; the SMTP password (B20) is
+the natural next.
+
 The file is loaded the same way no matter how a process starts:
 
 - **systemd** — `deploy/angelus.service` carries `EnvironmentFile=-…/state/angelus.env`.

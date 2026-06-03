@@ -16,7 +16,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from angelus.clock import Clock
 from angelus.control import ControlServer
-from angelus.envfile import load_env_file
+from angelus.envfile import load_env_file, resolve_op_refs
 from angelus.logging_config import configure_logging
 from angelus.lodging import Lodging, ScheduledSource, load_lodging
 from angelus.lodging.reloader import LodgingReloader
@@ -991,5 +991,17 @@ def main(root: Path | None = None) -> None:
             "loaded %d var(s) from state/angelus.env: %s",
             len(applied),
             ", ".join(sorted(applied)),
+        )
+    # Resolve any op:// secret references (e.g. the digest heartbeat URL) via the
+    # read-only angelus-daemon service-account token the systemd unit injects.
+    # Daemon-only: belfry has its own stdlib loader and never resolves refs, so
+    # the belt layer keeps no 1Password dependency. Fail-safe -- an unresolved
+    # ref is left unset (the consumer degrades) rather than crashing startup.
+    resolved = resolve_op_refs()
+    if resolved:
+        LOGGER.info(
+            "resolved %d secret ref(s) via service account: %s",
+            len(resolved),
+            ", ".join(sorted(resolved)),
         )
     asyncio.run(AngelusDaemon(root).run())
