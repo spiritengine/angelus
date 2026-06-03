@@ -553,9 +553,32 @@ def _render_health(result: dict[str, Any]) -> None:
         click.echo("  none")
     for pipe in sorted(pending):
         click.echo(f"  {pipe}: {pending[pipe]}")
+    _render_delivery(result.get("delivery") or {})
     _render_belfry(result["belfry"])
     _render_deps(result.get("deps") or [])
     _render_channels(result.get("channels") or {})
+
+
+def _render_delivery(delivery: dict[str, Any]) -> None:
+    """Delivery surface (B5): plain text, one item per line, screen-reader
+    friendly (no tables/columns). Answers "is it WORKING", not just running."""
+    click.echo("delivery:")
+    if not delivery:
+        click.echo("  unavailable")
+        return
+    last_sent = delivery.get("last_successful_send") or {}
+    click.echo("  last successful send:")
+    if not last_sent:
+        click.echo("    none")
+    for pipe in sorted(last_sent):
+        click.echo(f"    {pipe}: {last_sent[pipe] or 'never'}")
+    failed = delivery.get("failed_dispatches") or {}
+    window = failed.get("window_hours")
+    count = failed.get("count", 0)
+    click.echo(f"  failed dispatches (last {window}h): {count}")
+    click.echo(
+        f"  open internal incidents: {delivery.get('open_internal_incidents', 0)}"
+    )
 
 
 def _render_belfry(belfry: dict[str, Any] | None) -> None:
@@ -630,7 +653,8 @@ def _render_channels(channels: dict[str, Any]) -> None:
 
 
 def _render_health_fallback(root: Path) -> None:
-    from angelus.daemon import _belfry_status
+    from angelus.daemon import _belfry_status, _delivery_surface
+    from angelus.lodging.config import _enabled_yaml_files
 
     status, pid = _pid_status(root / "state" / "angelus.pid")
     click.echo(f"daemon: {status}")
@@ -657,6 +681,15 @@ def _render_health_fallback(root: Path) -> None:
             click.echo("  none")
         for pipe in sorted(pending):
             click.echo(f"  {pipe}: {pending[pipe]}")
+        # Delivery surface, read-only, daemon-down path. Pipe names come from
+        # the pipes/ dir (a plain file listing -- no cross-ref validation that
+        # could raise on a half-broken config) unioned with any pipe that has
+        # actually dispatched, so a never-delivered pipe still shows 'never'.
+        pipe_names = sorted(
+            {path.stem for path in _enabled_yaml_files(root / "pipes")}
+            | set(catalog.last_successful_dispatch_per_pipe())
+        )
+        _render_delivery(_delivery_surface(catalog, pipe_names))
         # dep_health is a plain table read; surface it in the daemon-down
         # path too (read-only), so dep status is visible without the daemon.
         _render_deps(_deps_with_active_mutes(catalog))

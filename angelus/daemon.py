@@ -35,6 +35,11 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_BELFRY_SENTINEL_FILENAME = "belfry-pinged-at"
 DEFAULT_BELFRY_STALE_AFTER_SEC = 1200
 
+# Recent-window for the health surface's failed-dispatch count (B5). A nonzero
+# count over this window says "delivery is actively breaking now", distinct
+# from the open-internal-incident tally (which can persist across the window).
+HEALTH_FAILED_DISPATCH_WINDOW_HOURS = 24
+
 # Internal incident sources reconciled at daemon startup. Each recovers only
 # off a live edge a restart can skip, so an incident open across a restart
 # orphans and the B30 gate then suppresses the next genuine failure. See
@@ -453,6 +458,13 @@ class AngelusDaemon:
                 "health": self.catalog.all_channel_health(),
                 "attempts": self.catalog.digest_channel_attempts(),
             },
+            # Delivery surface (B5): is each pipe actually getting content out,
+            # how many dispatches failed recently, and how many of angelus's own
+            # failures are open. The "is it WORKING" answer the 2026-05-29
+            # incident proved liveness alone does not give.
+            "delivery": _delivery_surface(
+                self.catalog, list(self.lodging.pipes)
+            ),
         }
 
     async def _op_incident_list(self, _args: dict) -> dict:
@@ -969,6 +981,34 @@ def _belfry_status(root: Path, clock: Clock | None = None) -> dict:
     return {
         "last_pinged_at": pinged_at.isoformat().replace("+00:00", "Z"),
         "stale": stale,
+    }
+
+
+def _delivery_surface(catalog: Catalog, pipe_names: list[str]) -> dict:
+    """Delivery half of the health surface (B5): "is it WORKING", not just
+    "is it running". Built from the dispatch/incident schema the daemon
+    already writes, so it works on both the live control-socket path and the
+    daemon-down read-only CLI fallback.
+
+    - last_successful_send: every configured pipe -> its most recent 'sent'
+      dispatch timestamp, or None ('never'). Keyed on the passed pipe set so a
+      pipe that has never delivered is still listed (the silent gap the
+      2026-05-29 incident hid).
+    - failed_dispatches: count of failed dispatches in the recent window.
+    - open_internal_incidents: angelus's own open self-reported failures.
+    """
+    last_sent = catalog.last_successful_dispatch_per_pipe()
+    return {
+        "last_successful_send": {
+            name: last_sent.get(name) for name in sorted(pipe_names)
+        },
+        "failed_dispatches": {
+            "window_hours": HEALTH_FAILED_DISPATCH_WINDOW_HOURS,
+            "count": catalog.failed_dispatch_count(
+                HEALTH_FAILED_DISPATCH_WINDOW_HOURS
+            ),
+        },
+        "open_internal_incidents": catalog.open_internal_incident_count(),
     }
 
 
