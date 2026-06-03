@@ -180,7 +180,7 @@ class PipeDrain:
                     pipe.name, [finding_id]
                 )
                 continue
-            for channel_name in pipe.channels:
+            for channel_name in self._dispatch_channels(pipe, row, channels):
                 if self.catalog.is_channel_unhealthy(channel_name):
                     continue
                 channel = channels[channel_name]
@@ -246,6 +246,49 @@ class PipeDrain:
                         f"{channel.name} delivery recovered",
                         known_pipes,
                     )
+
+    def _dispatch_channels(
+        self,
+        pipe: Pipe,
+        row,
+        channels: dict[str, Channel],
+    ) -> list[str]:
+        """Channel names a finding dispatches over on the immediate path.
+
+        A normal finding dispatches to exactly the pipe's own configured
+        channels (unchanged behaviour). An *internal* finding -- angelus's
+        OWN self-reported failure, identified domain-agnostically by the
+        ``internal/`` source prefix -- fans instead to the UNION of every
+        configured channel (B7).
+
+        The system's distress signal must not ride a single shared-fate
+        transport. internal/* findings route with ``target_pipes=["now"]``,
+        and `now` carries one channel (push); so a dead push would silently
+        swallow the alert that something is wrong -- the exact 2026-05-29
+        failure class this project exists to prevent. Fanning to all channels
+        and dispatching them independently (the caller attempts each in its
+        own try/except, so a failure on one does not skip the rest) means a
+        channel being down can't swallow the signal as long as one OTHER
+        transport is live.
+
+        Detection is the source prefix, never a channel name, so the rule
+        stays domain-agnostic: a channel added under channels/ is fanned to
+        for free, and no email/push special-case lives here. The union is
+        ordered pipe-channels-first so the urgent transport (push, on `now`)
+        is attempted before the long-form ones, and de-duplicated via
+        dict.fromkeys so an overlap between the pipe's channels and the wider
+        fan set sends once, not twice.
+
+        Clearances never reach this method: write_internal_clearance routes
+        them with ``target_pipes=[]`` (they page nothing), so they never
+        enqueue on a pipe and never drain. The emission gate, dedup, rate
+        limiting and the mute check all run upstream in _drain_immediate
+        before the channel loop, so fanning changes only which transports a
+        finding that is *already cleared to dispatch* reaches.
+        """
+        if not str(row["source"]).startswith("internal/"):
+            return list(pipe.channels)
+        return list(dict.fromkeys([*pipe.channels, *channels]))
 
     def _render(self, pipe: Pipe, row) -> str:
         body = self.catalog.read_body(row["body_ref"])
