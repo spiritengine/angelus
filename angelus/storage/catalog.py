@@ -511,12 +511,13 @@ class Catalog:
         writer) persists the contract here. Called at daemon startup from the
         loaded lodging.
 
-        tracking_since is written ONCE per pipe via INSERT OR IGNORE and never
-        moved on a later sync, so it stays the baseline for a never-delivered
-        pipe across daemon restarts (a stall spanning restarts is still
-        caught). max_interval_seconds is updated so a changed `max_interval`
-        takes effect. Pipes no longer declaring an SLA are removed so a stale
-        row can't keep belfry red after a pipe is reclassified or deleted.
+        tracking_since is written ONCE per pipe and preserved by the upsert
+        (ON CONFLICT updates only max_interval_seconds), so it is never moved on
+        a later sync and stays the baseline for a never-delivered pipe across
+        daemon restarts (a stall spanning restarts is still caught).
+        max_interval_seconds is updated so a changed `max_interval` takes
+        effect. Pipes no longer declaring an SLA are removed so a stale row
+        can't keep belfry red after a pipe is reclassified or deleted.
         """
         now = self._clock.now_iso()
         for pipe_name, seconds in slas.items():

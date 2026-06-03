@@ -680,9 +680,13 @@ def sla_failure(db_path: Path, now: datetime | None = None) -> str | None:
     imports), and here belfry reads it read-only alongside the last SUCCESSFUL
     (status='sent') dispatch per pipe and pings DOWN if the window lapsed.
 
-    Baseline for "overdue" is max(last successful dispatch, tracking_since), so
-    a pipe that has never delivered gets a full window of grace from when it
-    was first registered rather than alerting immediately on deploy.
+    Baseline for "overdue" is the last successful dispatch if the pipe has ever
+    delivered, else tracking_since. So a pipe that has never delivered gets a
+    full window of grace from when it was first registered rather than alerting
+    immediately on deploy, while a pipe that has delivered is always measured
+    from its real last delivery (even one older than tracking_since -- the
+    stricter choice, catching a stall a window sooner after the SLA is first
+    enabled on an already-running pipe).
 
     LEVEL-triggered: re-reports every tick until a delivery resets the window
     (no watermark), mirroring the open-internal-incident signal. Fails open:

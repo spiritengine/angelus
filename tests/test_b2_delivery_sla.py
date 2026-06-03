@@ -178,6 +178,35 @@ def test_sla_ok_within_window(tmp_path) -> None:
     assert belfry.sla_failure(db, now=PINNED) is None
 
 
+def test_sla_uses_real_last_delivery_even_when_older_than_tracking_since(
+    tmp_path,
+) -> None:
+    """When a pipe HAS delivered, the baseline is its real last delivery -- not
+    tracking_since -- even if that delivery predates tracking_since (the SLA was
+    enabled on an already-running pipe). This is the stricter choice and the
+    code's actual behavior (`delivered or tracking_since`, first-non-null); pin
+    it so a future maintainer can't 'simplify' it to max() and grant an extra
+    grace window after every deploy.
+    """
+    belfry = _load_belfry()
+    clock = FakeClock(PINNED)
+    catalog = _catalog(tmp_path, clock)
+    # A delivery 40h before now...
+    clock.set(PINNED - timedelta(hours=40))
+    catalog.record_dispatch("daily", "push", [1], "sent", mark_queue=False)
+    # ...then the SLA registered only 2h before now (tracking_since is recent).
+    clock.set(PINNED - timedelta(hours=2))
+    catalog.sync_pipe_sla({"daily": 27 * 3600})
+    catalog.connection.close()
+    db = tmp_path / "angelus.sqlite3"
+
+    # Measured from the 40h-old delivery (> 27h) -> overdue, despite the recent
+    # tracking_since that max() would have used to grant grace.
+    reason = belfry.sla_failure(db, now=PINNED)
+    assert reason is not None
+    assert "last delivery 40" in reason
+
+
 def test_sla_never_delivered_uses_tracking_since(tmp_path) -> None:
     belfry = _load_belfry()
     clock = FakeClock(PINNED - timedelta(hours=30))

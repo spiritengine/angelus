@@ -7,11 +7,12 @@
 -- pipe).
 --
 -- tracking_since is the baseline for a pipe that has NEVER delivered: belfry
--- measures overdue against max(last successful dispatch, tracking_since), so a
--- freshly-deployed pipe gets a full max_interval of grace before it can be
--- flagged, instead of pinging DOWN the instant it is registered. It is set
--- once (INSERT OR IGNORE) and deliberately NOT moved on daemon restart, so a
--- stall that spans restarts is still caught.
+-- measures overdue against the last successful dispatch, or tracking_since when
+-- the pipe has never delivered, so a freshly-deployed pipe gets a full
+-- max_interval of grace before it can be flagged, instead of pinging DOWN the
+-- instant it is registered. It is set once (the daemon's upsert preserves it,
+-- updating only max_interval_seconds) and deliberately NOT moved on daemon
+-- restart, so a stall that spans restarts is still caught.
 CREATE TABLE pipe_sla (
     pipe_name TEXT PRIMARY KEY,
     max_interval_seconds INTEGER NOT NULL,
