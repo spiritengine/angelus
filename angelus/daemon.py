@@ -17,8 +17,11 @@ from apscheduler.triggers.interval import IntervalTrigger
 from angelus.clock import Clock
 from angelus.control import ControlServer
 from angelus.envfile import load_env_file, resolve_op_refs
+from angelus.fixers.runner import run_python_fixer
 from angelus.logging_config import configure_logging
 from angelus.lodging import (
+    Fixer,
+    FixerCondition,
     Lodging,
     ScheduledSource,
     load_lodging,
@@ -67,6 +70,15 @@ _RESTART_RECONCILED_INTERNAL_SOURCES = (
 # wedged drain still cannot hang shutdown past this bound. Kept comfortably
 # under the integration fell's 8.0s no-hang assertion.
 _DRAIN_SHUTDOWN_TIMEOUT = 6.0
+
+# How often the fixer-evaluation loop (B11) re-checks live conditions. The
+# guardrails (max_attempts/window/backoff) -- not this interval -- bound how
+# often any single fixer actually fires, so this only needs to be frequent
+# enough that a remediable condition is acted on promptly. Overridable for
+# tests/alternate deployments; tests drive _evaluate_fixers directly and do
+# not depend on it.
+_FIXER_POLL_INTERVAL_SEC = 15.0
+DEFAULT_FIXERS_LOG_FILENAME = "fixers.log"
 
 
 class AngelusDaemon:
@@ -145,11 +157,13 @@ class AngelusDaemon:
             control_started = True
             LOGGER.info("control socket listening at %s", self.socket_path)
             LOGGER.info(
-                "loaded lodging: %d sources, %d triagers, %d pipes, %d channels",
+                "loaded lodging: %d sources, %d triagers, %d pipes, "
+                "%d channels, %d fixers",
                 len(self.lodging.sources),
                 len(self.lodging.triagers),
                 len(self.lodging.pipes),
                 len(self.lodging.channels),
+                len(self.lodging.fixers),
             )
             # Log the resolved local TZ at startup. The digest subject and
             # all rendered timestamps use the clock's local-now (system TZ).
@@ -199,6 +213,9 @@ class AngelusDaemon:
             scheduler_started = True
             LOGGER.info("scheduler started with %d jobs", len(self.scheduler.get_jobs()))
             self.tasks.append(asyncio.create_task(self._triage_loop(), name="triage-loop"))
+            self.tasks.append(
+                asyncio.create_task(self._fixer_loop(), name="fixer-loop")
+            )
             for pipe_name, pipe in self.lodging.pipes.items():
                 if pipe.cadence != "immediate":
                     continue
@@ -943,6 +960,214 @@ class AngelusDaemon:
                 return
             await drain.drain_once()
             await asyncio.sleep(1)
+
+    # -- Fixers (B11) ------------------------------------------------------
+    #
+    # The in-daemon autoremediation layer. Each pass evaluates every lodged
+    # fixer's condition against live catalog state and, for each matched
+    # condition instance the guardrails permit, runs the fixer's handler
+    # subprocess and records the attempt + an audit line. Reads
+    # self.lodging.fixers fresh each pass, so a hot-added/removed fixer takes
+    # effect on the next pass with no per-fixer scheduler job to manage (unlike
+    # sources/pipes, a fixer has no cadence -- it fires off condition, not time).
+
+    async def _fixer_loop(self) -> None:
+        try:
+            while not self.stop_event.is_set():
+                try:
+                    await self._evaluate_fixers()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # A bug evaluating one pass must not kill the loop; the
+                    # condition stays live and is retried next pass.
+                    LOGGER.exception("fixer evaluation pass crashed")
+                try:
+                    await asyncio.wait_for(
+                        self.stop_event.wait(), timeout=_FIXER_POLL_INTERVAL_SEC
+                    )
+                except TimeoutError:
+                    continue
+        except asyncio.CancelledError:
+            return
+
+    async def _evaluate_fixers(self) -> None:
+        """One evaluation pass over all fixers. Serial by design: a remediation
+        storm is the opposite of what this layer is for, and the guardrails
+        already throttle each fixer, so a single in-flight handler at a time
+        (bounded by its timeout) is the safe default for the registry's first
+        cut. Tests call this directly."""
+        for fixer in list(self.lodging.fixers.values()):
+            for condition_key, context in self._match_fixer_condition(
+                fixer.condition
+            ):
+                if not self._fixer_allowed(fixer, condition_key):
+                    continue
+                await self._run_fixer(fixer, condition_key, context)
+
+    def _match_fixer_condition(
+        self, condition: FixerCondition
+    ) -> list[tuple[str, dict]]:
+        """Return (condition_key, handler_context) for each live instance of a
+        condition. The key uniquely identifies one condition instance so the
+        guardrail budget accumulates per instance; the context is the JSON the
+        handler receives describing what it is being asked to remediate."""
+        matches: list[tuple[str, dict]] = []
+        if condition.kind == "open_internal_incident":
+            for incident in self.catalog.open_incidents():
+                if incident.get("source") != condition.source:
+                    continue
+                if (
+                    condition.incident_type is not None
+                    and incident.get("type") != condition.incident_type
+                ):
+                    continue
+                if (
+                    condition.entity is not None
+                    and incident.get("entity") != condition.entity
+                ):
+                    continue
+                # source/type/entity is the open-incident identity (the unique
+                # open index in 0001), so this key is stable across passes for
+                # the same open incident -- attempts accumulate against it.
+                key = (
+                    f"open_internal_incident:{incident.get('source')}:"
+                    f"{incident.get('type')}:{incident.get('entity')}"
+                )
+                matches.append(
+                    (key, {"kind": condition.kind, "incident": incident})
+                )
+        elif condition.kind == "channel_unhealthy":
+            for row in self.catalog.all_channel_health():
+                if row.get("status") != "unhealthy":
+                    continue
+                if (
+                    condition.channel is not None
+                    and row.get("channel") != condition.channel
+                ):
+                    continue
+                key = f"channel_unhealthy:{row.get('channel')}"
+                matches.append((key, {"kind": condition.kind, "channel": row}))
+        return matches
+
+    def _fixer_allowed(self, fixer: Fixer, condition_key: str) -> bool:
+        """Guardrail gate: cap attempts within the window and enforce backoff.
+
+        When the cap is hit the fixer simply stops firing for that condition --
+        deliberately quiet, not an escalation. The underlying condition (the
+        open incident / unhealthy channel) stays live and is already surfaced by
+        belfry and `angelus health`, so the problem remains loud through the
+        detection layer; making the fixer's *giving up* itself page is the
+        escalation ladder's job (B14), not the registry's."""
+        count = self.catalog.fixer_attempt_count_in_window(
+            fixer.name, condition_key, fixer.window_seconds
+        )
+        if count >= fixer.max_attempts:
+            LOGGER.warning(
+                "fixer %s guard: %d attempt(s) in %ds window for %s; skipping",
+                fixer.name,
+                count,
+                fixer.window_seconds,
+                condition_key,
+            )
+            return False
+        if fixer.backoff_seconds > 0:
+            last = self.catalog.last_fixer_attempt_at(fixer.name, condition_key)
+            if last is not None:
+                last_dt = _parse_iso(last)
+                if last_dt is not None:
+                    elapsed = (self.clock.now() - last_dt).total_seconds()
+                    if elapsed < fixer.backoff_seconds:
+                        LOGGER.info(
+                            "fixer %s backoff: %.0fs since last attempt for %s "
+                            "(< %ds); skipping",
+                            fixer.name,
+                            elapsed,
+                            condition_key,
+                            fixer.backoff_seconds,
+                        )
+                        return False
+        return True
+
+    async def _run_fixer(
+        self, fixer: Fixer, condition_key: str, context: dict
+    ) -> None:
+        note: str | None = None
+        try:
+            result = await run_python_fixer(fixer, {**context, "condition_key": condition_key})
+            outcome = result["outcome"]
+            raw_note = result.get("note")
+            note = raw_note if isinstance(raw_note, str) and raw_note else None
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Any handler failure (timeout, non-zero exit, bad output) is a
+            # recorded outcome, not a crash: it must count against the guardrail
+            # so a persistently-failing fixer backs off like any other.
+            outcome = "error"
+            note = str(exc)
+            LOGGER.error(
+                "fixer %s failed on %s: %s", fixer.name, condition_key, exc
+            )
+        # Record the attempt AFTER running so the ledger carries the real
+        # outcome. The belfry restart-guard records BEFORE its systemctl call
+        # because a daemon crash-loop would otherwise bypass the count; here the
+        # crash-loop axis is belfry's (B12), the handler is timeout-bounded, and
+        # at most one handler runs per condition per pass, so record-after
+        # cannot create an unbounded loop -- the worst case is one uncounted
+        # attempt if the daemon is killed mid-handler.
+        self.catalog.record_fixer_attempt(fixer.name, condition_key, outcome)
+        self._append_fixers_log(fixer.name, condition_key, outcome, note)
+        LOGGER.info(
+            "fixer %s ran on %s -> %s", fixer.name, condition_key, outcome
+        )
+
+    def _append_fixers_log(
+        self, fixer_name: str, condition_key: str, outcome: str, note: str | None
+    ) -> None:
+        """Append one line to the shared fixers.log audit trail (B11).
+
+        Same file and key=value line format belfry's B12 restart-fixer writes,
+        so an in-daemon fixer's actions flow into the daily digest's
+        fixer_actions input and any postmortem with zero extra plumbing. actor
+        is the fixer name (distinct from belfry's actor=belfry). Best-effort:
+        an audit-log IO error is logged and swallowed, never failing a fixer."""
+        path = _fixers_log_path(self.root)
+        # Second-precision wall format matches belfry's lines in the same file;
+        # sourced from the injected clock so a FakeClock test controls it.
+        ts = self.clock.now().strftime("%Y-%m-%dT%H:%M:%SZ")
+        line = (
+            f"{ts} actor={fixer_name} action=fix "
+            f"reason={condition_key!r} outcome={outcome}"
+        )
+        if note is not None:
+            line += f" note={note!r}"
+        line += "\n"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(line)
+        except OSError:
+            LOGGER.warning("failed to append to fixers log %s", path, exc_info=True)
+
+
+def _parse_iso(value: str) -> datetime | None:
+    """Parse a catalog ISO8601 timestamp (``...Z``) to an aware UTC datetime,
+    or None if it does not parse. Used for fixer backoff spacing."""
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _fixers_log_path(root: Path) -> Path:
+    """Path to the shared fixers.log. Honors ANGELUS_BELFRY_FIXERS_LOG_PATH --
+    the same override belfry and the digest's reader use -- so all three agree
+    on one file in tests and alternate deployments."""
+    override = os.environ.get("ANGELUS_BELFRY_FIXERS_LOG_PATH")
+    if override:
+        return Path(override)
+    return root / "state" / DEFAULT_FIXERS_LOG_FILENAME
 
 
 def _belfry_sentinel_path(root: Path) -> Path:

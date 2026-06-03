@@ -29,6 +29,7 @@ from .config import (
     Lodging,
     parse_channel,
     parse_dependency,
+    parse_fixer,
     parse_pipe,
     parse_source,
     parse_triager,
@@ -46,6 +47,7 @@ WATCHED_DIRS = (
     "pipes",
     "channels",
     "dependencies",
+    "fixers",
 )
 
 
@@ -53,7 +55,7 @@ WATCHED_DIRS = (
 class _Identified:
     """Result of mapping a filesystem path to a lodging entry."""
 
-    kind: str  # "source" | "triager" | "pipe" | "channel" | "dependency"
+    kind: str  # "source" | "triager" | "pipe" | "channel" | "dependency" | "fixer"
     key: str  # canonical key in the matching Lodging dict
     yaml_path: Path  # path with .disabled stripped
 
@@ -86,6 +88,13 @@ def _identify(root: Path, path: Path) -> _Identified | None:
     # key is the filename stem (parse_dependency enforces name == stem).
     if len(parts) == 2 and parts[0] == "dependencies":
         return _Identified("dependency", stem, yaml_path)
+    # fixers/ is FLAT for the bindings (fixers/<name>.yaml, depth 2). The
+    # python handlers live one level down in fixers/handlers/<x>.py and are
+    # never *.yaml, so the .yaml gate above already excludes them -- editing a
+    # handler does not (and need not) trigger a reload, since each invocation
+    # reads the handler file fresh as a subprocess.
+    if len(parts) == 2 and parts[0] == "fixers":
+        return _Identified("fixer", stem, yaml_path)
     return None
 
 
@@ -108,6 +117,8 @@ def _parse(kind: str, root: Path, path: Path) -> Any:
         return parse_channel(path)
     if kind == "dependency":
         return parse_dependency(path)
+    if kind == "fixer":
+        return parse_fixer(root, path)
     raise ValueError(f"unknown lodging kind {kind!r}")
 
 
@@ -133,6 +144,10 @@ def _swap(lodging: Lodging, kind: str, key: str, item: Any) -> Lodging:
         dependencies = dict(lodging.dependencies)
         dependencies[key] = item
         return replace(lodging, dependencies=dependencies)
+    if kind == "fixer":
+        fixers = dict(lodging.fixers)
+        fixers[key] = item
+        return replace(lodging, fixers=fixers)
     raise ValueError(f"unknown lodging kind {kind!r}")
 
 
@@ -157,6 +172,10 @@ def _without(lodging: Lodging, kind: str, key: str) -> Lodging:
         dependencies = dict(lodging.dependencies)
         dependencies.pop(key, None)
         return replace(lodging, dependencies=dependencies)
+    if kind == "fixer":
+        fixers = dict(lodging.fixers)
+        fixers.pop(key, None)
+        return replace(lodging, fixers=fixers)
     raise ValueError(f"unknown lodging kind {kind!r}")
 
 
@@ -171,6 +190,8 @@ def _existing(lodging: Lodging, kind: str, key: str) -> Any:
         return lodging.channels.get(key)
     if kind == "dependency":
         return lodging.dependencies.get(key)
+    if kind == "fixer":
+        return lodging.fixers.get(key)
     raise ValueError(f"unknown lodging kind {kind!r}")
 
 
@@ -233,7 +254,11 @@ class LodgingReloader:
         # That makes the absent-at-startup and created-later cases both
         # behave: the observer watches a real (possibly empty) dir from
         # the start and sees the first dependencies/<name>.yaml dropped in.
+        # fixers/ (B11) gets the same treatment for the same reason: a
+        # deployment may not ship one yet, but dropping the first fixer file
+        # should wire it without a restart.
         (self.root / "dependencies").mkdir(parents=True, exist_ok=True)
+        (self.root / "fixers").mkdir(parents=True, exist_ok=True)
         for subdir in WATCHED_DIRS:
             target = self.root / subdir
             if target.exists():
