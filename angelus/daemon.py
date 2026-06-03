@@ -121,6 +121,13 @@ class AngelusDaemon:
         # its task here on entry and discards on exit; run()'s finally cancels
         # and awaits the set. Mirrors _triage_loop's in_flight handling.
         self._drain_tasks: set[asyncio.Task[None]] = set()
+        # The fixer-evaluation loop (B11). Held separately from self.tasks
+        # because, unlike the triage loop (whose body only awaits sleep and
+        # spawns child tasks), this loop blocks INLINE on a fixer handler
+        # subprocess -- so shutdown must CANCEL it, not merely await it, or a
+        # slow handler hangs teardown. Cancellation propagates into
+        # run_python_fixer's reap arm. None until run() starts it.
+        self._fixer_loop_task: asyncio.Task[None] | None = None
         self.pipe_drains: dict[str, PipeDrain] = {
             name: PipeDrain(
                 self.catalog,
@@ -213,8 +220,8 @@ class AngelusDaemon:
             scheduler_started = True
             LOGGER.info("scheduler started with %d jobs", len(self.scheduler.get_jobs()))
             self.tasks.append(asyncio.create_task(self._triage_loop(), name="triage-loop"))
-            self.tasks.append(
-                asyncio.create_task(self._fixer_loop(), name="fixer-loop")
+            self._fixer_loop_task = asyncio.create_task(
+                self._fixer_loop(), name="fixer-loop"
             )
             for pipe_name, pipe in self.lodging.pipes.items():
                 if pipe.cadence != "immediate":
@@ -258,6 +265,28 @@ class AngelusDaemon:
                         "drain task shutdown exceeded %.1fs; %d still in-flight",
                         _DRAIN_SHUTDOWN_TIMEOUT,
                         len(self._drain_tasks),
+                    )
+            # Cancel the fixer loop before the final gather. Its body blocks
+            # inline on a handler subprocess (run_python_fixer.communicate),
+            # which setting stop_event does not interrupt; cancelling lands in
+            # that runner's `except CancelledError: await _kill_and_reap`, so
+            # the handler's process group is reaped instead of hanging
+            # teardown until its timeout. Bounded by the same budget as the
+            # drain reap so a wedged handler still can't hang shutdown past it
+            # (and under the integration fell's 8.0s no-hang assertion).
+            if self._fixer_loop_task is not None:
+                self._fixer_loop_task.cancel()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            self._fixer_loop_task, return_exceptions=True
+                        ),
+                        timeout=_DRAIN_SHUTDOWN_TIMEOUT,
+                    )
+                except TimeoutError:
+                    LOGGER.warning(
+                        "fixer loop shutdown exceeded %.1fs",
+                        _DRAIN_SHUTDOWN_TIMEOUT,
                     )
             pending = [*self.tasks, *self._pipe_loop_tasks.values()]
             if pending:
@@ -1058,12 +1087,18 @@ class AngelusDaemon:
         open incident / unhealthy channel) stays live and is already surfaced by
         belfry and `angelus health`, so the problem remains loud through the
         detection layer; making the fixer's *giving up* itself page is the
-        escalation ladder's job (B14), not the registry's."""
+        escalation ladder's job (B14), not the registry's.
+
+        Both skip paths log at DEBUG: a live-but-blocked condition is
+        re-evaluated every poll, so a higher level would emit hundreds of
+        identical lines per hour into state/angelus.log -- exactly the noise the
+        logging unification (B21+B22) made ERROR/WARNING meaningful to avoid.
+        The attempts that DID run are in fixers.log and the daily digest."""
         count = self.catalog.fixer_attempt_count_in_window(
             fixer.name, condition_key, fixer.window_seconds
         )
         if count >= fixer.max_attempts:
-            LOGGER.warning(
+            LOGGER.debug(
                 "fixer %s guard: %d attempt(s) in %ds window for %s; skipping",
                 fixer.name,
                 count,
@@ -1078,7 +1113,7 @@ class AngelusDaemon:
                 if last_dt is not None:
                     elapsed = (self.clock.now() - last_dt).total_seconds()
                     if elapsed < fixer.backoff_seconds:
-                        LOGGER.info(
+                        LOGGER.debug(
                             "fixer %s backoff: %.0fs since last attempt for %s "
                             "(< %ds); skipping",
                             fixer.name,

@@ -6,12 +6,17 @@
 -- fixer must not get a fresh attempt budget every time the daemon comes back,
 -- the same fail-safe reasoning belfry's restart-log guard uses (B12).
 --
--- condition_key identifies the specific condition instance a fixer is acting
--- on (e.g. open_internal_incident:internal/dep:dependency_unhealthy:<entity>),
--- so attempts accumulate per-condition rather than per-fixer: one fixer bound
--- to a recurring condition class gets an independent budget for each distinct
--- live instance, and an instance that clears and recurs later is measured from
--- its own attempt history within the window.
+-- condition_key identifies the condition by its logical IDENTITY, not by
+-- episode: for open_internal_incident it is source:type:entity (matching the
+-- one-open-per-entity unique index in 0001), so each distinct live condition a
+-- fixer binds to gets its own budget, but an instance that clears and later
+-- recurs with the same identity SHARES the budget of the prior episode for as
+-- long as those attempts remain inside the window. That is deliberate and the
+-- safe direction: a flapping dependency cannot earn an unlimited stream of
+-- remediations by clearing and re-opening. The cost is that a genuinely new
+-- failure episode can go unremediated until the window slides past the old
+-- attempts -- acceptable, because the condition itself stays loud via belfry
+-- and `angelus health` the whole time; the fixer giving up is not the alarm.
 --
 -- Append-only; rows are never updated. The dispatcher reads attempts within
 -- the window to count against max_attempts and the latest attempt to enforce

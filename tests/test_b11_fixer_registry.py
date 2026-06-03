@@ -35,7 +35,8 @@ import pytest
 
 from angelus.daemon import AngelusDaemon, _fixers_log_path
 from angelus.clock import FakeClock
-from angelus.lodging import Fixer, parse_fixer, validate_cross_refs
+from angelus.fixers.runner import run_python_fixer
+from angelus.lodging import Fixer, FixerCondition, parse_fixer, validate_cross_refs
 from angelus.lodging.config import _load_fixers, load_lodging
 from angelus.lodging.reloader import LodgingReloader, _identify
 from angelus.pipes.runner import _FIXER_KV_RE
@@ -447,6 +448,76 @@ def test_guardrail_backoff_spaces_attempts(tmp_path) -> None:
         assert len(_read_fixers_log(tmp_path)) == 2
     finally:
         daemon.connection.close()
+
+
+def test_attempts_persist_across_daemon_restart(tmp_path) -> None:
+    # The guardrail must survive a restart: a crash-looping fixer cannot earn a
+    # fresh budget every time the daemon comes back. The count reads from the
+    # file-backed fixer_attempts table, so a fresh daemon on the same DB sees
+    # the prior attempts.
+    _write_base_lodging(tmp_path)
+    _write_handler(tmp_path, "observe.py", _OBSERVE_HANDLER)
+    _write_fixer(tmp_path, "dep-observe", max_attempts=1)
+    key = (
+        "open_internal_incident:internal/dep:dependency_unhealthy:iotaschool.com"
+    )
+
+    daemon1 = _make_daemon(tmp_path, FakeClock(PINNED))
+    try:
+        _open_dep_incident(daemon1)
+        asyncio.run(daemon1._evaluate_fixers())  # fires once, hits the cap
+        assert (
+            daemon1.catalog.fixer_attempt_count_in_window("dep-observe", key, 3600)
+            == 1
+        )
+    finally:
+        daemon1.connection.close()
+
+    # Restart: a new daemon on the same root/DB (the open incident and the
+    # attempt ledger both persist). Same pinned instant -> still in window.
+    daemon2 = _make_daemon(tmp_path, FakeClock(PINNED))
+    try:
+        assert (
+            daemon2.catalog.fixer_attempt_count_in_window("dep-observe", key, 3600)
+            == 1
+        )
+        asyncio.run(daemon2._evaluate_fixers())  # guard blocks: no new fire
+        assert len(_read_fixers_log(tmp_path)) == 1
+    finally:
+        daemon2.connection.close()
+
+
+def _bare_fixer(handler_path: Path, timeout: float = 30.0) -> Fixer:
+    return Fixer(
+        name="t",
+        condition=FixerCondition(kind="open_internal_incident", source="internal/dep"),
+        handler_path=handler_path,
+        handler_timeout=timeout,
+        max_attempts=3,
+        window_seconds=3600,
+        backoff_seconds=0,
+    )
+
+
+def test_run_python_fixer_timeout_raises(tmp_path) -> None:
+    handler = _write_handler(tmp_path, "slow.py", "import time\ntime.sleep(5)\n")
+    fixer = _bare_fixer(handler, timeout=0.5)
+    with pytest.raises(RuntimeError, match="timed out"):
+        asyncio.run(run_python_fixer(fixer, {"condition_key": "k"}))
+
+
+def test_run_python_fixer_non_json_raises(tmp_path) -> None:
+    handler = _write_handler(tmp_path, "garbage.py", "print('not json')\n")
+    fixer = _bare_fixer(handler)
+    with pytest.raises(ValueError, match="non-JSON"):
+        asyncio.run(run_python_fixer(fixer, {"condition_key": "k"}))
+
+
+def test_run_python_fixer_missing_outcome_raises(tmp_path) -> None:
+    handler = _write_handler(tmp_path, "no_outcome.py", "print('{\"note\": \"x\"}')\n")
+    fixer = _bare_fixer(handler)
+    with pytest.raises(ValueError, match="non-empty 'outcome'"):
+        asyncio.run(run_python_fixer(fixer, {"condition_key": "k"}))
 
 
 def test_handler_error_recorded_and_counts_against_guard(tmp_path) -> None:
