@@ -390,6 +390,87 @@ def dep_check(name: str, root: Path) -> None:
     click.echo(f"{result['name']}: {result['status']} ({detail})")
 
 
+@main.command("fault-inject")
+@click.argument("channel", required=False)
+@click.option(
+    "--clear", "clear_channel", default=None,
+    help="Clear the fault armed on this channel.",
+)
+@click.option("--clear-all", is_flag=True, help="Clear all armed faults.")
+@click.option("--list", "list_faults", is_flag=True, help="List armed faults.")
+@_ROOT_OPTION
+def fault_inject(
+    channel: str | None,
+    clear_channel: str | None,
+    clear_all: bool,
+    list_faults: bool,
+    root: Path,
+) -> None:
+    """Force CHANNEL's dispatch to fail on demand (B28).
+
+    An armed channel's next send raises a transport-shaped failure, so the
+    real detection/failover/escalation machinery runs without touching channel
+    config. Faults are in-memory on the daemon -- a restart clears them, and
+    every action (including --list) requires the daemon, since there is no
+    persisted state to fall back to.
+
+      angelus fault-inject email             arm a fault on email
+      angelus fault-inject --clear email     clear the fault on email
+      angelus fault-inject --clear-all       clear every armed fault
+      angelus fault-inject --list            list armed faults
+    """
+    root = root.resolve()
+    # Exactly one mode per invocation -- arm (a bare CHANNEL), --clear, --clear-all,
+    # or --list. Reject combinations up front so a typo cannot silently arm and
+    # list in one ambiguous call.
+    modes = [bool(channel), bool(clear_channel), clear_all, list_faults]
+    if sum(modes) != 1:
+        click.echo(
+            "fault-inject takes exactly one of: a channel to arm, "
+            "--clear <channel>, --clear-all, or --list",
+            err=True,
+        )
+        raise SystemExit(1)
+
+    if list_faults:
+        result = _require_daemon(root, "fault_inject", {"action": "list"}, "fault-inject")
+        _render_armed(result)
+        return
+    if clear_all:
+        result = _require_daemon(
+            root, "fault_inject", {"action": "clear_all"}, "fault-inject"
+        )
+        click.echo("cleared all faults")
+        _render_armed(result)
+        return
+    if clear_channel:
+        result = _require_daemon(
+            root,
+            "fault_inject",
+            {"action": "clear", "channel": clear_channel},
+            "fault-inject",
+        )
+        click.echo(f"cleared fault: {clear_channel}")
+        _render_armed(result)
+        return
+    result = _require_daemon(
+        root, "fault_inject", {"action": "arm", "channel": channel}, "fault-inject"
+    )
+    click.echo(f"armed fault: {channel}")
+    _render_armed(result)
+
+
+def _render_armed(result: dict[str, Any]) -> None:
+    """Armed faults, one channel per line (screen-reader plain text)."""
+    armed = result.get("armed") or []
+    click.echo("armed faults:")
+    if not armed:
+        click.echo("  none")
+        return
+    for name in armed:
+        click.echo(f"  {name}")
+
+
 def _format_instant(value: datetime) -> str:
     """Render a datetime in the same '...Z' millisecond format the storage
     layer writes, so window bounds compare lexicographically against the
@@ -558,6 +639,7 @@ def _render_health(result: dict[str, Any]) -> None:
     _render_belfry(result["belfry"])
     _render_deps(result.get("deps") or [])
     _render_channels(result.get("channels") or {})
+    _render_fault_injection(result.get("fault_injection") or {})
 
 
 def _render_delivery(delivery: dict[str, Any]) -> None:
@@ -696,6 +778,20 @@ def _render_channels(channels: dict[str, Any]) -> None:
                 click.echo(f"      last error: {row['last_error']}")
 
 
+def _render_fault_injection(fault_injection: dict[str, Any]) -> None:
+    """Armed fault-injection channels (B28), one per line, screen-reader
+    friendly. The registry is in-memory on the live daemon, so the daemon-down
+    fallback always renders 'none' -- a restart clears every armed fault by
+    construction, so there is nothing to read off sqlite."""
+    armed = fault_injection.get("armed") or []
+    click.echo("fault injection:")
+    if not armed:
+        click.echo("  none")
+        return
+    for name in armed:
+        click.echo(f"  {name}")
+
+
 def _render_health_fallback(root: Path) -> None:
     from angelus.daemon import _belfry_status, _delivery_surface
     from angelus.lodging.config import _enabled_yaml_files
@@ -747,6 +843,10 @@ def _render_health_fallback(root: Path) -> None:
     finally:
         connection.close()
     _render_belfry(_belfry_status(root))
+    # In-memory only: a down daemon holds no armed faults, so this always
+    # renders 'none' on the fallback path -- present for output symmetry with
+    # the live health surface.
+    _render_fault_injection({})
     click.echo("(sources and next-fire times need the daemon)")
 
 
