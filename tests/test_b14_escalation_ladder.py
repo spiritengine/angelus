@@ -740,3 +740,258 @@ def test_threshold_above_schedule_length(tmp_path) -> None:
     ]
     assert returns == [False] * 7 + [True], "exhausts on the 8th, no IndexError before"
     assert _queue_status(catalog, finding_id) == "failed"
+
+
+# --------------------------------------------------------------------------
+# (l) Rung-3 recovery edge via the DIGEST overflow fallback (B14, fell-r2).
+#     The immediate-path `if delivered:` clearance (test g) closes the rung-3
+#     incident when the content is redelivered over `now`. But an exhausted
+#     finding has a SECOND way to finally reach the user: `angelus replay`
+#     re-arms it, the next `now` drain finds it over the rate limit and shunts
+#     it onto the daily digest (overflow: daily), and the DIGEST delivers the
+#     content. The digest success path clears internal/render and
+#     internal/dispatch but -- before this fix -- never internal/delivery, so a
+#     finding genuinely delivered via the digest left its rung-3 incident open
+#     forever and belfry stayed red. This pins the digest-path clearance.
+# --------------------------------------------------------------------------
+
+
+def _write_digest_templates(root: Path) -> None:
+    """Minimal render-templates so _render_preamble has something to load.
+    The rate-limit-callout renders suppressed findings, which is exactly where
+    an overflow-shunted finding's content surfaces in the digest body -- so the
+    rendered message proves the content actually rode the digest to the user."""
+    (root / "render-templates").mkdir()
+    (root / "render-templates" / "rate-limit-callout.j2").write_text(
+        "Suppressed:\n{% for finding in suppressed_findings %}"
+        "{{ finding.entity }} {{ finding.body_text }}\n{% endfor %}",
+        encoding="utf-8",
+    )
+    (root / "render-templates" / "incident-status.j2").write_text(
+        "Incidents:\n{% for incident in open_incidents %}{{ incident.entity }}\n"
+        "{% endfor %}",
+        encoding="utf-8",
+    )
+
+
+def _digest_pipe() -> Pipe:
+    """A daily digest routing to a single `email` channel, mirroring the real
+    daily.yaml overflow target."""
+    return Pipe(
+        name="daily",
+        cadence="0 7 * * *",
+        render_kind="digest",
+        template=None,
+        channels=["email"],
+        render={
+            "preamble": [
+                {"kind": "structured", "template": "rate-limit-callout"},
+                {"kind": "structured", "template": "incident-status"},
+            ],
+            "body": {
+                "kind": "llm",
+                "mantle": "chronicler",
+                "inputs": ["suppressed_findings", "open_incidents"],
+            },
+        },
+    )
+
+
+def test_digest_redelivery_clears_rung3_incident(tmp_path, monkeypatch) -> None:
+    """Full replay -> overflow -> digest-delivery path. A product finding
+    exhausts its immediate ladder on `now` (rung-3 internal/delivery incident
+    open). `angelus replay` re-arms it; the next `now` drain finds it over the
+    per-source rate limit and shunts it onto the daily digest (overflow: daily);
+    the digest delivers the content over a healthy email channel. The digest
+    success path must clear the rung-3 incident -- the same recovery the
+    immediate path's `if delivered:` branch performs, reached via the overflow
+    fallback instead.
+
+    Discrimination: the email leg's rendered message carries the finding's
+    content (it surfaces in the suppressed-findings preamble), proving the
+    content really reached the user via the digest AND not via `now` (the now
+    drain only suppressed it, never sent). The incident is asserted OPEN after
+    exhaustion and CLOSED after the digest delivery. Remove the digest-path
+    clearance and this final assertion inverts -- the incident stays open and
+    belfry stays red after a genuine delivery, the exact bug this pins.
+    """
+    clock = FakeClock(PINNED)
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path, clock=clock)
+    _write_digest_templates(tmp_path)
+
+    push_channel = {"push": Channel(name="push", kind="push", command="notify-pat")}
+    email_channel = {"email": Channel(name="email", kind="email", command="true", to="x@e")}
+    # `now` routes urgent findings to push and overflows to daily on rate limit;
+    # max_delivery_attempts=2 exhausts the per-finding ladder fast. Each drain is
+    # handed only the channels it routes to (the daemon hands the full set; here
+    # the split keeps the rung-3 ALARM finding -- which B7 fans to every channel
+    # in the now drain's set -- off the email leg, so email_bodies isolates the
+    # DIGEST delivery we are asserting on).
+    now_pipe = Pipe(
+        name="now",
+        cadence="immediate",
+        render_kind="dumb-alert",
+        template="{severity} {type}: {entity} {body}",
+        channels=["push"],
+        rate_limit={"per_source": "4/hr", "per_channel": "6/hr", "overflow": "daily"},
+        max_delivery_attempts=2,
+    )
+    now_drain = PipeDrain(
+        catalog, now_pipe, push_channel, tmp_path, {"now", "daily"}, clock=clock
+    )
+    digest_drain = PipeDrain(
+        catalog, _digest_pipe(), email_channel, tmp_path, {"now", "daily"}, clock=clock
+    )
+
+    push = _Recorder(fail=True)  # down through exhaustion -> the finding never sends
+    email_bodies: list[str] = []
+
+    async def fake_email(_channel, _subject, body, _workdir):
+        email_bodies.append(body)
+
+    async def fake_llm(_self, _pipe, _structured):
+        return "digest synthesis.", None
+
+    monkeypatch.setattr(pipe_runner, "send_push", push)
+    monkeypatch.setattr(pipe_runner, "send_email", fake_email)
+    monkeypatch.setattr(PipeDrain, "_render_llm_body", fake_llm)
+
+    # The finding targets `now` only; the overflow seam (suppress_pipe_item_to)
+    # is what later routes it onto daily, exactly as the runner does at drain.
+    observation_id = catalog.write_observation(
+        "scheduled/a", {}, {"source": "scheduled/a"}
+    )
+    finding_id = catalog.write_finding(
+        observation_id,
+        {
+            "source": "scheduled/a",
+            "type": "down",
+            "entity": "example.com",
+            "severity": "high",
+            "target_pipes": ["now"],
+            "body": "the lost payload",
+        },
+        {"now", "daily"},
+    )
+
+    # Exhaust on `now`: push fails both drains (all dispatches 'failed', so the
+    # source never crosses the rate limit here -- the finding genuinely walks the
+    # ladder rather than overflowing early). After drain 2 the rung-3 incident is
+    # open and the now row is terminal.
+    for i in range(2):
+        if i:
+            clock.advance(_PAST_BACKOFF)
+        asyncio.run(now_drain.drain_once())
+    assert push.calls == ["push", "push"], "the primary was tried each drain"
+    assert _queue_status(catalog, finding_id) == "failed", "the finding exhausted"
+    assert _delivery_incident_open(catalog, finding_id), "rung 3 opened the incident"
+
+    # Operator replays the dead-lettered finding -> the now row re-arms to pending.
+    assert catalog.replay_finding(finding_id, {"now"})["outcome"] == "requeued"
+    assert _queue_status(catalog, finding_id) == "pending"
+
+    # Push the source over its per-source rate limit so the next `now` drain
+    # overflows the replayed finding onto the daily digest instead of retrying
+    # push. 4 'sent' dispatches at the current clock land inside the 1h window.
+    # mark_queue=False: these are rate-limit ballast for an unrelated finding id
+    # (the source count is what gates the limit) -- the default mark_queue=True
+    # would mark the replayed finding's `now` row dispatched and defeat the shunt.
+    for _ in range(4):
+        catalog.record_dispatch(
+            "now", "push", [999], "sent", source="scheduled/a", mark_queue=False
+        )
+
+    # The now drain shunts the replayed finding to daily (suppressed on now,
+    # pending on daily). The product finding is over the limit so it is NOT
+    # delivered here -- it is shunted, never sent -- so its rung-3 incident stays
+    # open through this step. (The rung-3 alarm finding itself, source
+    # internal/delivery, also rides `now`; it is internal so it bypasses the rate
+    # limit and is irrelevant to the product finding's incident, which is keyed
+    # on the product finding's own id.)
+    asyncio.run(now_drain.drain_once())
+    assert _queue_status(catalog, finding_id) == "suppressed", "shunted off now"
+    daily_status = catalog.connection.execute(
+        "SELECT status FROM pipe_queues WHERE finding_id = ? AND pipe = 'daily'",
+        (finding_id,),
+    ).fetchone()
+    assert daily_status["status"] == "pending", "overflow created the daily queue row"
+    assert _delivery_incident_open(catalog, finding_id), (
+        "the shunt is not a delivery -- the incident must still be open"
+    )
+
+    # The digest drains daily and delivers the content over email -> the
+    # digest-path recovery edge closes the rung-3 incident.
+    asyncio.run(digest_drain.drain_once())
+    assert email_bodies, "the digest delivered over email"
+    assert "the lost payload" in email_bodies[0], (
+        "the exhausted finding's content actually rode the digest to the user"
+    )
+    assert _queue_status(catalog, finding_id) == "suppressed", "the now row stays shunted"
+    daily_after = catalog.connection.execute(
+        "SELECT status FROM pipe_queues WHERE finding_id = ? AND pipe = 'daily'",
+        (finding_id,),
+    ).fetchone()
+    assert daily_after["status"] == "dispatched", "the digest marked the daily row sent"
+    assert not _delivery_incident_open(catalog, finding_id), (
+        "a digest redelivery must clear the rung-3 incident (fell-r2 clear edge)"
+    )
+
+
+def test_digest_send_failure_does_not_clear_rung3_incident(tmp_path, monkeypatch) -> None:
+    """Narrower guard on the same edge: a digest drain whose only channel FAILS
+    must NOT clear an open internal/delivery incident -- the content did not
+    reach the user. This pins the `if any_channel_succeeded:` scope: the
+    clearance fires on delivery, never on a failed send.
+
+    Discrimination: the email send raises, no channel succeeds, and the incident
+    asserted open before the drain is still open after. A clearance written
+    unconditionally (outside the success guard) would close it here even though
+    nothing was delivered -- re-greening belfry on a digest that never went out.
+    """
+    clock = FakeClock(PINNED)
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path, clock=clock)
+    _write_digest_templates(tmp_path)
+
+    channels = {"email": Channel(name="email", kind="email", command="true", to="x@e")}
+    digest_drain = PipeDrain(
+        catalog, _digest_pipe(), channels, tmp_path, {"now", "daily"}, clock=clock
+    )
+
+    async def failing_email(_channel, _subject, _body, _workdir):
+        raise RuntimeError("smtp down")
+
+    async def fake_llm(_self, _pipe, _structured):
+        return "digest synthesis.", None
+
+    monkeypatch.setattr(pipe_runner, "send_email", failing_email)
+    monkeypatch.setattr(PipeDrain, "_render_llm_body", fake_llm)
+
+    # A finding queued straight onto daily, plus an open rung-3 incident keyed on
+    # its id (as if it had exhausted on now earlier).
+    observation_id = catalog.write_observation(
+        "scheduled/a", {}, {"source": "scheduled/a"}
+    )
+    finding_id = catalog.write_finding(
+        observation_id,
+        {
+            "source": "scheduled/a",
+            "type": "down",
+            "entity": "example.com",
+            "severity": "high",
+            "target_pipes": ["daily"],
+            "body": "still lost",
+        },
+        {"daily"},
+    )
+    catalog.write_internal_finding(
+        "internal/delivery", "delivery_exhausted", str(finding_id), "pipe=now", {"now"}
+    )
+    assert _delivery_incident_open(catalog, finding_id), "incident open before the drain"
+
+    asyncio.run(digest_drain.drain_once())
+
+    assert _delivery_incident_open(catalog, finding_id), (
+        "a failed digest send must not clear the rung-3 incident"
+    )

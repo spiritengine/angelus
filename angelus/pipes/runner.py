@@ -868,6 +868,43 @@ class PipeDrain:
                 )
         if any_channel_succeeded:
             self.catalog.mark_pipe_items_dispatched(pipe.name, finding_ids)
+            # RUNG-3 RECOVERY EDGE via the DIGEST fallback (B14). Symmetric to the
+            # `if delivered:` clearance on the immediate path (_drain_immediate),
+            # but for the OTHER way an exhausted finding's content can finally
+            # reach the user: the rate-limit overflow. A product finding that
+            # exhausted its immediate ladder opened a durable per-FINDING
+            # internal/delivery incident (entity = its id). When `angelus replay`
+            # re-arms it, the next `now` drain may find it over the rate limit and
+            # suppress_pipe_item_to-shunt it onto THIS digest pipe (overflow:
+            # daily); the digest then actually delivers the content. That is a
+            # genuine recovery -- the user received it -- so the rung-3 incident
+            # must close here too, or it stays open forever and belfry stays red
+            # after a real delivery (the exact bug the immediate-path edge fixed,
+            # reached by the overflow path instead).
+            #
+            # Per-FINDING, not per-pipe: the internal/render and internal/dispatch
+            # clearances above are keyed on the PIPE / the CHANNEL (one incident
+            # per render surface / per transport), so they fire once. But
+            # internal/delivery is keyed on the FINDING id -- each abandoned item
+            # has its own incident -- so the clearance must fire once per finding
+            # this digest actually delivered, not once for the pipe. finding_ids
+            # is exactly that set (the same ids just marked dispatched), and the
+            # `if any_channel_succeeded:` guard scopes this to a real delivery:
+            # nothing clears on a digest send FAILURE (that path records a failed
+            # dispatch and never reaches here). The B30 recovery gate drops each
+            # call to a no-op SELECT when no internal/delivery incident is open
+            # for that finding -- so the common case (a digest of never-exhausted
+            # findings) pays only one cheap query per item. entity=str(finding_id)
+            # + source=internal/delivery means the clearance can only ever close
+            # the matching rung-3 incident; it cannot touch the digest pipe's own
+            # internal findings or any other source.
+            for finding_id in finding_ids:
+                self.catalog.write_internal_clearance(
+                    "internal/delivery",
+                    str(finding_id),
+                    f"{finding_id} redelivered via digest",
+                    known_pipes,
+                )
             self.catalog.mark_pipe_drained(pipe.name, drained_at)
             # Dead-man heartbeat: the digest demonstrably went out on at least
             # one channel this cycle, so ping the off-box check. A missing ping
