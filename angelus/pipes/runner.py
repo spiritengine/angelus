@@ -210,6 +210,19 @@ class PipeDrain:
             # regardless of how many channels failed (no +N inflation).
             delivered = False  # did >=1 live channel get this finding out?
             last_error: str | None = None  # last attempted-channel failure, if any
+            # B13 transport failover bookkeeping. `attempted` is every channel
+            # actually sent over this drain (primary or backup), so the failover
+            # walk never re-sends to a channel already tried -- e.g. when a
+            # degraded primary's backup is itself another primary that already
+            # failed. `degraded_primaries` collects the NON-internal primaries
+            # that are degraded this drain (already-unhealthy-and-skipped, or
+            # crossed their per-channel threshold on a failure here); after the
+            # loop, each is failed over to its backup if the finding is still
+            # undelivered. internal/* findings never populate this: B7 already
+            # fans them to every channel, so they reach a live transport without
+            # a per-channel backup and must not be double-handled here.
+            attempted: set[str] = set()
+            degraded_primaries: list[str] = []
             for channel_name in self._dispatch_channels(pipe, row, channels):
                 if self.catalog.is_channel_unhealthy(channel_name):
                     # An unhealthy channel is SKIPPED, not attempted -- so it is
@@ -218,7 +231,14 @@ class PipeDrain:
                     # skip-only drain). Pre-fan behaviour preserved: a skipped
                     # sole channel leaves the finding pending for a later drain
                     # or a daemon restart, never burns its retry budget.
+                    if not _is_internal(row["source"]):
+                        # B13: a NON-internal finding whose primary is already
+                        # degraded fails over to that channel's backup after the
+                        # loop. (internal/* findings reach a live transport via
+                        # the B7 fan instead, so they are excluded.)
+                        degraded_primaries.append(channel_name)
                     continue
+                attempted.add(channel_name)
                 channel = channels[channel_name]
                 try:
                     await self._send_channel(channel, message, subject)
@@ -258,6 +278,15 @@ class PipeDrain:
                             last_error,
                             known_pipes,
                         )
+                        if not _is_internal(row["source"]):
+                            # B13: this primary just crossed its threshold, so
+                            # it is now degraded -- fail this finding over to its
+                            # backup after the loop (if no co-routed channel
+                            # delivered it first). The internal/dispatch finding
+                            # written just above IS the "channel-degraded" alarm
+                            # the acceptance wants; B13 adds the failover DELIVERY
+                            # only, never a second alarm for the same channel.
+                            degraded_primaries.append(channel.name)
                     else:
                         # This channel will retry on a later drain. WARNING, not
                         # ERROR -- a single transient failure is expected to
@@ -317,6 +346,111 @@ class PipeDrain:
                         f"{channel.name} delivery recovered",
                         known_pipes,
                     )
+            # B13 transport failover. A NON-internal finding whose primary
+            # channel(s) are degraded this drain -- already unhealthy (skipped
+            # above) or just crossed the per-channel threshold on a failure
+            # above -- is delivered over the degraded channel's configured
+            # backup, so the content still gets out THIS drain even though its
+            # own transport is down. Gated on `not delivered`: if the primary or
+            # any co-routed channel already delivered the finding, there is
+            # nothing to fail over -- the contract is ">=1 delivery happened",
+            # never a duplicate page. internal/* findings never reach here
+            # (degraded_primaries stays empty for them; the B7 fan is their
+            # resilience), so they are not double-handled.
+            if not delivered and degraded_primaries:
+                for primary_name in degraded_primaries:
+                    if delivered:
+                        break
+                    primary = channels.get(primary_name)
+                    if primary is None:
+                        continue
+                    backup = self._failover_target(primary, channels, attempted)
+                    if backup is None:
+                        # The chain dead-ends -- no backup declared, or every
+                        # reachable backup is unhealthy/already tried. The
+                        # finding is not delivered here; it stays retryable via
+                        # the reconciliation below (dead-lettering an
+                        # undeliverable finding is B15, out of scope -- the seam
+                        # is the existing per-finding ladder).
+                        continue
+                    attempted.add(backup.name)
+                    try:
+                        await self._send_channel(backup, message, subject)
+                    except Exception as exc:
+                        last_error = str(exc)
+                        # The backup itself failed its send. Ladder its OWN
+                        # per-channel health exactly like a primary failure, so a
+                        # genuinely-down backup also escalates (and is skipped on
+                        # the next drain), and leave the finding retryable -- the
+                        # reconciliation below advances its per-finding ladder.
+                        backup_exhausted = (
+                            self.catalog.record_immediate_send_failure(
+                                pipe.name, backup.name, finding_id, last_error
+                            )
+                        )
+                        if backup_exhausted:
+                            LOGGER.error(
+                                "pipe %s: failover backup %s (for degraded %s) "
+                                "exhausted retries on finding %s; marking channel "
+                                "unhealthy: %s",
+                                pipe.name,
+                                backup.name,
+                                primary_name,
+                                finding_id,
+                                exc,
+                            )
+                            self.catalog.write_internal_finding(
+                                "internal/dispatch",
+                                "channel_unhealthy",
+                                backup.name,
+                                last_error,
+                                known_pipes,
+                            )
+                        else:
+                            LOGGER.warning(
+                                "pipe %s: failover of finding %s from degraded "
+                                "%s to backup %s failed, will retry: %s",
+                                pipe.name,
+                                finding_id,
+                                primary_name,
+                                backup.name,
+                                exc,
+                            )
+                    else:
+                        delivered = True
+                        # A degraded primary's content got out over its backup --
+                        # WARNING (not INFO): delivery happened, but only because
+                        # the primary transport is down, which an operator should
+                        # see in the log alongside the internal/dispatch alarm.
+                        LOGGER.warning(
+                            "pipe %s: finding %s failed over from degraded "
+                            "channel %s to backup %s",
+                            pipe.name,
+                            finding_id,
+                            primary_name,
+                            backup.name,
+                        )
+                        # Mirror the primary success branch: record the 'sent'
+                        # dispatch (mark_queue=True marks the pipe_queues row
+                        # 'dispatched' atomically), reset the backup's escalation
+                        # counter, and clear any open internal/dispatch incident
+                        # for the backup channel.
+                        self.catalog.record_dispatch(
+                            pipe.name,
+                            backup.name,
+                            [finding_id],
+                            "sent",
+                            source=row["source"],
+                        )
+                        self.catalog.record_immediate_send_success(
+                            pipe.name, backup.name
+                        )
+                        self.catalog.write_internal_clearance(
+                            "internal/dispatch",
+                            backup.name,
+                            f"{backup.name} delivery recovered",
+                            known_pipes,
+                        )
             # Per-finding redelivery reconciliation -- the step the digest path
             # never needed (it carries one channel per cycle). The channel loop
             # above owns per-CHANNEL health; this owns the orthogonal per-FINDING
@@ -389,6 +523,51 @@ class PipeDrain:
         if not _is_internal(row["source"]):
             return list(pipe.channels)
         return list(dict.fromkeys([*pipe.channels, *channels]))
+
+    def _failover_target(
+        self,
+        channel: Channel,
+        channels: dict[str, Channel],
+        attempted: set[str],
+    ) -> Channel | None:
+        """First deliverable channel on a degraded channel's backup chain (B13).
+
+        Walks ``.backup`` links starting from ``channel.backup`` and returns the
+        first channel that is configured, healthy (not is_channel_unhealthy),
+        and not already attempted this drain -- the live transport the finding
+        fails over to so its content still gets out. Returns None when the chain
+        dead-ends: no backup declared, or every reachable backup is unhealthy or
+        already tried. A None result leaves the finding retryable (the caller's
+        per-finding reconciliation); dead-lettering an undeliverable finding is
+        B15, out of scope.
+
+        A backup that is itself unhealthy is skipped and the walk CONTINUES to
+        that backup's own backup -- "follow the chain to the first healthy
+        channel" -- so an email->push->sms chain still reaches sms while push is
+        down. The "never fail over to a backup that is itself unhealthy" guard is
+        the is_channel_unhealthy skip here.
+
+        Cycle/length cap: validate_cross_refs rejects a backup cycle at load, so
+        a cycle cannot exist in valid config. The ``seen`` set here is
+        defense-in-depth that guarantees termination regardless -- each channel
+        is visited at most once, so the walk is hard-bounded by the channel
+        count even if a malformed state ever reached the runtime.
+        """
+        seen: set[str] = {channel.name}
+        cursor = channel.backup
+        while cursor is not None and cursor not in seen:
+            seen.add(cursor)
+            nxt = channels.get(cursor)
+            if nxt is None:
+                # Dangling backup -- validate_cross_refs guards this at load, so
+                # this is unreachable in valid config; stop rather than KeyError.
+                return None
+            if cursor not in attempted and not self.catalog.is_channel_unhealthy(
+                cursor
+            ):
+                return nxt
+            cursor = nxt.backup
+        return None
 
     def _render(self, pipe: Pipe, row) -> str:
         body = self.catalog.read_body(row["body_ref"])
@@ -476,6 +655,21 @@ class PipeDrain:
         # below. Email (and any non-push channel) keeps the full message.
         compact = self._render_compact(subject, structured)
 
+        # B13 digest-path decision: the digest does NOT honour channel.backup.
+        # It is already ADDITIVE across a pipe's channels -- daily renders to
+        # email AND push, so if email is down the digest still goes out over
+        # push without any failover. Layering per-channel backup failover on top
+        # would be redundant at best and double-deliver at worst (push is both a
+        # primary AND email's failover target, so a failed email would send the
+        # digest to push twice). For a digest pipe that routes to a SINGLE
+        # channel, the resilient pattern is to LIST a second channel (additive),
+        # which is strictly better than failover: it always delivers to both and
+        # gives a reliable receipt (daily.yaml documents exactly this for the
+        # push leg). So failover stays on the immediate path; the digest leans on
+        # additive routing plus its existing per-channel escalation + dead-man
+        # heartbeat. (Immediate findings carry one finding per dispatch and a
+        # pipe like `now` may route to a single channel, which is why failover
+        # earns its keep there and not here.)
         any_channel_succeeded = False
         for channel_name in pipe.channels:
             channel = channels[channel_name]

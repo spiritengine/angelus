@@ -92,6 +92,16 @@ class Channel:
     kind: str
     command: str
     to: str | None = None
+    # B13 transport failover: the name of another channel this channel fails
+    # over to when it is degraded on the immediate path (see
+    # PipeDrain._drain_immediate). Optional and domain-agnostic -- ANY channel
+    # may declare a backup; no email/push special-case lives in the loader.
+    # validate_cross_refs enforces that the target exists, is not the channel
+    # itself, and that the backup CHAIN does not cycle. `channel_env_requirements`
+    # and `_assert_well_formed_env_markers` scan every str field for the
+    # `$env:` marker; a backup holds a channel NAME, never an env ref, so it is
+    # inert to both (it cannot start with `$env:`).
+    backup: str | None = None
 
 
 @dataclass(frozen=True)
@@ -279,6 +289,47 @@ def validate_cross_refs(lodging: Lodging) -> list[str]:
                 f"fixer {fixer.name} condition.channel references missing "
                 f"channel {fixer.condition.channel!r}"
             )
+    # B13 transport failover: a channel's `backup` must name a real OTHER
+    # channel, and the backup CHAIN must not cycle. A cycle (A->B->A, or
+    # longer) is a load-time error -- at runtime PipeDrain._failover_target
+    # would otherwise have to defend against an infinite walk; catching it here
+    # keeps the runtime walk a simple "follow links to the first healthy one".
+    # Same silent-misroute class as every other cross-ref check: a `backup: psh`
+    # typo would never deliver and never complain without this gate.
+    for channel in lodging.channels.values():
+        if channel.backup is None:
+            continue
+        if channel.backup == channel.name:
+            errors.append(
+                f"channel {channel.name} backup references itself"
+            )
+            continue
+        if channel.backup not in lodging.channels:
+            errors.append(
+                f"channel {channel.name} backup references missing channel "
+                f"{channel.backup!r}"
+            )
+            continue
+        # Walk the chain from this channel; revisiting any channel already on
+        # the path is a cycle. `seen` seeds with the owner so a chain that
+        # loops back to its origin (A->B->A) is caught, not just a self-loop.
+        # A dangling mid-chain link is left to the owning channel's own
+        # missing-ref check above (it is reported once, when that channel is
+        # the loop subject), so we stop without double-reporting it here.
+        seen = {channel.name}
+        cursor: str | None = channel.backup
+        while cursor is not None:
+            if cursor in seen:
+                errors.append(
+                    f"channel {channel.name} backup chain cycles "
+                    f"(revisits {cursor!r})"
+                )
+                break
+            seen.add(cursor)
+            nxt = lodging.channels.get(cursor)
+            if nxt is None:
+                break
+            cursor = nxt.backup
     return errors
 
 
@@ -455,6 +506,12 @@ def parse_channel(path: Path) -> Channel:
         kind=str(kind),
         command=_required_str(data, "command", path),
         to=to,
+        # Optional B13 failover target. A present-but-empty/non-string value is
+        # a typo, not an omission, so _optional_str fails it loud rather than
+        # collapsing to None. The referential checks (exists / not-self / no
+        # cycle) need the WHOLE channel set and so live in validate_cross_refs,
+        # not here -- parse_channel sees one file at a time.
+        backup=_optional_str(data, "backup", path),
     )
     _assert_well_formed_env_markers(channel, path)
     return channel
