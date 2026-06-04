@@ -463,6 +463,29 @@ class PipeDrain:
                 # backstop that re-asserts the terminal state and keeps the
                 # delivered/undelivered reconciliation symmetric and explicit.
                 self.catalog.mark_pipe_items_dispatched(pipe.name, [finding_id])
+                # RUNG-3 RECOVERY EDGE (B14). Symmetric to the per-channel
+                # internal/dispatch clearance fired on a successful send (above):
+                # if this finding had previously exhausted its ladder (rung 3
+                # opened a durable internal/delivery incident keyed on its id),
+                # delivering its content NOW is the recovery that closes it. The
+                # one path that re-arms an exhausted ('failed') pipe_queues row
+                # for redelivery is `angelus replay <fid>` (catalog.replay_finding
+                # via the daemon _op_replay control op), which resets the row to
+                # 'pending' so it re-drains here -- that path exists and is wired
+                # today, so this clear edge is live, not a deferred seam. The B30
+                # gate drops this to a cheap no-op SELECT when no internal/delivery
+                # incident is open (the common case -- every delivered finding
+                # pays one query), and edge-closes the incident the instant the
+                # content is redelivered (by replay, or any future redelivery
+                # path). B15's dead-letter handling is a separate concern; this
+                # clearance does not depend on it. The entity is str(finding_id),
+                # matching write_internal_finding's key on the exhaustion edge.
+                self.catalog.write_internal_clearance(
+                    "internal/delivery",
+                    str(finding_id),
+                    f"{finding_id} redelivered",
+                    known_pipes,
+                )
             elif last_error is not None:
                 # No channel delivered it AND at least one channel was actually
                 # attempted (last_error set) -> the finding is undelivered;
@@ -472,9 +495,97 @@ class PipeDrain:
                 # moves a single step here. If every channel was SKIPPED as
                 # unhealthy (last_error is None) the row is left pending and
                 # untouched, exactly as the pre-fan path did.
-                self.catalog.record_pipe_finding_undelivered(
-                    pipe.name, finding_id, last_error
+                #
+                # The escalation ladder (B14), end to end, makes a delivery
+                # failure get LOUDER over time instead of looping quietly:
+                #   rung 1 -- retry with backoff (this counter + next_attempt_at);
+                #   rung 2 -- after a channel degrades, fail over to its backup
+                #             (the B13 block above, before this reconciliation);
+                #   rung 3 -- after the finding exhausts its retry budget WITHOUT
+                #             ever reaching ANY transport (primary or any backup),
+                #             page OUT-OF-BAND (below).
+                exhausted = self.catalog.record_pipe_finding_undelivered(
+                    pipe.name, finding_id, last_error, pipe.max_delivery_attempts
                 )
+                if exhausted and not _is_internal(row["source"]):
+                    # RUNG 3 (B14). This finding has walked the whole ladder --
+                    # retried to its per-pipe threshold and (since we are in the
+                    # `not delivered` reconciliation, NOT the delivered backstop
+                    # above) was never delivered over the primary OR any B13
+                    # failover backup. The daemon does not loop on it quietly: it
+                    # makes the loss impossible to miss.
+                    #
+                    # Out-of-band model 3 (decided): the daemon does NOT ping a
+                    # healthcheck itself and does NOT bypass the channel layer.
+                    # It emits a LOUD, DURABLE, finding-level signal; belfry --
+                    # which already pings ANGELUS_BELFRY_DOWN_URL off-box on each
+                    # tick when it sees an open internal/* incident (B1) -- is
+                    # what carries it out-of-band. The split holds: in-daemon
+                    # handles live errors, belfry owns the off-box page, and no
+                    # healthchecks dependency leaks into the daemon. The internal
+                    # finding fans to all channels via B7 (target_pipes=["now"]),
+                    # which is fine, but its LOAD-BEARING delivery is belfry --
+                    # by definition the channels here just failed.
+                    #
+                    # source/type are deliberately DISTINCT from the
+                    # internal/dispatch `channel_unhealthy` escalation raised in
+                    # the channel loop above. That one is per-CHANNEL and
+                    # transient -- "a transport is degraded", rung 2's edge. This
+                    # is per-FINDING and durable -- "we permanently gave up
+                    # delivering THIS content after the whole ladder", the louder
+                    # statement. A separate source (internal/delivery) keeps the
+                    # two cleanly partitioned for belfry/health/digest reads, and
+                    # the entity is the finding id so each lost item is tracked
+                    # and replayed individually.
+                    #
+                    # The emission is guarded on `not _is_internal(row["source"])`
+                    # for the same reason rung 2's failover is (the channel loop
+                    # above): an internal/* finding is angelus's OWN distress
+                    # signal, already fanned to every channel by B7 and already
+                    # carried off-box by belfry via its ORIGINAL internal incident.
+                    # If such a finding can't be delivered in a total outage, its
+                    # content is not "lost" -- its own alarm path is just down, and
+                    # belfry still pages on the original incident. Spawning a second
+                    # internal/delivery incident keyed on the internal finding's id
+                    # would be a false premise ("we lost this content"), would
+                    # pollute the source's meaning, and -- since an internal
+                    # finding has no separate redelivery path to clear it -- would
+                    # leave permanent cruft. So rung 3 fires only for product
+                    # content, exactly as rung 2 does.
+                    #
+                    # B30 emission gate: the (internal/delivery,
+                    # delivery_exhausted, finding_id) key opens ONE durable
+                    # incident on this exhaustion edge; a repeat for the same
+                    # finding while it is still open is dropped by the gate. The
+                    # incident stays open (keeps belfry red) until the content is
+                    # actually delivered -- it is NOT auto-cleared on a timer.
+                    #
+                    # RECOVERY EDGE (live, not a seam): the paired
+                    # write_internal_clearance("internal/delivery",
+                    # str(finding_id), ...) that closes this incident and re-arms
+                    # the gate fires in the `if delivered:` reconciliation branch
+                    # above. That branch runs whenever the content is redelivered,
+                    # and the path that re-arms an exhausted ('failed') row for
+                    # redelivery -- `angelus replay <fid>` (catalog.replay_finding
+                    # via the daemon _op_replay control op) -- exists and is wired
+                    # today. So the clear edge is built: any successful redelivery
+                    # closes this incident. B15's dead-letter handling remains a
+                    # separate concern, but the clear edge does not wait on it.
+                    LOGGER.error(
+                        "pipe %s: finding %s exhausted its delivery ladder "
+                        "undelivered over every transport; paging out-of-band "
+                        "(internal/delivery incident); last error: %s",
+                        pipe.name,
+                        finding_id,
+                        last_error,
+                    )
+                    self.catalog.write_internal_finding(
+                        "internal/delivery",
+                        "delivery_exhausted",
+                        str(finding_id),
+                        f"pipe={pipe.name} last_error={last_error}",
+                        known_pipes,
+                    )
 
     def _dispatch_channels(
         self,
@@ -757,6 +868,43 @@ class PipeDrain:
                 )
         if any_channel_succeeded:
             self.catalog.mark_pipe_items_dispatched(pipe.name, finding_ids)
+            # RUNG-3 RECOVERY EDGE via the DIGEST fallback (B14). Symmetric to the
+            # `if delivered:` clearance on the immediate path (_drain_immediate),
+            # but for the OTHER way an exhausted finding's content can finally
+            # reach the user: the rate-limit overflow. A product finding that
+            # exhausted its immediate ladder opened a durable per-FINDING
+            # internal/delivery incident (entity = its id). When `angelus replay`
+            # re-arms it, the next `now` drain may find it over the rate limit and
+            # suppress_pipe_item_to-shunt it onto THIS digest pipe (overflow:
+            # daily); the digest then actually delivers the content. That is a
+            # genuine recovery -- the user received it -- so the rung-3 incident
+            # must close here too, or it stays open forever and belfry stays red
+            # after a real delivery (the exact bug the immediate-path edge fixed,
+            # reached by the overflow path instead).
+            #
+            # Per-FINDING, not per-pipe: the internal/render and internal/dispatch
+            # clearances above are keyed on the PIPE / the CHANNEL (one incident
+            # per render surface / per transport), so they fire once. But
+            # internal/delivery is keyed on the FINDING id -- each abandoned item
+            # has its own incident -- so the clearance must fire once per finding
+            # this digest actually delivered, not once for the pipe. finding_ids
+            # is exactly that set (the same ids just marked dispatched), and the
+            # `if any_channel_succeeded:` guard scopes this to a real delivery:
+            # nothing clears on a digest send FAILURE (that path records a failed
+            # dispatch and never reaches here). The B30 recovery gate drops each
+            # call to a no-op SELECT when no internal/delivery incident is open
+            # for that finding -- so the common case (a digest of never-exhausted
+            # findings) pays only one cheap query per item. entity=str(finding_id)
+            # + source=internal/delivery means the clearance can only ever close
+            # the matching rung-3 incident; it cannot touch the digest pipe's own
+            # internal findings or any other source.
+            for finding_id in finding_ids:
+                self.catalog.write_internal_clearance(
+                    "internal/delivery",
+                    str(finding_id),
+                    f"{finding_id} redelivered via digest",
+                    known_pipes,
+                )
             self.catalog.mark_pipe_drained(pipe.name, drained_at)
             # Dead-man heartbeat: the digest demonstrably went out on at least
             # one channel this cycle, so ping the off-box check. A missing ping

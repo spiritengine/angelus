@@ -259,6 +259,72 @@ The script alerts when the sentinel is missing or older than
 dependency check or any new angelus product behavior; the operator owns the
 outermost watchdog wiring.
 
+### Escalation ladder
+
+A delivery failure gets **louder** over time instead of looping quietly. The
+immediate (`now`) path walks a three-rung ladder, each rung a strictly louder
+statement than the last:
+
+1. **Retry with backoff.** An undelivered finding advances a per-*finding*
+   redelivery counter (`pipe_queues.attempts` + `next_attempt_at`) and is
+   retried on a backoff schedule. A transient blip recovers here and never
+   escalates.
+2. **Fail over to an alternate channel.** Once a *channel* degrades (it crosses
+   its per-channel failure threshold, or is already marked unhealthy), the
+   runner delivers the finding over that channel's configured `backup`, so the
+   content still gets out this drain while the degraded channel is alarmed
+   separately (the `internal/dispatch` `channel_unhealthy` incident). This is
+   the B13 transport failover; the backup chain is followed to the first healthy
+   channel.
+3. **Page out-of-band.** When a *product* finding exhausts its retry budget
+   *without ever reaching any transport* — the primary and every backup failed —
+   the daemon gives up on that content and makes the loss impossible to miss: it
+   logs an ERROR and raises a **distinct, durable** internal finding
+   (`internal/delivery` / `delivery_exhausted`, entity = the finding id, so each
+   lost item is tracked and replayable individually). That opens an incident
+   that stays open — keeping belfry red — until the content is actually
+   delivered; it is **not** auto-cleared on a timer. Rung 3 fires only for
+   product content: an `internal/*` finding (angelus's own distress signal) is
+   excluded, exactly as it is from rung 2's failover — it already fans to every
+   channel via B7 and belfry already carries its original incident off-box, so a
+   second `internal/delivery` incident would be a false "content lost" premise
+   with no redelivery path of its own to ever clear it.
+
+Rung 3 is deliberately distinct from rung 2's `channel_unhealthy` alarm:
+`channel_unhealthy` says "a transport is degraded" (transient, per-channel),
+while `delivery_exhausted` says "we permanently gave up delivering this content
+after the whole ladder" (durable, per-finding) — the louder statement, on its
+own source so belfry, health, and the digest can tell them apart.
+
+**Out-of-band model.** The daemon does **not** ping a healthcheck itself or
+bypass the channel layer for rung 3. It emits the durable finding-level signal;
+**belfry** — which already pings `ANGELUS_BELFRY_DOWN_URL` off-box on each tick
+whenever it sees an open `internal/*` incident — is what carries it out-of-band.
+This keeps the two-tier split intact (the in-daemon path handles live errors,
+belfry owns the off-box page) and keeps any healthchecks dependency out of the
+daemon. The rung-3 finding also fans to every channel via the internal-findings
+fan, but its load-bearing delivery is belfry: by definition the channels just
+failed.
+
+**Configurable threshold.** The rung-3 give-up point is a per-pipe field,
+`max_delivery_attempts` in `pipes/<name>.yaml`, so a pipe tunes how patient its
+redelivery ladder is before it exhausts and pages out-of-band. Unset, it
+defaults to the shared retry constant (5), so behaviour is unchanged. The field
+tunes only the per-finding redelivery ladder — the per-channel health
+thresholds that trigger rung 2 stay on the shared constant, since "how patient
+am I about one finding's delivery" is a different question from "when is a
+transport degraded".
+
+**Recovery edge (live).** The `delivery_exhausted` incident closes when the
+exhausted content is actually re-delivered: the `now`-path reconciliation fires a
+paired `internal/delivery` clearance on every successful delivery (a no-op under
+the B30 gate unless an incident is open), so the incident auto-closes the instant
+the content gets out. The path that re-arms an exhausted (`failed`) queue row for
+redelivery — `angelus replay <fid>` (`catalog.replay_finding` via the daemon's
+`_op_replay` control op) — exists and is wired today, so this clear edge is
+built, not deferred. B15's dead-letter handling remains a separate concern; the
+clear edge does not wait on it.
+
 ### Autoremediation (fixers)
 
 Detection makes a failure loud; a **fixer** lets the daemon *act* on one. A

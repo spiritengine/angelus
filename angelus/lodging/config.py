@@ -84,6 +84,20 @@ class Pipe:
     # immediate `now` pipe, which delivers on demand and has no cadence to lapse
     # against). Declared in YAML as `max_interval: 27h`.
     max_interval_seconds: int | None = None
+    # B14 escalation ladder, rung-3 threshold: how many undelivered drains a
+    # finding's per-FINDING redelivery ladder tolerates before it EXHAUSTS --
+    # the pipe_queues row goes status='failed' and the daemon pages out-of-band
+    # (a durable internal/delivery incident belfry carries off-box). This tunes
+    # ONLY the per-finding redelivery ladder in
+    # Catalog.record_pipe_finding_undelivered -- the rung the ladder actually
+    # walks to give up on a piece of content. None means "use the catalog
+    # default" (MAX_RETRY_ATTEMPTS=5), so behaviour is unchanged when a pipe
+    # omits it; a pipe widens its patience with `max_delivery_attempts: 8`.
+    # Named to NOT collide with a Fixer.max_attempts (a per-condition
+    # remediation budget) or this Pipe's max_interval_seconds (the B2
+    # delivery-SLA window) -- this is the per-finding retry COUNT on the
+    # immediate path, a third, distinct knob.
+    max_delivery_attempts: int | None = None
 
 
 @dataclass(frozen=True)
@@ -450,6 +464,13 @@ def parse_pipe(path: Path) -> Pipe:
         render=render,
         rate_limit=dict(data.get("rate_limit") or {}),
         max_interval_seconds=_optional_sla_interval(data, path),
+        # B14: optional per-pipe rung-3 threshold. _optional_positive_int is the
+        # validation -- a present-but-non-positive value (0, a float, a bool, a
+        # string) fails the load loudly rather than silently disabling the
+        # ladder's give-up point, exactly like max_interval. It references no
+        # other lodging entry, so there is nothing for validate_cross_refs to
+        # check; the scalar shape constraint enforced here is the whole gate.
+        max_delivery_attempts=_optional_positive_int(data, "max_delivery_attempts", path),
     )
 
 
@@ -813,6 +834,23 @@ def _optional_str(data: dict[str, Any], key: str, path: Path) -> str | None:
 def _required_positive_int(data: dict[str, Any], key: str, path: Path) -> int:
     value = data.get(key)
     # bool is an int subclass; `True`/`False` here is a YAML typo, not a count.
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{path}: expected positive integer {key}")
+    return value
+
+
+def _optional_positive_int(data: dict[str, Any], key: str, path: Path) -> int | None:
+    """Return a positive integer value for `key`, or None when absent.
+
+    Mirrors _required_positive_int's guards (bool is an int subclass, so a YAML
+    `true`/`false` is rejected as a typo, not read as 1/0) but optional: an
+    absent key collapses to None (the caller resolves the default), while a
+    present-but-non-positive value fails loud. Used for B14's
+    max_delivery_attempts, where None means "fall back to the catalog default".
+    """
+    if key not in data:
+        return None
+    value = data[key]
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{path}: expected positive integer {key}")
     return value
