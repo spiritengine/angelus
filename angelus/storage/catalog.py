@@ -704,6 +704,62 @@ class Catalog:
         ).fetchone()
         return int(row["n"])
 
+    def dead_letter_count(self) -> int:
+        """Count of pipe_queues rows in the terminal 'dead_letter' state (B15).
+
+        The system's "how much content have we permanently given up delivering"
+        tally for the health surface. Distinct from failed_dispatch_count, which
+        counts transient per-CHANNEL dispatches.status='failed' rows in a recent
+        window: a dead_letter row is a per-FINDING give-up that persists until
+        the finding is replayed and redelivered. Read-only.
+        """
+        row = self.connection.execute(
+            "SELECT COUNT(*) AS n FROM pipe_queues WHERE status = 'dead_letter'"
+        ).fetchone()
+        return int(row["n"])
+
+    def dead_letter_items(self, limit: int | None = None) -> list[dict[str, Any]]:
+        """Findings whose pipe_queues row exhausted its redelivery ladder and
+        landed in the terminal 'dead_letter' state (B15). Read-only.
+
+        Each row carries enough to be ACTIONABLE without a second lookup: which
+        finding (finding_id) and what it is (source/type/entity/severity), which
+        pipe abandoned it, the last delivery error, how many attempts were burned,
+        and WHEN it dead-lettered. dead_lettered_at is pq.updated_at -- the
+        exhaustion edge in record_pipe_finding_undelivered sets
+        status='dead_letter' and stamps updated_at in the same UPDATE, and no
+        other transition writes a dead_letter row, so updated_at on a dead_letter
+        row is exactly the moment it was abandoned.
+
+        Ordered oldest-abandoned-first (by the queue row's created_at, then
+        finding_id) so the longest-stuck item -- the one most overdue for a
+        replay -- reads first. `limit` caps the rows for a bounded health render;
+        None returns all (the count, surfaced separately, conveys the true total).
+        """
+        limit_sql = "" if limit is None else "LIMIT ?"
+        params: tuple[Any, ...] = () if limit is None else (limit,)
+        rows = self.connection.execute(
+            f"""
+            SELECT
+                pq.finding_id AS finding_id,
+                pq.pipe AS pipe,
+                pq.last_error AS last_error,
+                pq.attempts AS attempts,
+                pq.updated_at AS dead_lettered_at,
+                f.source AS source,
+                f.type AS type,
+                f.entity AS entity,
+                f.severity AS severity
+            FROM pipe_queues pq
+            JOIN findings f ON f.id = pq.finding_id
+            WHERE pq.status = 'dead_letter'
+            ORDER BY pq.created_at, pq.finding_id
+            {limit_sql}
+            """,
+            params,
+        )
+        return [dict(row) for row in rows]
+
     def recently_closed_incidents(self, days: int = 7) -> list[dict[str, Any]]:
         """Incidents closed within the last `days` days (default 7).
         Read-only; a plain SELECT, no write."""
@@ -844,7 +900,7 @@ class Catalog:
 
         This is rung 1 of the B14 escalation ladder (retry with backoff) AND the
         gate to rung 3: the True return -- a finding that has crossed the
-        threshold to status='failed' WITHOUT ever being delivered over any
+        threshold to status='dead_letter' WITHOUT ever being delivered over any
         transport -- is the load-bearing hook the runner turns into the
         out-of-band page (PipeDrain._drain_immediate raises the durable
         internal/delivery `delivery_exhausted` incident on exactly this edge).
@@ -882,8 +938,16 @@ class Catalog:
         moved to the per-channel counter).
 
         Returns True when the finding has exhausted its redelivery attempts
-        (status -> 'failed', so pending_pipe_items drops it); False when it
-        stays retryable with next_attempt_at set to the backoff schedule.
+        (status -> 'dead_letter' (B15), the explicit terminal state, so
+        pending_pipe_items drops it); False when it stays retryable with
+        next_attempt_at set to the backoff schedule.
+
+        B15: the exhaustion-terminal is 'dead_letter', NOT the old 'failed'.
+        'failed' on pipe_queues was indistinguishable from the dispatches
+        table's transient per-channel 'failed'; 'dead_letter' names the give-up
+        state so health/belfry can surface it and `angelus replay` can re-arm
+        it. The state transition is the only change here -- the ladder
+        arithmetic, the per-finding grain, and the rung-3 hook are unchanged.
         """
         row = self.connection.execute(
             """
@@ -903,7 +967,7 @@ class Catalog:
                 SET attempts = ?,
                     last_error = ?,
                     next_attempt_at = NULL,
-                    status = 'failed',
+                    status = 'dead_letter',
                     updated_at = ?
                 WHERE finding_id = ? AND pipe = ?
                 """,
@@ -1525,8 +1589,11 @@ class Catalog:
         Idempotency guard (mandatory): a (finding, pipe) that is already
         'pending' is left untouched -- a double replay before any drain
         therefore does not double-queue. A row in any other state
-        (dispatched/failed/suppressed) is reset to 'pending' so the
-        finding is genuinely re-dispatched; a missing row is inserted.
+        (dispatched/dead_letter/suppressed) is reset to 'pending' so the
+        finding is genuinely re-dispatched; a missing row is inserted. The
+        reset is generic ("status != 'pending'"), so a B15 dead-lettered row
+        re-arms here exactly as the old 'failed' terminal did -- replay is the
+        one path that pulls content back out of dead-letter.
         """
         frow = self.connection.execute(
             "SELECT target_pipes FROM findings WHERE id = ?", (finding_id,)

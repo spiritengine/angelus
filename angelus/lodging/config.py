@@ -86,7 +86,7 @@ class Pipe:
     max_interval_seconds: int | None = None
     # B14 escalation ladder, rung-3 threshold: how many undelivered drains a
     # finding's per-FINDING redelivery ladder tolerates before it EXHAUSTS --
-    # the pipe_queues row goes status='failed' and the daemon pages out-of-band
+    # the pipe_queues row goes status='dead_letter' (B15) and the daemon pages out-of-band
     # (a durable internal/delivery incident belfry carries off-box). This tunes
     # ONLY the per-finding redelivery ladder in
     # Catalog.record_pipe_finding_undelivered -- the rung the ladder actually

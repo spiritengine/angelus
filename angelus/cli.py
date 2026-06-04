@@ -583,6 +583,37 @@ def _render_delivery(delivery: dict[str, Any]) -> None:
     click.echo(
         f"  open internal incidents: {delivery.get('open_internal_incidents', 0)}"
     )
+    _render_dead_letter(delivery.get("dead_letter") or {})
+
+
+def _render_dead_letter(dead_letter: dict[str, Any]) -> None:
+    """Dead-letter section of the delivery surface (B15): findings whose
+    redelivery ladder exhausted undelivered now sit in the terminal
+    'dead_letter' state. Surfaces WHAT was abandoned and how to recover it
+    (`angelus replay <finding_id>`) so an exhausted dispatch is loud and
+    replayable, not silently pending -- the 2026-05-29 anti-pattern.
+
+    Plain text, one item per line, screen-reader friendly (no tables/columns):
+    a human-readable description first, the finding id last, matching the rest
+    of the delivery surface. The count is the true total; the item list is
+    capped upstream (HEALTH_DEAD_LETTER_DISPLAY_LIMIT), so a count exceeding the
+    rendered rows tells the operator more are dead-lettered than shown.
+    """
+    count = dead_letter.get("count", 0)
+    click.echo(f"  dead-letter (exhausted, replayable): {count}")
+    for item in dead_letter.get("items") or []:
+        entity = item.get("entity") or "?"
+        ftype = item.get("type") or "?"
+        pipe = item.get("pipe") or "?"
+        last_error = item.get("last_error") or "no error recorded"
+        finding_id = item.get("finding_id")
+        # Description first, then the actionable replay id last -- a screen
+        # reader reads the id at the end, and `angelus replay <id>` is the
+        # recovery the line points the operator to.
+        click.echo(
+            f"    {entity} {ftype} on {pipe}, last error: {last_error}; "
+            f"replay finding {finding_id}"
+        )
 
 
 def _render_belfry(belfry: dict[str, Any] | None) -> None:

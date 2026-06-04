@@ -43,6 +43,12 @@ DEFAULT_BELFRY_STALE_AFTER_SEC = 1200
 # from the open-internal-incident tally (which can persist across the window).
 HEALTH_FAILED_DISPATCH_WINDOW_HOURS = 24
 
+# Cap on the dead-letter items the health surface renders inline (B15). The
+# count is always exact; this only bounds the per-item detail list so a large
+# backlog cannot flood the screen-reader output. The longest-stuck items sort
+# first, so the cap drops the freshest rather than the most overdue.
+HEALTH_DEAD_LETTER_DISPLAY_LIMIT = 20
+
 # Internal incident sources reconciled at daemon startup. Each recovers only
 # off a live edge a restart can skip, so an incident open across a restart
 # orphans and the B30 gate then suppresses the next genuine failure. See
@@ -1301,6 +1307,11 @@ def _delivery_surface(catalog: Catalog, pipe_names: list[str]) -> dict:
       2026-05-29 incident hid).
     - failed_dispatches: count of failed dispatches in the recent window.
     - open_internal_incidents: angelus's own open self-reported failures.
+    - dead_letter: findings whose redelivery ladder exhausted undelivered and
+      now sit in the terminal 'dead_letter' state (B15) -- WHAT was abandoned
+      (so an operator can `angelus replay <id>` it) plus the true total count.
+      This is the "surface loudly, not silently pending" answer the 2026-05-29
+      incident demanded: 9/10 findings sat 'pending' with nothing showing it.
     """
     last_sent = catalog.last_successful_dispatch_per_pipe()
     return {
@@ -1314,6 +1325,12 @@ def _delivery_surface(catalog: Catalog, pipe_names: list[str]) -> dict:
             ),
         },
         "open_internal_incidents": catalog.open_internal_incident_count(),
+        "dead_letter": {
+            "count": catalog.dead_letter_count(),
+            "items": catalog.dead_letter_items(
+                limit=HEALTH_DEAD_LETTER_DISPLAY_LIMIT
+            ),
+        },
     }
 
 

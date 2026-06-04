@@ -234,7 +234,10 @@ def test_dispatch_retry_schedule_and_internal_finding(tmp_path, monkeypatch) -> 
         connection.close()
 
     assert queue["attempts"] == 5
-    assert queue["status"] == "failed"
+    # B15: the per-finding exhaustion terminal on pipe_queues is now
+    # 'dead_letter' (renamed from the ambiguous 'failed'), set by
+    # record_pipe_finding_undelivered when the redelivery ladder gives up.
+    assert queue["status"] == "dead_letter"
     assert queue["next_attempt_at"] is None
     assert health["status"] == "unhealthy"
     assert health["last_error"] == "push broke"
