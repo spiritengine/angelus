@@ -19,7 +19,11 @@ These tests pin:
   - a backup that is also unhealthy is not delivered to -- the finding stays
     retryable, no crash;
   - the cross-ref validation (missing backup, self-backup, cycle) fails the load;
-  - internal findings are unaffected -- still fan, no failover double-handling.
+  - internal findings are unaffected -- still fan, no failover double-handling;
+  - the MULTI-channel double-delivery cases the single-channel tests above can't
+    reach: a backup that is also a primary is paged once, two degraded primaries
+    sharing one backup page it once, and a co-routed primary that already
+    delivered suppresses a degraded primary's failover.
 """
 
 from __future__ import annotations
@@ -254,12 +258,23 @@ def test_already_unhealthy_primary_routes_straight_to_backup(
 
 
 def test_no_double_delivery_when_primary_succeeds(tmp_path, monkeypatch) -> None:
-    """email (healthy) delivers the finding; push (its backup) is never invoked.
+    """email (healthy, the pipe's SOLE channel) delivers the finding; push (its
+    backup) is never invoked.
 
-    Discrimination: a failover that ran unconditionally -- rather than only when
-    the finding is still undelivered -- would also send over push, so
-    push.calls == [] is the load-bearing assertion. A single push 'sent' row
-    would mean the finding paged twice.
+    This pins the single-channel happy path: the lone primary delivers and no
+    backup is touched. It does NOT discriminate the `not delivered` failover
+    gate -- email succeeds, so no channel is ever degraded, degraded_primaries
+    stays empty, and `if not delivered and degraded_primaries:` short-circuits on
+    the empty list before `not delivered` is ever the deciding term. A mutant
+    that dropped `not delivered` (failing over whenever degraded_primaries is
+    non-empty) would still pass here, because there is nothing in
+    degraded_primaries to fail over. The test that actually exercises that gate
+    -- a co-routed primary that already delivered while another primary is
+    degraded -- is test_co_routed_primary_delivers_suppresses_failover.
+
+    Discrimination here: push.calls == [] / _sent_count(push) == 0 invert only if
+    a backup is paged on the plain single-channel success path -- a duplicate
+    page with no degraded channel in sight.
     """
     catalog, drain = _drain(tmp_path)
     push = _Recorder()
@@ -402,6 +417,200 @@ def test_internal_findings_unaffected_by_failover(tmp_path, monkeypatch) -> None
     # No NEW degraded-channel alarm: email was already unhealthy, and the
     # internal finding's skip does not re-alarm or fail over.
     assert _escalation_entities(catalog) == []
+
+
+# --------------------------------------------------------------------------
+# (g) MULTI-channel pipes. Every test above routes `now` to a SINGLE channel
+#     (email), so the failover walk never has to reason about a backup that is
+#     ALSO a primary, two primaries sharing one backup, or a co-routed primary
+#     that already delivered. Those are the double-delivery cases: the contract
+#     is ">=1 delivery", never a duplicate page, and a duplicate page is exactly
+#     what a wrong failover produces when more than one channel is in play. The
+#     three guards that hold the line are the outer `if not delivered` gate, the
+#     in-loop `if delivered: break`, and the `attempted`-set skip in
+#     _failover_target; these tests put a multi-channel pipe through each shape
+#     and pin "the shared backup is paged exactly once".
+# --------------------------------------------------------------------------
+
+
+def _multi_channel_drain(
+    tmp_path, channels: dict[str, Channel], channel_names: list[str]
+) -> tuple[Catalog, PipeDrain]:
+    """A now-pipe drain routing to `channel_names` (in order) over `channels`."""
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    pipe = Pipe(
+        name="now",
+        cadence="immediate",
+        render_kind="dumb-alert",
+        template=ALERT_PIPE.template,
+        channels=channel_names,
+    )
+    drain = PipeDrain(catalog, pipe, channels, tmp_path, {"now"})
+    return catalog, drain
+
+
+# --------------------------------------------------------------------------
+# (g1) The backup is ALSO a primary. `now` routes to [push, email] with
+#      email.backup=push. push is healthy and delivers as a primary; email is
+#      degraded and would fail a finding over to push -- but push has already
+#      paged this finding, so it must NOT be paged a second time as the backup.
+# --------------------------------------------------------------------------
+
+
+def test_failover_backup_that_is_also_a_primary_paged_once(tmp_path, monkeypatch) -> None:
+    """[push, email], email.backup=push, push healthy, email already unhealthy.
+
+    push delivers the finding as a primary; email is skipped and queued for
+    failover to its push backup. Because the finding is already delivered (and
+    push is already in the attempted set), push is paged EXACTLY once -- never
+    again as email's backup. This is the case the single-channel suite could not
+    reach: a channel that is simultaneously a primary AND another channel's
+    failover target.
+
+    Discrimination: push.calls == ["push"] and _sent_count(push) == 1 invert to
+    a duplicate page if the failover re-routes to push. The three guards stand
+    in front of that duplicate -- the outer `not delivered` gate (the finding is
+    already out), the in-loop `if delivered` break, and the attempted-set skip
+    (push was already attempted) -- and the mutation proofs in the shard summary
+    show push doubles only once ALL of them are removed.
+    """
+    channels = {
+        "push": Channel(name="push", kind="push", command="notify-pat"),
+        "email": Channel(
+            name="email", kind="email", command="patbot-email", to="x@e", backup="push"
+        ),
+    }
+    catalog, drain = _multi_channel_drain(tmp_path, channels, ["push", "email"])
+    push = _Recorder()
+    email = _Recorder(fail=True)  # would fail if attempted -- it is skipped
+    monkeypatch.setattr(pipe_runner, "send_push", push)
+    monkeypatch.setattr(pipe_runner, "send_email", email)
+
+    catalog.mark_channel_unhealthy("email", "smtp route down")  # email degraded
+    finding_id = _write_finding(catalog, "example.com")
+    asyncio.run(drain.drain_once())
+
+    assert email.calls == [], "the degraded primary is skipped, not attempted"
+    assert push.calls == ["push"], "push paged once as primary, never again as backup"
+    assert _sent_count(catalog, "push") == 1
+    assert _queue_status(catalog, finding_id) == "dispatched"
+
+
+# --------------------------------------------------------------------------
+# (g2) Two degraded primaries share ONE backup. `now` routes to [email, sms]
+#      (sms a distinct push-kind channel), both degraded, both backup=push.
+#      The finding fails over to push -- but ONCE, not once per degraded primary.
+# --------------------------------------------------------------------------
+
+
+def test_overlapping_degraded_primaries_share_backup_paged_once(
+    tmp_path, monkeypatch
+) -> None:
+    """[email, sms] both already unhealthy, both backup=push, push healthy.
+
+    Both primaries are skipped and both are queued for failover to the SAME
+    backup (push). The first failover delivers; the second must see the finding
+    already delivered (and push already attempted) and not page push again. The
+    finding is one event, so push pages once -- not once per degraded primary.
+
+    sms is a push-kind channel (a distinct name, _send_channel routes push/email
+    only), so it would deliver over the shared send_push double if it were ever
+    attempted; it is unhealthy and thus skipped, so the only send_push call is
+    the single push failover.
+
+    Discrimination: push.calls == ["push"] and _sent_count(push) == 1 invert to
+    ["push", "push"] / 2 if the loop fails each degraded primary over
+    independently. Holding the line to one are the in-loop `if delivered` break
+    and the attempted-set skip; the mutation proofs show push doubles when both
+    are removed.
+    """
+    channels = {
+        "email": Channel(
+            name="email", kind="email", command="patbot-email", to="x@e", backup="push"
+        ),
+        "sms": Channel(name="sms", kind="push", command="notify-sms", backup="push"),
+        "push": Channel(name="push", kind="push", command="notify-pat"),
+    }
+    catalog, drain = _multi_channel_drain(tmp_path, channels, ["email", "sms"])
+    push = _Recorder()
+    email = _Recorder(fail=True)  # skipped (unhealthy); would fail if attempted
+    monkeypatch.setattr(pipe_runner, "send_push", push)  # push AND sms are push-kind
+    monkeypatch.setattr(pipe_runner, "send_email", email)
+
+    catalog.mark_channel_unhealthy("email", "smtp down")
+    catalog.mark_channel_unhealthy("sms", "sms gateway down")
+    finding_id = _write_finding(catalog, "example.com")
+    asyncio.run(drain.drain_once())
+
+    assert email.calls == [], "the degraded email primary is skipped"
+    assert push.calls == ["push"], "the shared backup is paged once, not once per primary"
+    assert _sent_count(catalog, "push") == 1
+    assert _queue_status(catalog, finding_id) == "dispatched"
+
+
+# --------------------------------------------------------------------------
+# (g3) A co-routed primary delivers while another primary is degraded. `now`
+#      routes to [push, email]; push delivers, email is degraded with a backup
+#      (pager) that is a DISTINCT healthy channel -- NOT the one that already
+#      delivered. email's failover is SUPPRESSED because the finding is already
+#      out, so pager is never paged. This is the scenario where the `not
+#      delivered` gate is reached with degraded_primaries non-empty -- the
+#      discriminator the single-channel success test
+#      (test_no_double_delivery_when_primary_succeeds) cannot be, because there
+#      the lone primary succeeds and degraded_primaries is empty, so the gate is
+#      never evaluated at all.
+#
+#      The backup is deliberately a DISTINCT channel rather than the delivering
+#      push: were it push, the attempted-set skip in _failover_target would be a
+#      third, redundant guard masking the `not delivered` gate, and the gate
+#      could no longer be shown load-bearing. With a distinct healthy pager, the
+#      `not delivered` gate (and its in-loop `if delivered: break` twin) is the
+#      only thing standing between "delivered once" and "paged on pager too", so
+#      dropping that guard produces a real second page here.
+# --------------------------------------------------------------------------
+
+
+def test_co_routed_primary_delivers_suppresses_failover(tmp_path, monkeypatch) -> None:
+    """[push, email], email.backup=pager (distinct, healthy), push delivers.
+
+    Unlike the single-channel success test, here a degraded primary (email) IS
+    present, so degraded_primaries is non-empty when the failover block is
+    reached -- and the finding is already delivered by push. The `not delivered`
+    gate suppresses email's failover to pager; with a lone successful channel
+    that gate is never reached because degraded_primaries is empty. So this is
+    the test that actually exercises the "already delivered, do not fail over"
+    path.
+
+    pager shares push's send_push double (both push-kind), so a wrongful failover
+    surfaces as a second recorder call named "pager".
+
+    Discrimination: push.calls == ["push"] (only the primary send, no "pager")
+    and _sent_count(catalog, "pager") == 0 invert to a duplicate page if a
+    degraded co-routed primary fails over even though the finding is already out.
+    """
+    channels = {
+        "push": Channel(name="push", kind="push", command="notify-pat"),
+        "email": Channel(
+            name="email", kind="email", command="patbot-email", to="x@e", backup="pager"
+        ),
+        "pager": Channel(name="pager", kind="push", command="notify-pager"),
+    }
+    catalog, drain = _multi_channel_drain(tmp_path, channels, ["push", "email"])
+    push = _Recorder()  # push AND pager are push-kind -> share this double
+    email = _Recorder(fail=True)  # degraded -- skipped, would fail if attempted
+    monkeypatch.setattr(pipe_runner, "send_push", push)
+    monkeypatch.setattr(pipe_runner, "send_email", email)
+
+    catalog.mark_channel_unhealthy("email", "smtp down")  # email degraded
+    finding_id = _write_finding(catalog, "example.com")
+    asyncio.run(drain.drain_once())
+
+    assert email.calls == [], "the degraded co-routed primary is skipped"
+    assert push.calls == ["push"], "push delivered once; pager never paged (failover suppressed)"
+    assert _sent_count(catalog, "push") == 1
+    assert _sent_count(catalog, "pager") == 0
+    assert _queue_status(catalog, finding_id) == "dispatched"
 
 
 # --------------------------------------------------------------------------
