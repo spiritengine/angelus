@@ -43,10 +43,11 @@ import pytest
 
 import angelus.pipes.runner as pipe_runner
 from angelus.clock import FakeClock
+from angelus.daemon import _RESTART_RECONCILED_INTERNAL_SOURCES, AngelusDaemon
 from angelus.lodging import Channel, Pipe
 from angelus.pipes import PipeDrain
 from angelus.storage import Catalog, init_db
-from angelus.storage.catalog import MAX_RETRY_ATTEMPTS
+from angelus.storage.catalog import MAX_RETRY_ATTEMPTS, TRUST_RETRY_DELAYS
 
 PINNED = datetime(2026, 1, 15, 12, 0, 0, tzinfo=UTC)
 
@@ -464,3 +465,278 @@ def test_belfry_surfaces_rung3_incident_off_box(tmp_path, monkeypatch) -> None:
     reason = belfry.failure_surface(db_path, state_path)
     assert reason is not None, "belfry must surface the open rung-3 incident as DOWN"
     assert "internal/delivery" in reason
+
+
+def _delivery_incident_open(catalog: Catalog, finding_id: int) -> bool:
+    """Is the rung-3 internal/delivery incident for this finding currently open?"""
+    return ("internal/delivery", "delivery_exhausted", str(finding_id)) in _open_incidents(
+        catalog
+    )
+
+
+def _write_lodging(root: Path) -> None:
+    """On-disk lodging for the restart test, which needs a real AngelusDaemon to
+    run its actual startup orphan-reconcile (_reconcile_orphaned_internal_
+    incidents). Mirrors the minimal now(push)+daily(email) shape the other
+    daemon-level tests use; the daemon keeps its catalog under root/state, so it
+    is independent of the _solo_drain catalogs above."""
+    (root / "sources" / "scheduled").mkdir(parents=True)
+    (root / "sources" / "scheduled" / "watch.yaml").write_text(
+        "cadence: 1h\ncheck:\n  kind: shell\n  command: 'echo {}'\n", encoding="utf-8"
+    )
+    (root / "pipes").mkdir()
+    (root / "pipes" / "now.yaml").write_text(
+        "cadence: immediate\nchannels: [push]\n"
+        "render:\n  kind: dumb-alert\n  template: '{type}:{entity}:{body}'\n",
+        encoding="utf-8",
+    )
+    (root / "pipes" / "daily.yaml").write_text(
+        "cadence: '0 8 * * *'\nchannels: [email]\n"
+        "render:\n  kind: dumb-alert\n  template: '{type}:{entity}:{body}'\n",
+        encoding="utf-8",
+    )
+    (root / "channels").mkdir()
+    (root / "channels" / "push.yaml").write_text(
+        "kind: push\ncommand: 'true'\n", encoding="utf-8"
+    )
+    (root / "channels" / "email.yaml").write_text(
+        "kind: email\ncommand: 'true'\nto: person@example.com\n", encoding="utf-8"
+    )
+
+
+# --------------------------------------------------------------------------
+# (g) Recovery edge (LIVE, not a deferred seam): replaying an exhausted finding
+#     re-delivers its content, and the `if delivered:` reconciliation fires the
+#     paired internal/delivery clearance that closes the rung-3 incident. This is
+#     the edge Finding 1 of the fell adds; before the fix the incident stays open
+#     forever even after the content is successfully re-delivered.
+# --------------------------------------------------------------------------
+
+
+def test_replay_redelivers_and_clears_incident(tmp_path, monkeypatch) -> None:
+    """A finding exhausts to rung 3 (durable internal/delivery incident open),
+    then the live `angelus replay <fid>` path (catalog.replay_finding, which the
+    daemon _op_replay control op wraps) resets its failed queue row to pending.
+    The channel recovers, the next drain delivers the content, and the
+    `if delivered:` reconciliation clears the incident -- belfry goes green.
+
+    max_delivery_attempts=2 exhausts the per-FINDING ladder at the 2nd drain
+    while the per-CHANNEL counter is still at 2 (< 5), so email is NOT marked
+    unhealthy. That matters: on the post-replay drain email must be eligible
+    (a healthy channel) so the redelivery actually happens -- the whole point of
+    the clear edge.
+
+    Discrimination: the incident is asserted OPEN after exhaustion and CLOSED
+    after the replayed redelivery. Before Finding 1's fix the `if delivered:`
+    branch wrote no clearance, so the incident would still be open here and the
+    final assertion inverts -- the exact "belfry stays red forever after a
+    successful recovery" defect this pins.
+    """
+    catalog, drain, clock = _solo_drain(tmp_path, max_delivery_attempts=2)
+    email = _Recorder(fail=True)  # down through exhaustion, healed before replay
+    monkeypatch.setattr(pipe_runner, "send_email", email)
+    monkeypatch.setattr(pipe_runner, "send_push", _Recorder())
+
+    finding_id = _walk_to_exhaustion(catalog, drain, clock, "example.com", 2)
+    assert _queue_status(catalog, finding_id) == "failed", "the finding exhausted"
+    assert _delivery_incident_open(catalog, finding_id), "rung 3 opened the incident"
+    assert not catalog.is_channel_unhealthy("email"), (
+        "the low per-finding threshold must leave the channel healthy so replay "
+        "can redeliver"
+    )
+
+    # The transport recovers and an operator replays the dead-lettered finding.
+    email.fail = False
+    outcome = catalog.replay_finding(finding_id, {"now"})
+    assert outcome["outcome"] == "requeued"
+    assert _queue_status(catalog, finding_id) == "pending", "replay re-armed the row"
+
+    # The next drain delivers the content -> the recovery edge closes the incident.
+    asyncio.run(drain.drain_once())
+    assert email.calls[-1] == "email", "the recovered channel redelivered the content"
+    assert _queue_status(catalog, finding_id) == "dispatched"
+    assert not _delivery_incident_open(catalog, finding_id), (
+        "a successful redelivery must clear the rung-3 incident (Finding 1)"
+    )
+
+
+# --------------------------------------------------------------------------
+# (h) An INTERNAL finding that cannot be delivered must NOT spawn a rung-3
+#     internal/delivery incident. internal/* findings already fan to every
+#     channel (B7) and belfry already carries their ORIGINAL incident off-box;
+#     a second internal/delivery incident keyed on the internal finding's id is
+#     a false "content lost" premise with no redelivery path of its own to clear
+#     it. This is the guard Finding 2 of the fell adds, mirroring rung 2's
+#     internal exclusion in the channel loop.
+# --------------------------------------------------------------------------
+
+
+def test_internal_finding_does_not_spawn_rung3(tmp_path, monkeypatch) -> None:
+    """An internal/render finding fans to BOTH channels (B7), both fail every
+    drain, and the per-finding ladder walks to exhaustion (status 'failed'). The
+    exhaustion edge IS reached -- but rung 3 is guarded on
+    `not _is_internal(source)`, so NO internal/delivery finding or incident is
+    created. The original internal/render incident is what belfry carries off-box.
+
+    Discrimination: the queue row reaching 'failed' proves the ladder genuinely
+    crossed its threshold (so this is not a vacuous pass), while
+    _exhausted_entities stays empty. Before Finding 2's guard, the same exhaustion
+    edge would fire write_internal_finding('internal/delivery', ...) and the
+    internal/delivery assertion inverts -- the redundant, never-clearing incident
+    the guard exists to prevent.
+    """
+    catalog, drain, clock = _solo_drain(tmp_path)
+    monkeypatch.setattr(pipe_runner, "send_email", _Recorder(fail=True))
+    monkeypatch.setattr(pipe_runner, "send_push", _Recorder(fail=True))
+
+    # An internal finding -- angelus's OWN distress signal -- routed to `now`,
+    # which the B7 fan delivers to every channel. Both channels are down.
+    finding_id = catalog.write_internal_finding(
+        "internal/render", "render_failed", "digest", "boom", {"now"}
+    )
+    for i in range(MAX_RETRY_ATTEMPTS):
+        if i:
+            clock.advance(_PAST_BACKOFF)
+        asyncio.run(drain.drain_once())
+
+    assert _queue_status(catalog, finding_id) == "failed", (
+        "the per-finding ladder must reach the exhaustion edge -- otherwise the "
+        "test would pass for the wrong reason (rung 3 simply never evaluated)"
+    )
+    assert _exhausted_entities(catalog) == [], (
+        "an internal finding must not spawn a rung-3 internal/delivery incident "
+        "(Finding 2)"
+    )
+    assert not any(
+        src == "internal/delivery" for src, _t, _e in _open_incidents(catalog)
+    ), "no internal/delivery incident of any entity"
+    # The original internal/render incident is still open -- that is the signal
+    # belfry carries off-box; rung 3 adds nothing for it.
+    assert ("internal/render", "render_failed", "digest") in _open_incidents(catalog)
+
+
+# --------------------------------------------------------------------------
+# (i) Restart persistence: an open internal/delivery incident must SURVIVE the
+#     startup orphan-reconcile. internal/delivery is correctly absent from
+#     _RESTART_RECONCILED_INTERNAL_SOURCES -- it recovers only off a real
+#     redelivery (the live clear edge), never on a blind startup sweep, since a
+#     restart does not redeliver the content. Blind-clearing it would re-green
+#     belfry while the content is still lost.
+# --------------------------------------------------------------------------
+
+
+def test_exhausted_incident_survives_startup_reconcile(tmp_path) -> None:
+    """Open an internal/delivery incident, then run the daemon's REAL
+    _reconcile_orphaned_internal_incidents (the exact startup sweep) and assert
+    the incident is still open afterwards.
+
+    Discrimination: the sweep clears every source in
+    _RESTART_RECONCILED_INTERNAL_SOURCES and leaves the rest. The companion
+    assertion pins internal/delivery's ABSENCE from that tuple, so if a future
+    edit added it (blind-clearing the incident on every boot and re-greening
+    belfry while the content is still undelivered) both this survival assertion
+    and the membership assertion fail.
+    """
+    assert "internal/delivery" not in _RESTART_RECONCILED_INTERNAL_SOURCES, (
+        "internal/delivery must recover only off a real redelivery, never a "
+        "blind startup sweep"
+    )
+    _write_lodging(tmp_path)
+    daemon = AngelusDaemon(tmp_path)
+    known_pipes = set(daemon.lodging.pipes)
+    daemon.catalog.write_internal_finding(
+        "internal/delivery", "delivery_exhausted", "123", "pipe=now last_error=boom",
+        known_pipes,
+    )
+    assert ("internal/delivery", "delivery_exhausted", "123") in _open_incidents(
+        daemon.catalog
+    )
+
+    daemon._reconcile_orphaned_internal_incidents()
+
+    assert ("internal/delivery", "delivery_exhausted", "123") in _open_incidents(
+        daemon.catalog
+    ), "the rung-3 incident must survive the startup reconcile"
+
+
+# --------------------------------------------------------------------------
+# (j) Repeat suppression: once a finding is exhausted, further drains and a
+#     repeat rung-3 emission for the same key do not grow the incident count --
+#     the B30 gate keeps it at exactly one open incident / one finding row.
+# --------------------------------------------------------------------------
+
+
+def test_repeat_exhaustion_emits_single_incident(tmp_path, monkeypatch) -> None:
+    """Exhaust a finding (one internal/delivery incident), then drain several
+    more times AND fire a second explicit rung-3 emission for the same finding
+    key. The B30 gate drops both repeats: still exactly one internal/delivery
+    finding row and one open incident.
+
+    Discrimination: counting findings AND open incidents == 1 after the repeats.
+    A missing/ineffective gate would either re-enqueue on each drain or open a
+    second incident on the explicit repeat -- the count would climb past one.
+    """
+    catalog, drain, clock = _solo_drain(tmp_path)
+    monkeypatch.setattr(pipe_runner, "send_email", _Recorder(fail=True))
+    monkeypatch.setattr(pipe_runner, "send_push", _Recorder())
+
+    finding_id = _walk_to_exhaustion(
+        catalog, drain, clock, "example.com", MAX_RETRY_ATTEMPTS
+    )
+    assert _exhausted_entities(catalog) == [str(finding_id)]
+
+    # Drain well past exhaustion: the failed row is no longer pending, so it is
+    # never re-picked, and no new internal/delivery finding is produced.
+    for _ in range(3):
+        clock.advance(_PAST_BACKOFF)
+        asyncio.run(drain.drain_once())
+
+    # An explicit repeat for the SAME key is dropped by the B30 gate (no new
+    # row, no second incident) -- this is the path that would re-fire if a future
+    # redelivery attempt re-exhausted before the incident was cleared.
+    catalog.write_internal_finding(
+        "internal/delivery", "delivery_exhausted", str(finding_id), "again", {"now"}
+    )
+
+    assert _exhausted_entities(catalog) == [str(finding_id)], "exactly one finding row"
+    delivery_incidents = [
+        (src, typ, ent)
+        for src, typ, ent in _open_incidents(catalog)
+        if src == "internal/delivery"
+    ]
+    assert delivery_incidents == [
+        ("internal/delivery", "delivery_exhausted", str(finding_id))
+    ], "exactly one open internal/delivery incident, no growth"
+
+
+# --------------------------------------------------------------------------
+# (k) Threshold above the backoff schedule: a pipe configuring
+#     max_delivery_attempts greater than the 4-step TRUST_RETRY_DELAYS must
+#     exercise the index clamp without IndexError and still exhaust on the Nth
+#     call. Driven at the catalog seam so the clamp arithmetic is pinned directly.
+# --------------------------------------------------------------------------
+
+
+def test_threshold_above_schedule_length(tmp_path) -> None:
+    """record_pipe_finding_undelivered with max_attempts=8 -- beyond the 4-entry
+    TRUST_RETRY_DELAYS -- walks calls 5..7 past the end of the delay schedule.
+    The clamp (min(next_attempt-1, len-1)) holds the backoff at its longest step
+    instead of indexing out of range, and the finding exhausts on the 8th call.
+
+    Discrimination: 8 > len(TRUST_RETRY_DELAYS) is asserted up front so this stays
+    a genuine over-the-end case; the returns are [False]*7 + [True]. An unclamped
+    TRUST_RETRY_DELAYS[next_attempt - 1] would raise IndexError on call 5, before
+    ever reaching the exhausting 8th -- so the test simply completing past the
+    clamp is itself the discriminator, with the exhaustion point pinned on top.
+    """
+    assert 8 > len(TRUST_RETRY_DELAYS), "the threshold must exceed the schedule"
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    finding_id = _write_finding(catalog, "wide")
+
+    returns = [
+        catalog.record_pipe_finding_undelivered("now", finding_id, "boom", 8)
+        for _ in range(8)
+    ]
+    assert returns == [False] * 7 + [True], "exhausts on the 8th, no IndexError before"
+    assert _queue_status(catalog, finding_id) == "failed"
