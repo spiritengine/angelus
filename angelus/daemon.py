@@ -700,8 +700,12 @@ class AngelusDaemon:
         ControlServer._dispatch.
 
         `action` selects the operation:
-          - "arm"/"clear" require `channel`, which must name a CONFIGURED
-            channel (rejected otherwise so a typo cannot silently arm nothing);
+          - "arm"/"clear" require `channel`. For "arm" it must name a
+            CONFIGURED channel (rejected otherwise so a typo cannot silently
+            arm nothing). "clear" accepts ANY name unconditionally: the
+            registry discard is idempotent, and a channel can be hot-reloaded
+            out of config while a stale armed entry lingers -- requiring it to
+            be configured would make that entry un-clearable individually.
           - "clear_all" drops every armed fault;
           - "list" returns the current set with no change.
         Every action returns the resulting armed set (sorted) so the caller can
@@ -719,9 +723,9 @@ class AngelusDaemon:
                 raise ValueError(
                     f"fault_inject {action} requires a non-empty channel"
                 )
-            if channel not in self.lodging.channels:
-                raise ValueError(f"unknown channel: {channel}")
             if action == "arm":
+                if channel not in self.lodging.channels:
+                    raise ValueError(f"unknown channel: {channel}")
                 self.faults.arm(channel)
             else:
                 self.faults.clear(channel)

@@ -19,7 +19,13 @@ These tests pin:
   - real config is untouched -- the fault is an overlay, not a config edit;
   - an injected fault walks the FULL B14 ladder to rung 3 identically to a real
     failure, with the real sender never invoked (the strongest test);
-  - the control op arms/clears/lists and rejects an unknown channel;
+  - an injected fault drives B13 failover (rung 2) to a healthy backup, with the
+    real primary sender never invoked;
+  - the control op arms/clears/lists and rejects an unknown channel, while
+    `clear` still discards a channel hot-reloaded out of config;
+  - the `fault-inject` CLI command dispatches each mode and rejects combinations;
+  - an injected fault exercises the DIGEST dispatch path, not just the immediate
+    ladder;
   - armed faults surface in `angelus health`, and none-armed renders 'none'.
 """
 
@@ -31,8 +37,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
+import angelus.cli as cli
 import angelus.pipes.runner as pipe_runner
+from angelus.cli import main
 from angelus.clock import FakeClock
 from angelus.daemon import AngelusDaemon
 from angelus.faults import FAULT_INJECT_ENV, FaultRegistry
@@ -454,6 +463,55 @@ def test_clearing_fault_lets_channel_recover(tmp_path, monkeypatch) -> None:
     ), "a successful redelivery clears the rung-3 incident"
 
 
+def test_injected_fault_fails_over_to_live_backup(tmp_path, monkeypatch) -> None:
+    """An injected fault drives B13 failover (rung 2): arm email, which declares
+    a HEALTHY push backup. Below the per-channel threshold the armed failures
+    retry without failing over; on the threshold-crossing drain email is
+    degraded and that finding is delivered over the push backup THIS drain --
+    exactly as a genuine email outage would fail over, proving an injected fault
+    is indistinguishable from a real outage at the failover rung too.
+
+    Discrimination: the real send_email recorder is NEVER called (calls == [])
+    -- every failure was injected -- yet push delivers the crossing finding and
+    its queue row reaches 'dispatched'. push stays untouched on the sub-threshold
+    drains, so the single push send is the failover, not an unconditional fan. If
+    _send_channel did not consult the registry, email would deliver and push
+    would never be reached; if failover did not fire, the crossing finding would
+    stay pending and push.calls would be empty.
+    """
+    faults = FaultRegistry(["email"])
+    catalog, drain, _clock = _drain(
+        tmp_path,
+        channels=_channels(backup="push"),
+        pipe_channels=["email"],
+        faults=faults,
+    )
+    email = _Recorder()
+    push = _Recorder()
+    monkeypatch.setattr(pipe_runner, "send_email", email)
+    monkeypatch.setattr(pipe_runner, "send_push", push)
+
+    # Sub-threshold: each fresh finding fails on the armed email but email is not
+    # yet degraded, so no failover -- push is untouched.
+    for i in range(MAX_RETRY_ATTEMPTS - 1):
+        _write_finding(catalog, f"sub-{i}")
+        asyncio.run(drain.drain_once())
+    assert push.calls == [], "no failover before the armed channel crosses threshold"
+
+    # The threshold-crossing finding: email crosses and this finding fails over
+    # to the healthy push backup in the same drain.
+    crossing = _write_finding(catalog, "crossing.example")
+    asyncio.run(drain.drain_once())
+
+    assert email.calls == [], "the real primary sender was never invoked -- failure was injected"
+    assert push.calls == ["push"], "the injected fault failed the finding over to the live backup"
+    sent = catalog.connection.execute(
+        "SELECT COUNT(*) AS n FROM dispatches WHERE channel = 'push' AND status = 'sent'"
+    ).fetchone()["n"]
+    assert sent == 1, "the backup recorded a sent dispatch"
+    assert _queue_status(catalog, crossing) == "dispatched", "delivered over the backup"
+
+
 # --------------------------------------------------------------------------
 # Control op: arm / list / clear / clear_all over the real control layer, and
 # rejection of an unknown channel.
@@ -585,6 +643,57 @@ def test_op_fault_inject_rejects_unknown_channel(tmp_path) -> None:
     asyncio.run(driver())
 
 
+def test_op_fault_inject_clear_succeeds_for_hot_removed_channel(tmp_path) -> None:
+    """The configured-channel guard is scoped to ARM only. A channel armed and
+    then hot-reloaded out of config leaves a stale armed entry; `clear` must
+    discard it individually (the registry discard is idempotent for any name),
+    even though `arm` of that same now-unknown name is rejected.
+
+    Discrimination: after arming 'email' and removing it from the configured
+    channels, `clear` of 'email' returns ok=True and empties the armed set,
+    while `arm` of 'email' now returns ok=False naming the unknown channel. If
+    the guard were re-broadened to cover `clear`, the clear would return
+    ok=False with 'unknown channel: email' and the stale entry would be stuck
+    (only --clear-all could shift it, which also drops legitimate faults).
+    """
+    _write_lodging(tmp_path)
+
+    async def driver() -> None:
+        daemon = AngelusDaemon(tmp_path)
+        await daemon.control.start()
+        try:
+            armed = await _ask(
+                daemon.socket_path,
+                {"op": "fault_inject", "args": {"action": "arm", "channel": "email"}},
+            )
+            assert armed["result"] == {"armed": ["email"]}
+
+            # Hot-reload email out of config -> the armed entry is now stale.
+            daemon.lodging.channels.pop("email")
+
+            cleared = await _ask(
+                daemon.socket_path,
+                {"op": "fault_inject", "args": {"action": "clear", "channel": "email"}},
+            )
+            assert cleared["ok"] is True, "clear must discard a hot-removed channel"
+            assert cleared["result"] == {"armed": []}, "the stale entry is gone"
+            assert daemon.faults.armed() == [], "registry no longer holds the fault"
+
+            # arm of the same now-unknown name is still rejected -- the guard
+            # protects arm against typos, it just no longer blocks clear.
+            rearm = await _ask(
+                daemon.socket_path,
+                {"op": "fault_inject", "args": {"action": "arm", "channel": "email"}},
+            )
+            assert rearm["ok"] is False
+            assert "unknown channel: email" in rearm["error"]
+        finally:
+            await daemon.control.stop()
+            daemon.connection.close()
+
+    asyncio.run(driver())
+
+
 # --------------------------------------------------------------------------
 # Health visibility: an armed fault is surfaced in `angelus health`; none-armed
 # renders 'none'.
@@ -658,3 +767,137 @@ def test_render_fault_injection_screen_reader_format(capsys) -> None:
 
     _render_fault_injection({})
     assert "fault injection:\n  none\n" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# The `fault-inject` click command body: per-mode dispatch and the
+# mutual-exclusion guard, with the daemon request layer stubbed.
+# --------------------------------------------------------------------------
+
+
+def test_cli_fault_inject_command_dispatch(tmp_path, monkeypatch) -> None:
+    """The click command maps each mode to the right control request and
+    rejects a combination before touching the daemon. The request layer is
+    stubbed (every mode REQUIRES the daemon, so there is no sqlite fallback to
+    exercise) and the recorded calls pin the action/channel per mode.
+
+    Discrimination: arm / --clear / --clear-all / --list each send exactly one
+    fault_inject request with its action (and channel where applicable) and exit
+    0; a bare channel combined with --list is rejected with 'exactly one' and a
+    non-zero exit WITHOUT reaching the request layer. If the mutual-exclusion
+    guard were dropped, the rejected case would fall through to a request and
+    exit 0; if a mode dispatched the wrong action, the recorded calls invert.
+    """
+    calls: list[tuple[str, dict]] = []
+
+    def fake_request(root, op, args):
+        calls.append((op, dict(args)))
+        channel = args.get("channel")
+        armed = [channel] if args.get("action") == "arm" and channel else []
+        return {"ok": True, "result": {"armed": armed}}
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    runner = CliRunner()
+    root_args = ["--root", str(tmp_path)]
+
+    arm = runner.invoke(main, ["fault-inject", "email", *root_args])
+    assert arm.exit_code == 0
+    assert "armed fault: email" in arm.output
+
+    cleared = runner.invoke(main, ["fault-inject", "--clear", "email", *root_args])
+    assert cleared.exit_code == 0
+    assert "cleared fault: email" in cleared.output
+
+    cleared_all = runner.invoke(main, ["fault-inject", "--clear-all", *root_args])
+    assert cleared_all.exit_code == 0
+    assert "cleared all faults" in cleared_all.output
+
+    listed = runner.invoke(main, ["fault-inject", "--list", *root_args])
+    assert listed.exit_code == 0
+    assert "armed faults:" in listed.output
+
+    assert [op for op, _ in calls] == ["fault_inject"] * 4
+    assert [a["action"] for _, a in calls] == ["arm", "clear", "clear_all", "list"]
+    assert calls[0][1]["channel"] == "email"
+    assert calls[1][1]["channel"] == "email"
+
+    # Mutual exclusion: a bare channel AND --list is two modes -> rejected
+    # before any request reaches the daemon.
+    calls.clear()
+    rejected = runner.invoke(main, ["fault-inject", "email", "--list", *root_args])
+    assert rejected.exit_code != 0
+    assert "exactly one" in rejected.output
+    assert calls == [], "a rejected combination must not reach the daemon"
+
+
+# --------------------------------------------------------------------------
+# The digest path: an armed channel fails the DIGEST dispatch (a distinct code
+# path from the immediate ladder), recording a failed dispatch and advancing
+# the per-channel digest attempt counter.
+# --------------------------------------------------------------------------
+
+
+def test_injected_fault_exercises_digest_path(tmp_path, monkeypatch) -> None:
+    """A digest pipe routes to an armed channel: the digest send is forced to
+    fail through the same seam the immediate path uses, so _drain_digest's
+    failure handling runs -- a failed dispatch row and the digest-specific
+    per-channel attempt counter (record_digest_send_failure), keyed by
+    (pipe, channel), advance. This is a separate path from the immediate ladder
+    and otherwise had no direct B28 coverage.
+
+    Discrimination: the real send_email recorder is never called (the fault
+    short-circuits the send), yet the dispatch row is 'failed' and
+    digest_channel_attempts for (daily, email) is 1. If _send_channel did not
+    consult the registry on the digest path, the send would succeed, the
+    dispatch would be 'sent', and the digest attempt counter would stay absent.
+    """
+    clock = FakeClock(PINNED)
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path, clock=clock)
+    faults = FaultRegistry(["email"])
+    pipe = Pipe(
+        name="daily",
+        cadence="0 8 * * *",
+        render_kind="digest",
+        template=None,
+        channels=["email"],
+        render={"body": {"kind": "llm", "mantle": "chronicler", "inputs": []}},
+    )
+    drain = PipeDrain(
+        catalog, pipe, _channels(), tmp_path, {"daily"}, clock=clock, faults=faults
+    )
+    email = _Recorder()
+    monkeypatch.setattr(pipe_runner, "send_email", email)
+
+    async def fake_llm(self, _pipe, _structured):
+        return "synthesis paragraph.", None
+
+    monkeypatch.setattr(PipeDrain, "_render_llm_body", fake_llm)
+    monkeypatch.setattr(pipe_runner, "_is_same_utc_day", lambda *_args: False)
+
+    catalog.write_finding(
+        None,
+        {
+            "source": "scheduled/a",
+            "type": "down",
+            "entity": "site",
+            "severity": "high",
+            "target_pipes": ["daily"],
+        },
+        {"daily"},
+    )
+    asyncio.run(drain.drain_once())
+
+    assert email.calls == [], "the real digest sender was short-circuited by the fault"
+    failed = catalog.connection.execute(
+        "SELECT COUNT(*) AS n FROM dispatches "
+        "WHERE channel = 'email' AND status = 'failed'"
+    ).fetchone()["n"]
+    assert failed == 1, "the digest recorded a failed dispatch"
+    attempts = catalog.connection.execute(
+        "SELECT attempts FROM digest_channel_attempts "
+        "WHERE pipe = 'daily' AND channel = 'email'"
+    ).fetchone()
+    assert attempts is not None and attempts["attempts"] == 1, (
+        "the digest per-channel attempt counter advanced"
+    )
