@@ -472,9 +472,77 @@ class PipeDrain:
                 # moves a single step here. If every channel was SKIPPED as
                 # unhealthy (last_error is None) the row is left pending and
                 # untouched, exactly as the pre-fan path did.
-                self.catalog.record_pipe_finding_undelivered(
-                    pipe.name, finding_id, last_error
+                #
+                # The escalation ladder (B14), end to end, makes a delivery
+                # failure get LOUDER over time instead of looping quietly:
+                #   rung 1 -- retry with backoff (this counter + next_attempt_at);
+                #   rung 2 -- after a channel degrades, fail over to its backup
+                #             (the B13 block above, before this reconciliation);
+                #   rung 3 -- after the finding exhausts its retry budget WITHOUT
+                #             ever reaching ANY transport (primary or any backup),
+                #             page OUT-OF-BAND (below).
+                exhausted = self.catalog.record_pipe_finding_undelivered(
+                    pipe.name, finding_id, last_error, pipe.max_delivery_attempts
                 )
+                if exhausted:
+                    # RUNG 3 (B14). This finding has walked the whole ladder --
+                    # retried to its per-pipe threshold and (since we are in the
+                    # `not delivered` reconciliation, NOT the delivered backstop
+                    # above) was never delivered over the primary OR any B13
+                    # failover backup. The daemon does not loop on it quietly: it
+                    # makes the loss impossible to miss.
+                    #
+                    # Out-of-band model 3 (decided): the daemon does NOT ping a
+                    # healthcheck itself and does NOT bypass the channel layer.
+                    # It emits a LOUD, DURABLE, finding-level signal; belfry --
+                    # which already pings ANGELUS_BELFRY_DOWN_URL off-box on each
+                    # tick when it sees an open internal/* incident (B1) -- is
+                    # what carries it out-of-band. The split holds: in-daemon
+                    # handles live errors, belfry owns the off-box page, and no
+                    # healthchecks dependency leaks into the daemon. The internal
+                    # finding fans to all channels via B7 (target_pipes=["now"]),
+                    # which is fine, but its LOAD-BEARING delivery is belfry --
+                    # by definition the channels here just failed.
+                    #
+                    # source/type are deliberately DISTINCT from the
+                    # internal/dispatch `channel_unhealthy` escalation raised in
+                    # the channel loop above. That one is per-CHANNEL and
+                    # transient -- "a transport is degraded", rung 2's edge. This
+                    # is per-FINDING and durable -- "we permanently gave up
+                    # delivering THIS content after the whole ladder", the louder
+                    # statement. A separate source (internal/delivery) keeps the
+                    # two cleanly partitioned for belfry/health/digest reads, and
+                    # the entity is the finding id so each lost item is tracked
+                    # and replayed individually.
+                    #
+                    # B30 emission gate: the (internal/delivery,
+                    # delivery_exhausted, finding_id) key opens ONE durable
+                    # incident on this exhaustion edge; a repeat for the same
+                    # finding while it is still open is dropped by the gate. The
+                    # incident stays open (keeps belfry red) until the content is
+                    # actually delivered -- it is NOT auto-cleared on a timer.
+                    #
+                    # B15 SEAM: the recovery edge -- when an exhausted finding is
+                    # later re-delivered (dead-letter replay) -- is where a
+                    # paired write_internal_clearance("internal/delivery",
+                    # str(finding_id), ...) closes this incident and re-arms the
+                    # gate. That replay/clearance is B15's job; this item opens
+                    # the incident and leaves the clear edge clean and unbuilt.
+                    LOGGER.error(
+                        "pipe %s: finding %s exhausted its delivery ladder "
+                        "undelivered over every transport; paging out-of-band "
+                        "(internal/delivery incident); last error: %s",
+                        pipe.name,
+                        finding_id,
+                        last_error,
+                    )
+                    self.catalog.write_internal_finding(
+                        "internal/delivery",
+                        "delivery_exhausted",
+                        str(finding_id),
+                        f"pipe={pipe.name} last_error={last_error}",
+                        known_pipes,
+                    )
 
     def _dispatch_channels(
         self,

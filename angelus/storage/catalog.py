@@ -838,9 +838,29 @@ class Catalog:
         return events
 
     def record_pipe_finding_undelivered(
-        self, pipe: str, finding_id: int, error: str
+        self, pipe: str, finding_id: int, error: str, max_attempts: int | None = None
     ) -> bool:
         """Advance the per-finding redelivery ladder for the immediate path.
+
+        This is rung 1 of the B14 escalation ladder (retry with backoff) AND the
+        gate to rung 3: the True return -- a finding that has crossed the
+        threshold to status='failed' WITHOUT ever being delivered over any
+        transport -- is the load-bearing hook the runner turns into the
+        out-of-band page (PipeDrain._drain_immediate raises the durable
+        internal/delivery `delivery_exhausted` incident on exactly this edge).
+
+        ``max_attempts`` is the per-pipe rung-3 threshold (Pipe.max_delivery_
+        attempts). None falls back to the module MAX_RETRY_ATTEMPTS so behaviour
+        is unchanged for any caller that does not pass it -- a pipe tunes how
+        patient its redelivery ladder is before it exhausts and pages out-of-
+        band. The three OTHER MAX_RETRY_ATTEMPTS sites (the triage retry path,
+        the per-channel digest counter, the per-channel immediate counter) stay
+        on the shared constant deliberately: they answer the per-CHANNEL health
+        question ("is this transport degraded?", rung 2's trigger), a different
+        grain from this per-FINDING give-up decision, and a pipe's patience with
+        a single finding's delivery should not silently re-tune when a channel
+        is declared unhealthy. Only the rung the ladder actually walks to abandon
+        content is configurable here.
 
         Called AT MOST ONCE per finding per drain, and only when ZERO channels
         delivered the finding this drain (see PipeDrain._drain_immediate). This
@@ -874,7 +894,8 @@ class Catalog:
         ).fetchone()
         attempts = int(row["attempts"]) if row is not None else 0
         next_attempt = attempts + 1
-        if next_attempt >= MAX_RETRY_ATTEMPTS:
+        threshold = MAX_RETRY_ATTEMPTS if max_attempts is None else max_attempts
+        if next_attempt >= threshold:
             now = self._clock.now_iso()
             self.connection.execute(
                 """
@@ -891,9 +912,15 @@ class Catalog:
             self.connection.commit()
             return True
 
-        next_attempt_at = _format_time(
-            self._clock.now() + TRUST_RETRY_DELAYS[next_attempt - 1]
-        )
+        # TRUST_RETRY_DELAYS is a fixed 4-step schedule sized for the default
+        # threshold (5 attempts -> indices 0..3). A pipe that configures a
+        # HIGHER max_delivery_attempts walks past the end of the schedule, so
+        # clamp to the last (longest) delay rather than IndexError: once a
+        # finding has retried this many times the backoff is already at its
+        # ceiling, and holding it there is the right behaviour for the extra
+        # rungs.
+        delay = TRUST_RETRY_DELAYS[min(next_attempt - 1, len(TRUST_RETRY_DELAYS) - 1)]
+        next_attempt_at = _format_time(self._clock.now() + delay)
         self.connection.execute(
             """
             UPDATE pipe_queues
