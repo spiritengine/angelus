@@ -837,10 +837,34 @@ class Catalog:
         events.sort(key=lambda e: (e["ts"], kind_order[e["kind"]], e["id"]))
         return events
 
-    def record_pipe_send_failure(
-        self, pipe: str, channel: str, finding_id: int, error: str
+    def record_pipe_finding_undelivered(
+        self, pipe: str, finding_id: int, error: str
     ) -> bool:
-        self.record_dispatch(pipe, channel, [finding_id], "failed", error)
+        """Advance the per-finding redelivery ladder for the immediate path.
+
+        Called AT MOST ONCE per finding per drain, and only when ZERO channels
+        delivered the finding this drain (see PipeDrain._drain_immediate). This
+        answers the per-FINDING question -- "should this finding be retried
+        later?" -- split cleanly from the per-CHANNEL question "is this channel
+        unhealthy?", which now lives in immediate_channel_attempts via
+        record_immediate_send_failure / record_immediate_send_success.
+
+        The split is the extra reconciliation the digest path never faced.
+        Before B7, the immediate path attempted one channel per finding, so the
+        single pipe_queues.attempts row (keyed (finding_id, pipe)) doubled as
+        BOTH the redelivery counter AND the channel-health counter, and the old
+        record_pipe_send_failure advanced both at once. B7 fans internal/*
+        findings to N channels through that one row; letting each channel
+        advance it inflated it +N per drain and conflated the two concerns. This
+        method keeps pipe_queues.attempts as ONLY the per-finding redelivery
+        ladder: advanced once per undelivered drain, never per failed channel,
+        and it no longer touches channel_health at all (mark_channel_unhealthy
+        moved to the per-channel counter).
+
+        Returns True when the finding has exhausted its redelivery attempts
+        (status -> 'failed', so pending_pipe_items drops it); False when it
+        stays retryable with next_attempt_at set to the backoff schedule.
+        """
         row = self.connection.execute(
             """
             SELECT attempts FROM pipe_queues
@@ -864,7 +888,6 @@ class Catalog:
                 """,
                 (next_attempt, error, now, finding_id, pipe),
             )
-            self.mark_channel_unhealthy(channel, error)
             self.connection.commit()
             return True
 
@@ -994,6 +1017,97 @@ class Catalog:
         digest path.
         """
         self.connection.execute("DELETE FROM digest_channel_attempts")
+        self.connection.commit()
+
+    def record_immediate_send_failure(
+        self, pipe: str, channel: str, finding_id: int, error: str
+    ) -> bool:
+        """Per-channel health escalation for the immediate (_drain_immediate) path.
+
+        Mirrors record_digest_send_failure. Records the per-channel 'failed'
+        dispatch row (so the belfry/B1 failed-dispatch surface still sees it,
+        as the old record_pipe_send_failure did), then increments the
+        per-(pipe, channel) counter in immediate_channel_attempts. Returns True
+        when this call crosses MAX_RETRY_ATTEMPTS and the channel is marked
+        unhealthy in channel_health; False otherwise.
+
+        Counter shape is (pipe, channel) -- intentionally NOT per-finding.
+        Channel health is a property of the CHANNEL, so the counter must
+        accumulate a channel's failures ACROSS findings and reset on a success,
+        exactly like digest_channel_attempts. A per-(pipe, channel, finding_id)
+        key would reset on every finding and never escalate: the B7 fan retries
+        a finding only until >=1 channel delivers it, so a persistently-down
+        co-fanned channel is rarely re-attempted against the SAME finding -- its
+        failures are spread one apiece across many DIFFERENT findings. So
+        per-(pipe, channel) is the correct grain and matches the digest
+        precedent (a round-1 review's offhand (pipe,channel,finding_id)
+        suggestion would have made the counter unescalatable).
+
+        Deliberately decoupled from the finding's pipe_queues row status: the
+        escalation fires off THIS counter even when a co-fanned channel
+        succeeded and marked the finding 'dispatched' -- the exact gap (defect
+        b) the per-finding shared counter left open on the immediate path.
+        """
+        self.record_dispatch(
+            pipe, channel, [finding_id], "failed", error, mark_queue=False
+        )
+        now = self._clock.now_iso()
+        row = self.connection.execute(
+            """
+            SELECT attempts FROM immediate_channel_attempts
+            WHERE pipe = ? AND channel = ?
+            """,
+            (pipe, channel),
+        ).fetchone()
+        attempts = int(row["attempts"]) if row is not None else 0
+        next_attempt = attempts + 1
+        self.connection.execute(
+            """
+            INSERT INTO immediate_channel_attempts
+                (pipe, channel, attempts, last_error, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (pipe, channel) DO UPDATE SET
+                attempts = excluded.attempts,
+                last_error = excluded.last_error,
+                updated_at = excluded.updated_at
+            """,
+            (pipe, channel, next_attempt, error, now),
+        )
+        crossed = next_attempt >= MAX_RETRY_ATTEMPTS
+        if crossed:
+            self.mark_channel_unhealthy(channel, error)
+        self.connection.commit()
+        return crossed
+
+    def record_immediate_send_success(self, pipe: str, channel: str) -> None:
+        """Reset the per-channel immediate attempt counter after a successful send.
+
+        Mirrors record_digest_send_success: only N CONSECUTIVE channel failures
+        mark a channel unhealthy, so a single success clears the ladder and an
+        intermittent channel never gradually accumulates to threshold across
+        many mostly-succeeding findings. channel_health itself is NOT cleared
+        here -- it is daemon-restart-scoped, and re-clearing it on one success
+        would let a flapping channel oscillate in and out of the immediate
+        path's is_channel_unhealthy skip on every drain.
+        """
+        self.connection.execute(
+            """
+            DELETE FROM immediate_channel_attempts
+            WHERE pipe = ? AND channel = ?
+            """,
+            (pipe, channel),
+        )
+        self.connection.commit()
+
+    def clear_immediate_channel_attempts(self) -> None:
+        """Wipe the per-channel immediate attempt counter (daemon-restart scope).
+
+        Mirrors clear_digest_channel_attempts / clear_channel_health: the
+        threshold ladder resets when the daemon restarts, so an operator-
+        initiated restart is the supported path to re-enable a channel that has
+        been marked unhealthy via the immediate path.
+        """
+        self.connection.execute("DELETE FROM immediate_channel_attempts")
         self.connection.commit()
 
     def write_internal_finding(
@@ -1317,6 +1431,24 @@ class Catalog:
             """
             SELECT pipe, channel, attempts, last_error, updated_at
             FROM digest_channel_attempts
+            WHERE attempts > 0
+            ORDER BY pipe, channel
+            """
+        )
+        return [dict(row) for row in rows]
+
+    def immediate_channel_attempts(self) -> list[dict[str, Any]]:
+        """Immediate-path per-channel attempt ladder rows with attempts > 0.
+
+        Read-only operator surface mirroring digest_channel_attempts: the
+        immediate path's in-flight per-channel retry state accumulates before
+        channel_health flips, so this reader makes the ladder visible before
+        the unhealthy threshold is crossed.
+        """
+        rows = self.connection.execute(
+            """
+            SELECT pipe, channel, attempts, last_error, updated_at
+            FROM immediate_channel_attempts
             WHERE attempts > 0
             ORDER BY pipe, channel
             """

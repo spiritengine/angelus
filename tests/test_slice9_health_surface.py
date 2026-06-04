@@ -141,6 +141,36 @@ def test_health_surfaces_digest_attempt_ladder_before_threshold(tmp_path) -> Non
     asyncio.run(driver())
 
 
+def test_health_surfaces_immediate_attempt_ladder_before_threshold(tmp_path) -> None:
+    """Immediate-path per-channel ladder is visible before channel_health flips
+    (B7 fell-r1 Finding 3), mirroring the digest ladder surface.
+    Discrimination: if the immediate reader is not wired into the health op, the
+    now/push lookup below raises KeyError and the test fails."""
+    _write_lodging(tmp_path)
+
+    async def driver() -> None:
+        daemon = AngelusDaemon(tmp_path)
+        try:
+            for _ in range(MAX_RETRY_ATTEMPTS - 1):
+                crossed = daemon.catalog.record_immediate_send_failure(
+                    "now", "push", 1, "pushd hung"
+                )
+                assert crossed is False
+            health = await daemon._op_health({})
+        finally:
+            daemon.connection.close()
+
+        attempts = {
+            (row["pipe"], row["channel"]): row
+            for row in health["channels"]["immediate_attempts"]
+        }
+        assert attempts[("now", "push")]["attempts"] == MAX_RETRY_ATTEMPTS - 1
+        assert attempts[("now", "push")]["last_error"] == "pushd hung"
+        assert health["channels"]["health"] == []
+
+    asyncio.run(driver())
+
+
 def test_muted_channel_unhealthy_is_silent_on_now_but_visible_in_health(tmp_path) -> None:
     """The muted internal/dispatch finding is a product choice; the rail
     is that channel_health still surfaces via health. Discrimination: if

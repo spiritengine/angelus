@@ -484,3 +484,53 @@ def test_startup_clears_digest_channel_attempts(tmp_path) -> None:
         connection.close()
 
     assert rows == []
+
+
+def test_startup_clears_immediate_channel_attempts(tmp_path) -> None:
+    """Restart-scope parity for the immediate-path per-channel counter (B7
+    fell-r1 Finding 3). It feeds the same channel_health ladder _drain_immediate
+    uses, so leaving it populated while startup wipes channel_health would let
+    the first post-restart failure cross threshold immediately -- breaking the
+    operator-restart-re-enables-a-channel contract, exactly as for
+    digest_channel_attempts."""
+    _write_trust_lodging(tmp_path)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    connection = init_db(state_dir / "angelus.sqlite3")
+    # Seed one below threshold (MAX_RETRY_ATTEMPTS = 5 -> attempts = 4).
+    connection.execute(
+        """
+        INSERT INTO immediate_channel_attempts (pipe, channel, attempts, last_error)
+        VALUES ('now', 'push', 4, 'pushd hung')
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO immediate_channel_attempts (pipe, channel, attempts, last_error)
+        VALUES ('now', 'email', 4, 'smtp refused')
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    angelus = AngelusDaemon(tmp_path)
+
+    async def run_briefly() -> None:
+        run_task = asyncio.create_task(angelus.run())
+        await asyncio.sleep(0.05)
+        angelus.request_stop()
+        await asyncio.wait_for(run_task, timeout=2.0)
+
+    asyncio.run(run_briefly())
+
+    connection = init_db(state_dir / "angelus.sqlite3")
+    try:
+        rows = list(
+            connection.execute(
+                "SELECT pipe, channel, attempts FROM immediate_channel_attempts"
+            )
+        )
+    finally:
+        connection.close()
+
+    assert rows == []

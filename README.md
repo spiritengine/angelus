@@ -334,6 +334,7 @@ Subsequent migrations add:
 - `mutes` — per-dedup_key suppression with an expiry and optional comment; consulted on dispatch. Migration 0005 (also adds `close_comment` to `incidents`).
 - `dep_health` is dropped and recreated by migration 0006 with the slice-5c dependency-registry shape (`dependency_name` PK, status CHECK, `last_check_at` and `updated_at` NOT NULL, nullable `detail`).
 - `digest_channel_attempts` — per-(pipe, channel) digest send-attempt counter so the digest path can consume the same channel_health threshold ladder the immediate path uses without inflating it by the per-cycle batch size. Daemon-restart-scoped (cleared at startup) to match `channel_health`. Migration 0007.
+- `immediate_channel_attempts` — per-(pipe, channel) immediate-path send-attempt counter (B7 fell-r1 Finding 3). After B7 fans internal/* findings to every channel, the per-(finding, pipe) `pipe_queues.attempts` row can no longer carry per-channel escalation (it inflates +N per drain and goes terminal on the first co-fanned success). This table tracks each channel's consecutive failures across findings and drives channel_health independently, while `pipe_queues.attempts` stays as the per-finding redelivery ladder. Daemon-restart-scoped (cleared at startup) to match `channel_health` and `digest_channel_attempts`. Migration 0010.
 
 ## Service template
 
