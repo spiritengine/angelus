@@ -369,9 +369,9 @@ class PipeDrain:
                         # The chain dead-ends -- no backup declared, or every
                         # reachable backup is unhealthy/already tried. The
                         # finding is not delivered here; it stays retryable via
-                        # the reconciliation below (dead-lettering an
-                        # undeliverable finding is B15, out of scope -- the seam
-                        # is the existing per-finding ladder).
+                        # the reconciliation below. If it keeps failing to its
+                        # threshold, that per-finding ladder is what lands it in
+                        # the terminal 'dead_letter' state (B15).
                         continue
                     attempted.add(backup.name)
                     try:
@@ -468,17 +468,20 @@ class PipeDrain:
                 # if this finding had previously exhausted its ladder (rung 3
                 # opened a durable internal/delivery incident keyed on its id),
                 # delivering its content NOW is the recovery that closes it. The
-                # one path that re-arms an exhausted ('failed') pipe_queues row
-                # for redelivery is `angelus replay <fid>` (catalog.replay_finding
-                # via the daemon _op_replay control op), which resets the row to
-                # 'pending' so it re-drains here -- that path exists and is wired
-                # today, so this clear edge is live, not a deferred seam. The B30
-                # gate drops this to a cheap no-op SELECT when no internal/delivery
-                # incident is open (the common case -- every delivered finding
-                # pays one query), and edge-closes the incident the instant the
-                # content is redelivered (by replay, or any future redelivery
-                # path). B15's dead-letter handling is a separate concern; this
-                # clearance does not depend on it. The entity is str(finding_id),
+                # one path that re-arms an exhausted ('dead_letter', B15)
+                # pipe_queues row for redelivery is `angelus replay <fid>`
+                # (catalog.replay_finding via the daemon _op_replay control op),
+                # which resets the row to 'pending' so it re-drains here -- that
+                # path exists and is wired today, so this clear edge is live, not
+                # a deferred seam. The B30 gate drops this to a cheap no-op SELECT
+                # when no internal/delivery incident is open (the common case --
+                # every delivered finding pays one query), and edge-closes the
+                # incident the instant the content is redelivered (by replay, or
+                # any future redelivery path). The dead_letter row leaves that
+                # state via the same replay->pending->dispatched transition; this
+                # clearance keys off the incident, not the row. The entity is
+                # str(finding_id), matching write_internal_finding's key on the
+                # exhaustion edge.
                 # matching write_internal_finding's key on the exhaustion edge.
                 self.catalog.write_internal_clearance(
                     "internal/delivery",
@@ -565,12 +568,15 @@ class PipeDrain:
                     # str(finding_id), ...) that closes this incident and re-arms
                     # the gate fires in the `if delivered:` reconciliation branch
                     # above. That branch runs whenever the content is redelivered,
-                    # and the path that re-arms an exhausted ('failed') row for
-                    # redelivery -- `angelus replay <fid>` (catalog.replay_finding
-                    # via the daemon _op_replay control op) -- exists and is wired
-                    # today. So the clear edge is built: any successful redelivery
-                    # closes this incident. B15's dead-letter handling remains a
-                    # separate concern, but the clear edge does not wait on it.
+                    # and the path that re-arms an exhausted ('dead_letter', B15)
+                    # row for redelivery -- `angelus replay <fid>`
+                    # (catalog.replay_finding via the daemon _op_replay control
+                    # op) -- exists and is wired today. So the clear edge is built:
+                    # any successful redelivery closes this incident. The same
+                    # exhaustion edge below that opens this incident also sets the
+                    # pipe_queues row to 'dead_letter' (B15), so the row and the
+                    # incident are the two faces of one give-up: the row is the
+                    # replayable record, the incident is the off-box page.
                     LOGGER.error(
                         "pipe %s: finding %s exhausted its delivery ladder "
                         "undelivered over every transport; paging out-of-band "
@@ -649,8 +655,8 @@ class PipeDrain:
         fails over to so its content still gets out. Returns None when the chain
         dead-ends: no backup declared, or every reachable backup is unhealthy or
         already tried. A None result leaves the finding retryable (the caller's
-        per-finding reconciliation); dead-lettering an undeliverable finding is
-        B15, out of scope.
+        per-finding reconciliation); if that ladder later exhausts, the finding
+        lands in the terminal 'dead_letter' state (B15), not this method.
 
         A backup that is itself unhealthy is skipped and the walk CONTINUES to
         that backup's own backup -- "follow the chain to the first healthy

@@ -10,7 +10,7 @@ The complete ladder the immediate (`now`) path walks for an undelivered finding:
 
 Rung 3's signal (out-of-band model 3): when
 Catalog.record_pipe_finding_undelivered returns True (the finding crossed its
-threshold to status='failed' undelivered) on the `not delivered` reconciliation,
+threshold to status='dead_letter' undelivered) on the `not delivered` reconciliation,
 the daemon logs an ERROR and raises a DISTINCT, durable internal finding --
 source internal/delivery, type delivery_exhausted, entity = the finding id. That
 opens an incident belfry's open-internal-incident read carries off-box; the
@@ -191,7 +191,7 @@ def test_acceptance_persistent_failure_walks_ladder_to_out_of_band_page(
       _exhausted_entities is empty through drain 4 and holds the finding id after
       drain 5. A signal that fired on every undelivered drain would show up at
       drain 1; one that never fired would leave it empty.
-    - the finding's queue row is terminal ('failed'), the durable signature of
+    - the finding's queue row is terminal ('dead_letter'), the durable signature of
       crossing the threshold -- the hook rung 3 keys off.
     """
     catalog, drain, clock = _solo_drain(tmp_path)  # backup=None -> ladder dead-ends
@@ -219,7 +219,7 @@ def test_acceptance_persistent_failure_walks_ladder_to_out_of_band_page(
 
     assert email.calls == ["email"] * MAX_RETRY_ATTEMPTS, "the primary was tried each drain"
     assert push.calls == [], "no backup configured -- nothing failed over"
-    assert _queue_status(catalog, finding_id) == "failed", "the finding exhausted"
+    assert _queue_status(catalog, finding_id) == "dead_letter", "the finding exhausted"
     # The acceptance: a durable internal/delivery incident, keyed on the finding
     # id, is open.
     assert ("internal/delivery", "delivery_exhausted", str(finding_id)) in _open_incidents(
@@ -379,7 +379,7 @@ def test_configurable_threshold_changes_exhaustion_point(tmp_path) -> None:
         for _ in range(3)
     ]
     assert returns_tuned == [False, False, True]
-    assert _queue_status(catalog, tuned) == "failed"
+    assert _queue_status(catalog, tuned) == "dead_letter"
 
     # Unset (None) -> falls back to MAX_RETRY_ATTEMPTS: True only on the 5th.
     returns_default = [
@@ -387,7 +387,7 @@ def test_configurable_threshold_changes_exhaustion_point(tmp_path) -> None:
         for _ in range(MAX_RETRY_ATTEMPTS)
     ]
     assert returns_default == [False] * (MAX_RETRY_ATTEMPTS - 1) + [True]
-    assert _queue_status(catalog, default) == "failed"
+    assert _queue_status(catalog, default) == "dead_letter"
 
 
 def test_pipe_threshold_parsed_and_defaults(tmp_path) -> None:
@@ -538,7 +538,7 @@ def test_replay_redelivers_and_clears_incident(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(pipe_runner, "send_push", _Recorder())
 
     finding_id = _walk_to_exhaustion(catalog, drain, clock, "example.com", 2)
-    assert _queue_status(catalog, finding_id) == "failed", "the finding exhausted"
+    assert _queue_status(catalog, finding_id) == "dead_letter", "the finding exhausted"
     assert _delivery_incident_open(catalog, finding_id), "rung 3 opened the incident"
     assert not catalog.is_channel_unhealthy("email"), (
         "the low per-finding threshold must leave the channel healthy so replay "
@@ -573,12 +573,12 @@ def test_replay_redelivers_and_clears_incident(tmp_path, monkeypatch) -> None:
 
 def test_internal_finding_does_not_spawn_rung3(tmp_path, monkeypatch) -> None:
     """An internal/render finding fans to BOTH channels (B7), both fail every
-    drain, and the per-finding ladder walks to exhaustion (status 'failed'). The
+    drain, and the per-finding ladder walks to exhaustion (status 'dead_letter'). The
     exhaustion edge IS reached -- but rung 3 is guarded on
     `not _is_internal(source)`, so NO internal/delivery finding or incident is
     created. The original internal/render incident is what belfry carries off-box.
 
-    Discrimination: the queue row reaching 'failed' proves the ladder genuinely
+    Discrimination: the queue row reaching 'dead_letter' proves the ladder genuinely
     crossed its threshold (so this is not a vacuous pass), while
     _exhausted_entities stays empty. Before Finding 2's guard, the same exhaustion
     edge would fire write_internal_finding('internal/delivery', ...) and the
@@ -599,7 +599,7 @@ def test_internal_finding_does_not_spawn_rung3(tmp_path, monkeypatch) -> None:
             clock.advance(_PAST_BACKOFF)
         asyncio.run(drain.drain_once())
 
-    assert _queue_status(catalog, finding_id) == "failed", (
+    assert _queue_status(catalog, finding_id) == "dead_letter", (
         "the per-finding ladder must reach the exhaustion edge -- otherwise the "
         "test would pass for the wrong reason (rung 3 simply never evaluated)"
     )
@@ -739,7 +739,7 @@ def test_threshold_above_schedule_length(tmp_path) -> None:
         for _ in range(8)
     ]
     assert returns == [False] * 7 + [True], "exhausts on the 8th, no IndexError before"
-    assert _queue_status(catalog, finding_id) == "failed"
+    assert _queue_status(catalog, finding_id) == "dead_letter"
 
 
 # --------------------------------------------------------------------------
@@ -884,7 +884,7 @@ def test_digest_redelivery_clears_rung3_incident(tmp_path, monkeypatch) -> None:
             clock.advance(_PAST_BACKOFF)
         asyncio.run(now_drain.drain_once())
     assert push.calls == ["push", "push"], "the primary was tried each drain"
-    assert _queue_status(catalog, finding_id) == "failed", "the finding exhausted"
+    assert _queue_status(catalog, finding_id) == "dead_letter", "the finding exhausted"
     assert _delivery_incident_open(catalog, finding_id), "rung 3 opened the incident"
 
     # Operator replays the dead-lettered finding -> the now row re-arms to pending.

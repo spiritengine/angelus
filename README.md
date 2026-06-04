@@ -319,11 +319,13 @@ transport degraded".
 exhausted content is actually re-delivered: the `now`-path reconciliation fires a
 paired `internal/delivery` clearance on every successful delivery (a no-op under
 the B30 gate unless an incident is open), so the incident auto-closes the instant
-the content gets out. The path that re-arms an exhausted (`failed`) queue row for
-redelivery — `angelus replay <fid>` (`catalog.replay_finding` via the daemon's
-`_op_replay` control op) — exists and is wired today, so this clear edge is
-built, not deferred. B15's dead-letter handling remains a separate concern; the
-clear edge does not wait on it.
+the content gets out. The path that re-arms an exhausted (`dead_letter`, B15)
+queue row for redelivery — `angelus replay <fid>` (`catalog.replay_finding` via
+the daemon's `_op_replay` control op) — exists and is wired today, so this clear
+edge is built, not deferred. The same exhaustion edge that opens the incident
+also sets the `pipe_queues` row to the terminal `dead_letter` state (B15): the
+row is the replayable record surfaced on `angelus health`, the incident is the
+off-box page belfry carries. A successful redelivery clears both.
 
 ### Autoremediation (fixers)
 
@@ -401,6 +403,7 @@ Subsequent migrations add:
 - `dep_health` is dropped and recreated by migration 0006 with the slice-5c dependency-registry shape (`dependency_name` PK, status CHECK, `last_check_at` and `updated_at` NOT NULL, nullable `detail`).
 - `digest_channel_attempts` — per-(pipe, channel) digest send-attempt counter so the digest path can consume the same channel_health threshold ladder the immediate path uses without inflating it by the per-cycle batch size. Daemon-restart-scoped (cleared at startup) to match `channel_health`. Migration 0007.
 - `immediate_channel_attempts` — per-(pipe, channel) immediate-path send-attempt counter (B7 fell-r1 Finding 3). After B7 fans internal/* findings to every channel, the per-(finding, pipe) `pipe_queues.attempts` row can no longer carry per-channel escalation (it inflates +N per drain and goes terminal on the first co-fanned success). This table tracks each channel's consecutive failures across findings and drives channel_health independently, while `pipe_queues.attempts` stays as the per-finding redelivery ladder. Daemon-restart-scoped (cleared at startup) to match `channel_health` and `digest_channel_attempts`. Migration 0010.
+- `pipe_queues.status` gains `dead_letter` and drops `failed` (B15). A finding whose per-finding redelivery ladder exhausts undelivered lands in the terminal `dead_letter` state — its own name, no longer colliding with the `dispatches` table's transient per-channel `failed`. Surfaced on `angelus health` (the dead-letter section: what was abandoned + a count) and replayable via `angelus replay <fid>`; belfry pages off-box via the paired `internal/delivery` incident (B14), not a direct read. Migration 0011 is a table-rebuild that renames every existing `failed` row to `dead_letter` and tightens the CHECK so `failed` can never be written to `pipe_queues` again.
 
 ## Service template
 

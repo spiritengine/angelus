@@ -594,6 +594,20 @@ def failure_surface(db_path: Path, state_path: Path) -> str | None:
     None). The pid/wedge checks remain the liveness backstop; an
     unreadable or schema-incomplete database must never manufacture a
     false DOWN here.
+
+    B15 (dead-letter): belfry deliberately does NOT add a direct read of
+    pipe_queues.status='dead_letter' rows. A product finding lands in
+    dead_letter on the SAME exhaustion edge that opens its rung-3
+    internal/delivery incident (B14), so the open-internal/* read above
+    already pages off-box for every product dead-letter -- a direct row read
+    would double-signal the identical event. The only dead_letter rows WITHOUT
+    a paired internal/delivery incident are internal/* findings (the rung-3
+    emission is guarded on `not _is_internal`); those have no redelivery path
+    to clear them, so a direct read would pin belfry red forever on cruft B14
+    intentionally avoided -- and their original internal/* incident already
+    pages here anyway. So the incident IS the off-box signal; the dead_letter
+    ROW detail (what to replay) belongs on the on-box health surface (B5), not
+    on belfry. See B15 report / the runner's rung-3 comment for the full call.
     """
     last_seen = read_failcheck_watermark(state_path)
     quoted = urllib.parse.quote(str(db_path), safe="/:")
