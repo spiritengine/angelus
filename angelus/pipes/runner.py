@@ -17,6 +17,7 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from angelus.channels import send_email, send_push
 from angelus.clock import Clock
+from angelus.faults import FaultRegistry
 from angelus.lodging import Channel, Pipe
 from angelus.sources.runner import _kill_and_reap
 from angelus.storage import Catalog
@@ -76,6 +77,7 @@ class PipeDrain:
         workdir: Path,
         known_pipes: set[str],
         clock: Clock | None = None,
+        faults: FaultRegistry | None = None,
     ) -> None:
         self.catalog = catalog
         # Time seam (B24). Defaults to the catalog's clock so the runner's
@@ -83,6 +85,14 @@ class PipeDrain:
         # one notion of "now"; the daemon passes its shared clock explicitly
         # and tests pass a FakeClock.
         self._clock = clock or catalog._clock
+        # Fault-injection seam (B28). Defaults to a registry built from
+        # ANGELUS_FAULT_INJECT at construction, so a test (or a B27 scenario
+        # fixture) can set the env flag before building the drain and force a
+        # channel to fail with no daemon. The daemon passes its shared registry
+        # explicitly so a live control op arms a fault across every pipe at
+        # once -- exactly the Clock-seam threading above. In-memory only; never
+        # persisted, so it is cleared on restart by construction.
+        self.faults = faults or FaultRegistry.from_env()
         # `pipe`, `channels`, and `known_pipes` are mutated across hot-reloads
         # by AngelusDaemon.apply_lodging, which does NOT take self.lock --
         # so the lock is NOT what serialises a drain against a reload (it
@@ -1012,6 +1022,14 @@ class PipeDrain:
         return "\n".join(lines)
 
     async def _send_channel(self, channel: Channel, message: str, subject: str) -> None:
+        # B28 fault injection: an armed fault for this channel raises a
+        # transport-shaped RuntimeError INSTEAD of dispatching, so the rest of
+        # the pipeline (per-channel health escalation, B13 failover, B14 ladder,
+        # B15 dead-letter) walks it exactly as a real transport failure. The
+        # overlay never touches the channel's real config -- it is a pure
+        # in-memory check, so it adds no blocking work and the no-hang shutdown
+        # bound is unaffected.
+        self.faults.raise_if_armed(channel.name)
         if channel.kind == "push":
             await send_push(channel, message, self.workdir)
         elif channel.kind == "email":

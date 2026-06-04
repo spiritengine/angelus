@@ -17,6 +17,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from angelus.clock import Clock
 from angelus.control import ControlServer
 from angelus.envfile import load_env_file, resolve_op_refs
+from angelus.faults import FaultRegistry
 from angelus.fixers.runner import run_python_fixer
 from angelus.logging_config import configure_logging
 from angelus.lodging import (
@@ -107,6 +108,13 @@ class AngelusDaemon:
         # the scheduler).
         self.clock = Clock()
         self.catalog = Catalog(self.connection, root, clock=self.clock)
+        # Fault-injection registry (B28). One per process, threaded into every
+        # PipeDrain below so a live `fault_inject` control op arms a fault
+        # across all pipes at once -- the same shared-seam threading as the
+        # clock. Seeded from ANGELUS_FAULT_INJECT so a scenario harness can
+        # bring the daemon up with a channel already failing. In-memory only:
+        # never persisted, cleared on restart by construction.
+        self.faults = FaultRegistry.from_env()
         self.lodging: Lodging = load_lodging(root)
         self.scheduler = AsyncIOScheduler(timezone="UTC")
         self.scheduler_semaphore = asyncio.Semaphore(10)
@@ -142,6 +150,7 @@ class AngelusDaemon:
                 root,
                 set(self.lodging.pipes),
                 clock=self.clock,
+                faults=self.faults,
             )
             for name, pipe in self.lodging.pipes.items()
         }
@@ -157,6 +166,7 @@ class AngelusDaemon:
                 "replay": self._op_replay,
                 "reprocess": self._op_reprocess,
                 "dep_record": self._op_dep_record,
+                "fault_inject": self._op_fault_inject,
             },
         )
 
@@ -555,6 +565,12 @@ class AngelusDaemon:
             "delivery": _delivery_surface(
                 self.catalog, list(self.lodging.pipes)
             ),
+            # Fault-injection safety rail (B28): any channel armed to fail via
+            # the live `fault_inject` op (or the ANGELUS_FAULT_INJECT seed) is
+            # surfaced here so an armed fault on the running daemon is
+            # impossible to silently forget. In-memory only -- a restart clears
+            # it, so the daemon-down health fallback correctly shows none.
+            "fault_injection": {"armed": self.faults.armed()},
         }
 
     async def _op_incident_list(self, _args: dict) -> dict:
@@ -672,6 +688,50 @@ class AngelusDaemon:
                 set(self.lodging.pipes),
             )
         return {"name": name, "status": status}
+
+    async def _op_fault_inject(self, args: dict) -> dict:
+        """Arm, clear, or list in-memory channel faults (B28).
+
+        Same construction as the write ops above -- async in signature only,
+        no `await` in the body -- but it touches NO sqlite at all: the fault
+        registry is pure in-memory process state, never persisted, so arming a
+        fault here is cleared on the next daemon restart by construction. A
+        ValueError is turned into {"ok": false, "error": ...} by
+        ControlServer._dispatch.
+
+        `action` selects the operation:
+          - "arm"/"clear" require `channel`. For "arm" it must name a
+            CONFIGURED channel (rejected otherwise so a typo cannot silently
+            arm nothing). "clear" accepts ANY name unconditionally: the
+            registry discard is idempotent, and a channel can be hot-reloaded
+            out of config while a stale armed entry lingers -- requiring it to
+            be configured would make that entry un-clearable individually.
+          - "clear_all" drops every armed fault;
+          - "list" returns the current set with no change.
+        Every action returns the resulting armed set (sorted) so the caller can
+        render the live state without a second round-trip.
+        """
+        action = args.get("action")
+        if action not in ("arm", "clear", "clear_all", "list"):
+            raise ValueError(
+                "fault_inject action must be 'arm', 'clear', 'clear_all', "
+                "or 'list'"
+            )
+        if action in ("arm", "clear"):
+            channel = args.get("channel")
+            if not isinstance(channel, str) or not channel:
+                raise ValueError(
+                    f"fault_inject {action} requires a non-empty channel"
+                )
+            if action == "arm":
+                if channel not in self.lodging.channels:
+                    raise ValueError(f"unknown channel: {channel}")
+                self.faults.arm(channel)
+            else:
+                self.faults.clear(channel)
+        elif action == "clear_all":
+            self.faults.clear_all()
+        return {"armed": self.faults.armed()}
 
     def _install_signal_handlers(self) -> None:
         loop = asyncio.get_running_loop()
@@ -814,6 +874,7 @@ class AngelusDaemon:
                 self.root,
                 new_known,
                 clock=self.clock,
+                faults=self.faults,
             )
             if new_pipe.cadence == "immediate":
                 self._spawn_pipe_loop(name)
