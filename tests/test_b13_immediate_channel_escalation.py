@@ -360,6 +360,74 @@ def test_live_channel_delivers_while_cofanned_channel_fails(
     assert _channel_attempts(catalog)[("now", "push")] == 1
 
 
+# --------------------------------------------------------------------------
+# (d') The atomic-mark crash window. When the first fanned channel delivers,
+#     record_dispatch(mark_queue=True) marks the finding's pipe_queues row
+#     'dispatched' in the SAME transaction as the 'sent' dispatch insert --
+#     BEFORE the next fanned channel is attempted. That ordering is the only
+#     thing closing a SIGKILL window: a later channel's send (e.g. SMTP) can
+#     take seconds, and a crash in that gap must not leave a committed 'sent'
+#     row beside a still-'pending' queue row, or the finding re-drains and
+#     RE-DELIVERS to the first channel on restart (duplicate page).
+#
+#     This is the ONE property no other test pins. The post-loop
+#     mark_pipe_items_dispatched backstop re-asserts the terminal state at the
+#     end of every in-process happy-path drain, so reverting the success branch
+#     to mark_queue=False leaves the *final* row status 'dispatched' and every
+#     other test still green -- the regression is invisible to any assertion
+#     that only inspects state AFTER the loop. The only way to see it is to
+#     observe the row's status mid-loop, at the instant the SECOND fanned
+#     channel is attempted: with mark_queue=True it is already 'dispatched';
+#     with mark_queue=False it is still 'pending' (the masked bug shape).
+# --------------------------------------------------------------------------
+
+
+def test_first_channel_success_marks_dispatched_before_next_channel_attempted(
+    tmp_path, monkeypatch
+) -> None:
+    """push (fanned first) delivers; email (fanned second) probes the finding's
+    pipe_queues status the instant it is attempted and CAPTURES it. The captured
+    value must be 'dispatched' -- which can only hold if push's success marked
+    the row atomically inside the channel loop (mark_queue=True on the success-
+    branch record_dispatch) rather than deferring to the post-loop backstop.
+
+    The probe records the status rather than asserting it: an AssertionError
+    raised inside the sender would be swallowed by the channel loop's broad
+    `except Exception` (it would be miscounted as an email transport failure),
+    so the discriminating check must run in the OUTER scope after the drain.
+
+    Discrimination: revert that record_dispatch to mark_queue=False and the
+    probe captures 'pending' (the backstop has not run yet), so `seen` reads
+    ['pending'] and the outer assertion fails. No other test catches that
+    revert, because they all inspect the row after the loop, where the backstop
+    has already re-asserted 'dispatched' and masked it.
+    """
+    catalog, drain = _drain(tmp_path)
+    seen: list[str | None] = []
+
+    push = _Recorder()  # `now`'s own channel, fanned first -> delivers
+    finding_id: int | None = None
+
+    async def email_probe(channel, *_args, **_kwargs):
+        # push already delivered this drain; capture the queue row's status at
+        # the instant this second fanned channel is attempted. Returning (no
+        # raise) means email itself "delivers" -- this probe is non-failing so
+        # nothing is swallowed and the captured value reaches the outer assert.
+        seen.append(_queue_status(catalog, finding_id))
+
+    monkeypatch.setattr(pipe_runner, "send_push", push)
+    monkeypatch.setattr(pipe_runner, "send_email", email_probe)
+
+    finding_id = _write_internal(catalog, "speakbot")
+    asyncio.run(drain.drain_once())
+
+    # email WAS attempted exactly once (so the probe ran), and at that instant
+    # push's success had ALREADY marked the queue row 'dispatched' atomically.
+    assert push.calls == ["push"]
+    assert seen == ["dispatched"]
+    assert _queue_status(catalog, finding_id) == "dispatched"
+
+
 def test_undelivered_finding_stays_retryable_without_inflation(
     tmp_path, monkeypatch
 ) -> None:
