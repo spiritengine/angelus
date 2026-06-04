@@ -30,8 +30,10 @@ co-fanned channel fails.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import angelus.pipes.runner as pipe_runner
+from angelus.daemon import AngelusDaemon
 from angelus.lodging import Channel, Pipe
 from angelus.pipes import PipeDrain
 from angelus.storage import Catalog, init_db
@@ -61,6 +63,61 @@ def _drain(tmp_path) -> tuple[Catalog, PipeDrain]:
     }
     drain = PipeDrain(catalog, NOW_PIPE, channels, tmp_path, {"now"})
     return catalog, drain
+
+
+def _drain_three(tmp_path) -> tuple[Catalog, PipeDrain]:
+    """A now-pipe drain over THREE channels for the skip+fail+succeed mix.
+
+    Only push and email kinds exist (_send_channel supports no others), so the
+    skipped channel shares the push kind with the live one: push_backup is
+    pre-marked unhealthy and therefore never invokes its sender, so routing two
+    push-kind channels through the one send_push double is unambiguous -- only
+    the live `push` ever calls it.
+    """
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    channels = {
+        "push": Channel(name="push", kind="push", command="notify-pat"),
+        "email": Channel(
+            name="email", kind="email", command="patbot-email", to="x@example.com"
+        ),
+        "push_backup": Channel(
+            name="push_backup", kind="push", command="notify-pat"
+        ),
+    }
+    drain = PipeDrain(catalog, NOW_PIPE, channels, tmp_path, {"now"})
+    return catalog, drain
+
+
+def _write_lodging(root: Path) -> None:
+    """On-disk lodging for the cross-restart test, which needs a real
+    AngelusDaemon (its startup clear methods + orphan reconcile). Mirrors the
+    `now`(push) + `daily`(email) shape other daemon tests use; the immediate
+    drain under test is `now`, fanning internal findings to push AND email."""
+    (root / "sources" / "scheduled").mkdir(parents=True)
+    (root / "sources" / "scheduled" / "watch.yaml").write_text(
+        "cadence: 1h\ncheck:\n  kind: shell\n  command: 'echo {}'\n",
+        encoding="utf-8",
+    )
+    (root / "pipes").mkdir()
+    (root / "pipes" / "now.yaml").write_text(
+        "cadence: immediate\nchannels: [push]\n"
+        "render:\n  kind: dumb-alert\n  template: '{type}:{entity}:{body}'\n",
+        encoding="utf-8",
+    )
+    (root / "pipes" / "daily.yaml").write_text(
+        "cadence: '0 8 * * *'\nchannels: [email]\n"
+        "render:\n  kind: dumb-alert\n  template: '{type}:{entity}:{body}'\n",
+        encoding="utf-8",
+    )
+    (root / "channels").mkdir()
+    (root / "channels" / "push.yaml").write_text(
+        "kind: push\ncommand: 'true'\n", encoding="utf-8"
+    )
+    (root / "channels" / "email.yaml").write_text(
+        "kind: email\ncommand: 'true'\nto: person@example.com\n",
+        encoding="utf-8",
+    )
 
 
 class _Recorder:
@@ -354,3 +411,218 @@ def _dispatch_rows(catalog: Catalog) -> list[tuple[str, str]]:
             "SELECT channel, status FROM dispatches ORDER BY id"
         )
     ]
+
+
+def _open_dispatch_incidents(catalog: Catalog, entity: str) -> list[dict]:
+    """Open internal/dispatch incidents for one channel (entity), oldest first."""
+    return [
+        incident
+        for incident in catalog.open_incidents()
+        if incident["source"] == "internal/dispatch" and incident["entity"] == entity
+    ]
+
+
+# --------------------------------------------------------------------------
+# (e) Finding 2 -- a pure-skip drain never burns the finding's redelivery
+#     budget. When EVERY fanned channel is unhealthy and skipped, no channel
+#     is attempted (last_error stays None), so the reconciliation must leave
+#     the pipe_queues row entirely untouched. This pins the single
+#     `elif last_error is not None:` guard that distinguishes "skipped" from
+#     "attempted-and-failed".
+# --------------------------------------------------------------------------
+
+
+def test_pure_skip_drain_leaves_finding_redelivery_budget_untouched(
+    tmp_path, monkeypatch
+) -> None:
+    """Both fanned channels are unhealthy before the drain, so both are SKIPPED
+    and neither sender is invoked. The finding was never attempted, so its
+    per-finding redelivery ladder must not advance: the pipe_queues row stays
+    exactly as enqueued (status 'pending', attempts 0, next_attempt_at NULL),
+    and no per-channel counter is created.
+
+    Discrimination: this fails if the reconciliation's
+    `elif last_error is not None:` guard is weakened to an unconditional
+    `else: record_pipe_finding_undelivered(...)`. Under that weakening a
+    skip-only drain (delivered False, last_error None) would still advance the
+    ladder -> attempts becomes 1 and next_attempt_at is set, so both assertions
+    below invert. The empty-sender-calls assertion separately proves the
+    channels were skipped, not attempted-and-swallowed.
+    """
+    catalog, drain = _drain(tmp_path)
+    push = _Recorder()  # would SUCCEED if ever called -- it must not be
+    email = _Recorder()
+    monkeypatch.setattr(pipe_runner, "send_push", push)
+    monkeypatch.setattr(pipe_runner, "send_email", email)
+
+    # Both fanned channels down before the finding is ever drained.
+    catalog.mark_channel_unhealthy("push", "pushd hung")
+    catalog.mark_channel_unhealthy("email", "smtp refused")
+
+    finding_id = _write_internal(catalog, "speakbot")
+    asyncio.run(drain.drain_once())
+
+    row = catalog.connection.execute(
+        """
+        SELECT attempts, status, next_attempt_at
+        FROM pipe_queues WHERE finding_id = ? AND pipe = 'now'
+        """,
+        (finding_id,),
+    ).fetchone()
+    assert row["attempts"] == 0, "a skip-only drain must not burn the redelivery budget"
+    assert row["status"] == "pending", "the finding stays pending for a later drain"
+    assert row["next_attempt_at"] is None, "no backoff was scheduled -- nothing was tried"
+    # No channel was attempted, so no per-channel counter exists either.
+    assert _channel_attempts(catalog) == {}
+    assert push.calls == [] and email.calls == []
+
+
+# --------------------------------------------------------------------------
+# (f) Finding 3a -- one drain exercising all three channel outcomes at once:
+#     a skipped (pre-unhealthy) channel, a failing channel, and a live channel
+#     that delivers. Pins that the three are accounted independently in a
+#     single pass.
+# --------------------------------------------------------------------------
+
+
+def test_single_drain_mixes_skip_fail_and_deliver(tmp_path, monkeypatch) -> None:
+    """push (live) delivers, email fails, push_backup is pre-unhealthy and
+    skipped. After one drain: the finding is delivered (row 'dispatched'), the
+    failing channel's counter is +1, the skipped channel's counter is absent
+    (never attempted), and delivery happened on the live channel only.
+
+    Discrimination:
+    - delivery on the live channel while a co-fanned channel fails is B7's
+      load-bearing property; send_push.calls == ["push"] (NOT including the
+      skipped push_backup) proves the skip guard held -- a broken skip would
+      attempt push_backup through the same send_push double and append it.
+    - the skipped channel has no per-channel counter, so a skip is not miscounted
+      as a failure.
+    """
+    catalog, drain = _drain_three(tmp_path)
+    push = _Recorder()  # live; the pipe's own channel, attempted first
+    email = _Recorder(fail=True)  # fanned-in, down
+    monkeypatch.setattr(pipe_runner, "send_push", push)
+    monkeypatch.setattr(pipe_runner, "send_email", email)
+
+    # push_backup is unhealthy before the drain -> skipped, not attempted.
+    catalog.mark_channel_unhealthy("push_backup", "backup pushd down")
+
+    finding_id = _write_internal(catalog, "speakbot")
+    asyncio.run(drain.drain_once())
+
+    # Delivered over the live channel -> the single pipe_queues row is terminal.
+    assert _queue_status(catalog, finding_id) == "dispatched"
+    assert ("push", "sent") in _dispatch_rows(catalog)
+    # Live channel delivered; the skipped backup never invoked its sender.
+    assert push.calls == ["push"]
+    assert email.calls == ["email"]
+    # The failing channel laddered by one; the skipped one has no counter at all;
+    # the live channel's counter was reset by its success.
+    attempts = _channel_attempts(catalog)
+    assert attempts[("now", "email")] == 1
+    assert ("now", "push_backup") not in attempts
+    assert ("now", "push") not in attempts
+    # A single failure does not flip the failing channel unhealthy either.
+    assert _unhealthy_channels(catalog) == {"push_backup"}
+
+
+# --------------------------------------------------------------------------
+# (g) Finding 3b -- end-to-end cross-restart recovery. A channel escalated via
+#     the per-channel counter (unhealthy + internal/dispatch incident) is fully
+#     re-armed by the daemon's startup clear sequence: counter wiped, channel
+#     healthy, incident reconciled, and a single post-restart failure starts the
+#     ladder from zero rather than re-crossing immediately.
+# --------------------------------------------------------------------------
+
+
+def test_escalated_channel_clears_and_rearms_across_restart(
+    tmp_path, monkeypatch
+) -> None:
+    """Drive push to MAX_RETRY_ATTEMPTS failures over the REAL daemon drain
+    (each finding delivered by a live email, so this is the defect-(b) shape):
+    push goes unhealthy and an internal/dispatch incident opens. Then run the
+    exact startup clear sequence (clear_channel_health +
+    clear_digest_channel_attempts + clear_immediate_channel_attempts +
+    _reconcile_orphaned_internal_incidents) the daemon runs on boot, and assert
+    the channel is fully re-armed.
+
+    Discrimination:
+    - if clear_immediate_channel_attempts were NOT part of startup, push's
+      counter would survive at MAX_RETRY_ATTEMPTS and the first post-restart
+      failure would re-cross the threshold immediately; the single-failure
+      assertion (counter == 1, push still healthy) fails.
+    - if the internal/dispatch reconcile did not run, the B30 gate would stay
+      armed-open and the re-escalation would NOT write a fresh incident; the
+      new-incident-id assertion fails.
+    """
+    _write_lodging(tmp_path)
+    push = _Recorder(fail=True)
+    email = _Recorder()  # live -> each finding is delivered, push counter climbs
+    monkeypatch.setattr(pipe_runner, "send_push", push)
+    monkeypatch.setattr(pipe_runner, "send_email", email)
+
+    daemon = AngelusDaemon(tmp_path)
+    try:
+        drain = daemon.pipe_drains["now"]
+        known_pipes = set(daemon.lodging.pipes)
+
+        # Escalate push to threshold: MAX_RETRY_ATTEMPTS distinct findings, each
+        # delivered by email while push fails, so push's per-channel counter
+        # accumulates across findings and crosses on the last drain.
+        for i in range(MAX_RETRY_ATTEMPTS):
+            daemon.catalog.write_internal_finding(
+                "internal/dep", "down", f"dep-{i}", f"{i} down", known_pipes
+            )
+            asyncio.run(drain.drain_once())
+
+        assert daemon.catalog.is_channel_unhealthy("push")
+        opened = _open_dispatch_incidents(daemon.catalog, "push")
+        assert len(opened) == 1
+        first_incident_id = opened[0]["id"]
+        assert _channel_attempts(daemon.catalog)[("now", "push")] == MAX_RETRY_ATTEMPTS
+
+        # The threshold-crossing drain wrote the internal/dispatch finding mid-
+        # drain (after the pending-row snapshot), so it is itself still pending.
+        # Flush it now -- push is unhealthy so it is SKIPPED on push (counter
+        # unchanged) while email delivers it -- leaving no leftover pending
+        # finding to muddy the isolated single post-restart failure below.
+        asyncio.run(drain.drain_once())
+        assert _channel_attempts(daemon.catalog)[("now", "push")] == MAX_RETRY_ATTEMPTS
+
+        # --- simulate restart: the exact startup clear sequence (daemon.run) ---
+        daemon.catalog.clear_channel_health()
+        daemon.catalog.clear_digest_channel_attempts()
+        daemon.catalog.clear_immediate_channel_attempts()
+        daemon._reconcile_orphaned_internal_incidents()
+
+        # Counter wiped, channel healthy again, incident reconciled closed.
+        assert ("now", "push") not in _channel_attempts(daemon.catalog)
+        assert not daemon.catalog.is_channel_unhealthy("push")
+        assert _open_dispatch_incidents(daemon.catalog, "push") == []
+
+        # A SINGLE post-restart push failure starts the ladder from zero: counter
+        # == 1, push stays healthy, no fresh escalation yet.
+        daemon.catalog.write_internal_finding(
+            "internal/dep", "down", "after-restart", "still down", known_pipes
+        )
+        asyncio.run(drain.drain_once())
+        assert _channel_attempts(daemon.catalog)[("now", "push")] == 1
+        assert not daemon.catalog.is_channel_unhealthy("push")
+        assert _open_dispatch_incidents(daemon.catalog, "push") == []
+
+        # The lifecycle re-arms cleanly: driving the remaining failures to
+        # threshold re-escalates and opens a NEW incident (gate re-armed by the
+        # reconcile clearance), distinct from the pre-restart one.
+        for i in range(MAX_RETRY_ATTEMPTS - 1):
+            daemon.catalog.write_internal_finding(
+                "internal/dep", "down", f"rearm-{i}", "down again", known_pipes
+            )
+            asyncio.run(drain.drain_once())
+
+        assert daemon.catalog.is_channel_unhealthy("push")
+        reopened = _open_dispatch_incidents(daemon.catalog, "push")
+        assert len(reopened) == 1
+        assert reopened[0]["id"] != first_incident_id
+    finally:
+        daemon.connection.close()

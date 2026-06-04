@@ -272,20 +272,31 @@ class PipeDrain:
                         )
                 else:
                     delivered = True
-                    # mark_queue=False: the finding's pipe_queues row is marked
-                    # dispatched ONCE after the loop (the reconciliation below),
-                    # based on whether ANY channel delivered -- not as a side
-                    # effect of whichever channel happened to succeed first. The
-                    # old default (mark_queue=True) is exactly what marked the
-                    # row terminal on first success and starved a co-fanned
-                    # channel's escalation (defect b).
+                    # mark_queue=True: the finding's pipe_queues row is marked
+                    # 'dispatched' atomically, in the SAME transaction as this
+                    # 'sent' dispatch insert, before the remaining fanned channels
+                    # are attempted. That atomicity is load-bearing against
+                    # duplicate redelivery: _send_channel for a later channel
+                    # (e.g. SMTP) can take multiple seconds, and a SIGKILL in that
+                    # window must not leave a committed 'sent' row beside a still-
+                    # 'pending' pipe_queues row -- on restart the finding would
+                    # re-drain and RE-DELIVER to this channel (duplicate page).
+                    # Deferring the mark to the post-loop reconciliation widened
+                    # exactly that crash window.
+                    #
+                    # This does NOT starve a co-fanned channel's escalation: that
+                    # now runs off the per-(pipe, channel) immediate_channel_attempts
+                    # counter (record_immediate_send_failure), called on every
+                    # channel failure regardless of the pipe_queues row's status.
+                    # The counter split alone fixes defect (b); the old shared-
+                    # counter coupling that made mark_queue=True starve escalation
+                    # no longer exists.
                     self.catalog.record_dispatch(
                         pipe.name,
                         channel.name,
                         [finding_id],
                         "sent",
                         source=row["source"],
-                        mark_queue=False,
                     )
                     # Per-channel recovery edge: a successful send resets this
                     # channel's escalation counter (only CONSECUTIVE failures
@@ -312,11 +323,11 @@ class PipeDrain:
             # question: did this finding reach a live transport this drain, and
             # if not, should it be retried later?
             if delivered:
-                # >=1 live channel got the finding out -> delivered. Mark the
-                # single pipe_queues row terminal so it does not redeliver. This
-                # preserves the old "first success -> dispatched" outcome, but
-                # decided ONCE for the finding here rather than as a side effect
-                # of an arbitrary channel's record_dispatch.
+                # >=1 live channel got the finding out. The pipe_queues row was
+                # already marked 'dispatched' atomically by the first successful
+                # record_dispatch (mark_queue=True) above; this is an idempotent
+                # backstop that re-asserts the terminal state and keeps the
+                # delivered/undelivered reconciliation symmetric and explicit.
                 self.catalog.mark_pipe_items_dispatched(pipe.name, [finding_id])
             elif last_error is not None:
                 # No channel delivered it AND at least one channel was actually
