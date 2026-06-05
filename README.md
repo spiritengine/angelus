@@ -124,6 +124,12 @@ delivering. Output is plain text, one item per line (no tables/columns). The
 same delivery surface renders on the daemon-down read-only fallback, since it
 is built from the dispatch/incident schema rather than live daemon state.
 
+A **fault injection** section lists any channels with a fault armed against
+them (see [Fault injection](#fault-injection-exercising-the-machinery)). It
+reads `none` when nothing is armed — which is also what the daemon-down
+fallback always shows, since armed faults are in-memory live-daemon state. The
+section exists so an armed fault on the live daemon can't be silently forgotten.
+
 ### Logging
 
 The daemon writes one canonical, tail-able log at `state/angelus.log` (a
@@ -375,6 +381,39 @@ plumbing.
 template (and the `observe.py` handler it points at is the copy-me starting
 point for a real fixer).
 
+### Fault injection (exercising the machinery)
+
+All the reliability machinery above — per-channel health escalation, transport
+failover, the escalation ladder, dead-lettering, fixers — is only as
+trustworthy as our ability to *exercise* it. **Fault injection** forces a
+specific channel's dispatch to fail on demand, one channel at a time, so that
+machinery runs end-to-end against a real failure **without touching channel
+config**. An armed channel's next send raises a transport-shaped error at the
+single dispatch chokepoint (`PipeDrain._send_channel`), so it is indistinguishable
+downstream from a genuine outage and walks the exact same failover → ladder →
+dead-letter path. Real config is never edited; the fault is an in-memory overlay.
+
+There are two ways to arm a fault, sharing one registry:
+
+- **The live daemon** — `angelus fault-inject <channel>` arms a fault on a
+  running daemon (a `fault_inject` control op, same socket pattern as
+  `mute`/`replay`). `--clear <channel>` clears one, `--clear-all` clears every
+  armed fault, `--list` shows what's armed. Every action requires the daemon —
+  the registry is in-memory only, so there is no persisted state to fall back
+  to, and a **restart clears every armed fault**. Armed faults surface in
+  `angelus health` (the fault-injection section above) so a live arming can't be
+  forgotten.
+
+- **Offline, no daemon** — the `ANGELUS_FAULT_INJECT` env var (comma-separated
+  channel names) arms faults at `PipeDrain` construction. This is the path
+  scenario fixtures and tests use: set the var, build the drain, and the named
+  channels fail their sends. Unset/empty arms nothing.
+
+The injected failure is the same `RuntimeError` shape a real `send_email`/
+`send_push` failure raises, and the drain catches it the same way, which is the
+whole point — a test or scenario armed via either path proves the *real*
+detection and remediation code runs, not a stubbed approximation. (B28.)
+
 ## Storage
 
 SQLite is the authoritative lifecycle store. Migrations live in `migrations/` as ordered SQL files named `<NNNN>_<name>.sql`. The storage initializer enables WAL mode and applies pending migrations in order, with each migration and its `schema_migrations` bookkeeping recorded atomically.
@@ -414,3 +453,11 @@ Subsequent migrations add:
 ```sh
 pytest
 ```
+
+When a test or scenario needs a channel's dispatch to fail, use the fault
+injection seam ([Fault injection](#fault-injection-exercising-the-machinery))
+rather than monkeypatching `send_email`/`send_push`: set
+`ANGELUS_FAULT_INJECT=<channel>` before building the `PipeDrain`, or pass a
+`FaultRegistry` (`angelus.faults`) into it directly. The drain then fails the
+named channel through the real dispatch path, so the test exercises the actual
+detection and remediation code instead of a stubbed sender.
