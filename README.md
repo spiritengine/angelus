@@ -381,6 +381,33 @@ plumbing.
 template (and the `observe.py` handler it points at is the copy-me starting
 point for a real fixer).
 
+### Forcing scheduled work on demand (drain / fire-source)
+
+Sources fire and pipes drain on their configured cron cadence. Two control ops
+let an operator (or agent) run that work **now**, without editing cron or
+waiting for the next tick — for testing a freshly-lodged source, flushing a
+digest after a fix, or driving a scenario:
+
+- `angelus drain <pipe>` runs a named pipe's drain immediately and returns a
+  summary — `dispatched: N` / `failed: N`. Any pipe kind works, including the
+  immediate `now` pipe and a `daily` digest. The counts are **channel send
+  attempts**, not findings: a finding fanned to two channels is two dispatched,
+  a fault-failed send is one failed, and a *skip* (a muted finding, an
+  already-unhealthy channel, a rate-limit overflow) is neither — it was never a
+  send attempt. A manual drain takes the same per-pipe lock as a scheduled one,
+  so the two serialise, and it is tracked exactly like a scheduled drain so a
+  shutdown mid-drain reaps it within the no-hang bound.
+
+- `angelus fire-source <name>` runs a source's check once, producing one
+  observation (which the triage loop then picks up as usual), and returns the
+  observation id and `outcome` (`ok`, or `check_failed` for a non-zero/timeout/
+  bad-payload check — an observation is written either way). It acquires the same
+  concurrency semaphore scheduled fires use.
+
+Both are **writes** — they go through the daemon (the single sqlite writer, and
+the only process that can actually send or fire), so they require the daemon and
+have no read-only fallback. (B25.)
+
 ### Fault injection (exercising the machinery)
 
 All the reliability machinery above — per-channel health escalation, transport

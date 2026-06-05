@@ -1,5 +1,5 @@
 """Pipe runners."""
 
-from .runner import PipeDrain
+from .runner import DrainSummary, PipeDrain
 
-__all__ = ["PipeDrain"]
+__all__ = ["DrainSummary", "PipeDrain"]

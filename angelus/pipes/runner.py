@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -66,6 +67,41 @@ DIGEST_HEARTBEAT_URL_ENV = "ANGELUS_DIGEST_HEARTBEAT_URL"
 # delayed in practice. A pathological trickle from the operator's own healthcheck
 # URL is the only residual -- bounded per-recv, capped read below, accepted.
 DIGEST_HEARTBEAT_TIMEOUT_SEC = 5.0
+
+
+@dataclass(frozen=True)
+class DrainSummary:
+    """Outcome tally for one drain_once() call (B25).
+
+    Counts CHANNEL SEND ATTEMPTS, not findings and not pipe_queues rows:
+    ``dispatched`` is the number of ``_send_channel`` calls that returned
+    cleanly this drain, ``failed`` the number that raised. That is the
+    "send-action outcome" semantic -- one increment per actual transport
+    attempt -- chosen for three reasons:
+
+    - It is the one count consistent across BOTH drain paths. The immediate
+      path records a *failed* dispatch row only on the digest side; an
+      immediate send failure runs through record_immediate_send_failure, NOT
+      record_dispatch("failed"), so counting dispatch ROWS would silently
+      report failed=0 for every immediate outage. Counting at the
+      ``_send_channel`` call site is the only place both paths agree.
+    - It naturally covers the B7 fan and B13 failover: each fanned channel and
+      each failover backup is its own ``_send_channel`` attempt, so a finding
+      that reaches two channels counts as two dispatched, and one that fails
+      over from a degraded primary to a live backup counts the backup send.
+    - Skips are NOT attempts and so count as neither: a channel skipped because
+      it is already unhealthy, a muted finding, and a rate-limit-overflow
+      suppression never call ``_send_channel``, so they move neither counter --
+      matching the runner's own "a skip is not a delivery attempt" rule.
+
+    Tallied inline as the drain walks its send sites and threaded up through
+    drain_once; the count cannot drift from a post-hoc re-query of the
+    dispatches table (which would also be racy across concurrently-draining
+    pipes). The exact semantic is pinned by test_b25_drain_fire_ops.
+    """
+
+    dispatched: int = 0
+    failed: int = 0
 
 
 class PipeDrain:
@@ -127,23 +163,31 @@ class PipeDrain:
         self.known_pipes = known_pipes
         self.lock = asyncio.Lock()
 
-    async def drain_once(self) -> None:
+    async def drain_once(self) -> DrainSummary:
+        # Returns a DrainSummary (B25) so the manual `drain` control op can
+        # report dispatched/failed counts. Additive: the scheduler job body
+        # (_run_drain_job) and the immediate per-pipe loop (_pipe_loop) await
+        # this and ignore the return, exactly as before.
         async with self.lock:
             pipe = self.pipe
             channels = self.channels
             known_pipes = self.known_pipes
             if pipe.render_kind == "digest":
-                await self._drain_digest(pipe, channels, known_pipes)
-                return
-            await self._drain_immediate(pipe, channels, known_pipes)
+                return await self._drain_digest(pipe, channels, known_pipes)
+            return await self._drain_immediate(pipe, channels, known_pipes)
 
     async def _drain_immediate(
         self,
         pipe: Pipe,
         channels: dict[str, Channel],
         known_pipes: set[str],
-    ) -> None:
+    ) -> DrainSummary:
         rows = self.catalog.pending_pipe_items(pipe.name)
+        # B25 send-action tally (see DrainSummary): one increment per actual
+        # _send_channel attempt, threaded up so the manual drain op can report
+        # dispatched/failed without a racy re-query of the dispatches table.
+        dispatched = 0
+        failed = 0
         for row in rows:
             finding_id = int(row["id"])
             message = self._render(pipe, row)
@@ -253,6 +297,7 @@ class PipeDrain:
                 try:
                     await self._send_channel(channel, message, subject)
                 except Exception as exc:
+                    failed += 1  # B25: this send attempt raised.
                     last_error = str(exc)
                     # Per-CHANNEL health escalation, driven by the per-(pipe,
                     # channel) counter -- NOT the finding's pipe_queues row. This
@@ -311,6 +356,7 @@ class PipeDrain:
                         )
                 else:
                     delivered = True
+                    dispatched += 1  # B25: this send attempt succeeded.
                     # mark_queue=True: the finding's pipe_queues row is marked
                     # 'dispatched' atomically, in the SAME transaction as this
                     # 'sent' dispatch insert, before the remaining fanned channels
@@ -387,6 +433,7 @@ class PipeDrain:
                     try:
                         await self._send_channel(backup, message, subject)
                     except Exception as exc:
+                        failed += 1  # B25: the failover backup send raised.
                         last_error = str(exc)
                         # The backup itself failed its send. Ladder its OWN
                         # per-channel health exactly like a primary failure, so a
@@ -428,6 +475,7 @@ class PipeDrain:
                             )
                     else:
                         delivered = True
+                        dispatched += 1  # B25: the failover backup send succeeded.
                         # A degraded primary's content got out over its backup --
                         # WARNING (not INFO): delivery happened, but only because
                         # the primary transport is down, which an operator should
@@ -602,6 +650,7 @@ class PipeDrain:
                         f"pipe={pipe.name} last_error={last_error}",
                         known_pipes,
                     )
+        return DrainSummary(dispatched=dispatched, failed=failed)
 
     def _dispatch_channels(
         self,
@@ -716,14 +765,19 @@ class PipeDrain:
         pipe: Pipe,
         channels: dict[str, Channel],
         known_pipes: set[str],
-    ) -> None:
+    ) -> DrainSummary:
         drained_at = self._clock.now_iso()
         last_drain_at = self.catalog.last_pipe_drain_at(pipe.name)
         pending_rows = self.catalog.pending_pipe_items(pipe.name, limit=None)
         finding_ids = [int(row["id"]) for row in pending_rows]
         structured = self._structured_inputs(pipe, last_drain_at)
         if not pending_rows and _is_same_utc_day(last_drain_at, drained_at):
-            return
+            # Nothing to send this cycle -> no send attempts, an empty tally.
+            return DrainSummary()
+        # B25 send-action tally (see DrainSummary): one increment per channel
+        # _send_channel attempt on this digest cycle.
+        dispatched = 0
+        failed = 0
         preamble = self._render_preamble(pipe, structured)
         body, llm_error = await self._render_llm_body(pipe, structured)
         if llm_error is not None:
@@ -818,6 +872,7 @@ class PipeDrain:
             try:
                 await self._send_channel(channel, payload, subject)
             except Exception as exc:
+                failed += 1  # B25: this digest send attempt raised.
                 # The daily digest is the routine-delivery contract; a failed
                 # send here is the exact 2026-05-29 silent-failure shape, so
                 # log ERROR in addition to the failed dispatch row and the
@@ -860,6 +915,7 @@ class PipeDrain:
                 )
             else:
                 any_channel_succeeded = True
+                dispatched += 1  # B25: this digest send attempt succeeded.
                 self.catalog.record_dispatch(
                     pipe.name,
                     channel.name,
@@ -928,6 +984,7 @@ class PipeDrain:
             # liveness-only) cannot see. Best-effort and last, after the drain
             # is fully recorded, so a slow endpoint cannot affect delivery.
             await self._ping_digest_heartbeat()
+        return DrainSummary(dispatched=dispatched, failed=failed)
 
     async def _ping_digest_heartbeat(self) -> None:
         """Best-effort dead-man ping after a successful digest drain.

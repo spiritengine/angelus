@@ -29,7 +29,7 @@ from angelus.lodging import (
     missing_channel_config,
 )
 from angelus.lodging.reloader import LodgingReloader
-from angelus.pipes import PipeDrain
+from angelus.pipes import DrainSummary, PipeDrain
 from angelus.sources import run_shell_source
 from angelus.storage import Catalog, init_db
 from angelus.triage import run_python_triager
@@ -127,13 +127,17 @@ class AngelusDaemon:
         # on cadence change without disturbing others, and so cancelled tasks
         # don't accumulate in self.tasks across pipe churn.
         self._pipe_loop_tasks: dict[str, asyncio.Task[None]] = {}
-        # In-flight non-immediate (cron/interval) digest-drain job tasks.
-        # AsyncIOExecutor.shutdown() cancels these on shutdown but does not
-        # await them, and they are not in `pending` -- so a cancelled drain's
-        # reap arm (_render_llm_body -> _kill_and_reap) would race event-loop
-        # teardown and orphan the horizon cast subtree. Each drain registers
-        # its task here on entry and discards on exit; run()'s finally cancels
-        # and awaits the set. Mirrors _triage_loop's in_flight handling.
+        # In-flight drain job tasks: the scheduled (cron/interval) digest-drain
+        # jobs, plus any manually-triggered drain from the `drain` control op
+        # (_op_drain), which can target ANY pipe kind -- the immediate `now`
+        # pipe as well as a digest pipe. AsyncIOExecutor.shutdown() cancels
+        # these on shutdown but does not await them, and they are not in
+        # `pending` -- so a cancelled drain's reap arm (the digest path's
+        # _render_llm_body -> _kill_and_reap horizon cast subtree, or an
+        # immediate send's transport subprocess) would race event-loop teardown
+        # and orphan the child tree. Each drain registers its task here on entry
+        # and discards on exit; run()'s finally cancels and awaits the set.
+        # Mirrors _triage_loop's in_flight handling.
         self._drain_tasks: set[asyncio.Task[None]] = set()
         # The fixer-evaluation loop (B11). Held separately from self.tasks
         # because, unlike the triage loop (whose body only awaits sleep and
@@ -167,6 +171,8 @@ class AngelusDaemon:
                 "reprocess": self._op_reprocess,
                 "dep_record": self._op_dep_record,
                 "fault_inject": self._op_fault_inject,
+                "drain": self._op_drain,
+                "fire_source": self._op_fire_source,
             },
         )
 
@@ -733,6 +739,73 @@ class AngelusDaemon:
             self.faults.clear_all()
         return {"armed": self.faults.armed()}
 
+    async def _op_drain(self, args: dict) -> dict:
+        """Run a named pipe's drain on demand and return its summary (B25).
+
+        Unlike the cancel-safe write ops above this one genuinely AWAITS work
+        (the drain sends over real transports), so it must not break the
+        project's <8s no-hang shutdown bound. It does NOT call drain_once()
+        raw: it runs _run_drain_job in its OWN asyncio task, which registers
+        that task in self._drain_tasks for its whole lifetime -- the exact
+        shape a scheduled (cron/interval) drain has. run()'s finally cancels
+        and awaits self._drain_tasks on shutdown, so a manual drain in flight
+        when shutdown lands is reaped with the scheduled ones (its
+        CancelledError reap arm runs) instead of outliving teardown. drain_once
+        already takes the per-pipe self.lock, so a manual drain serialises with
+        a concurrent scheduled drain on the same pipe -- no new locking here.
+
+        The named pipe may be ANY kind, including the immediate `now` pipe;
+        drain_once branches to the digest or immediate path itself. An unknown
+        pipe name is rejected before any task is spawned (mirroring
+        fault_inject's unknown-channel rejection) so a typo surfaces loudly
+        rather than draining nothing. A None summary means the pipe was
+        hot-reloaded out between validation and the drain -- the same
+        vanished-target race, surfaced the same way.
+        """
+        pipe_name = args.get("pipe")
+        if not isinstance(pipe_name, str) or not pipe_name:
+            raise ValueError("drain requires a non-empty pipe name")
+        if pipe_name not in self.pipe_drains:
+            raise ValueError(f"unknown pipe: {pipe_name}")
+        summary = await asyncio.create_task(self._run_drain_job(pipe_name))
+        if summary is None:
+            raise ValueError(f"unknown pipe: {pipe_name}")
+        return {
+            "pipe": pipe_name,
+            "dispatched": summary.dispatched,
+            "failed": summary.failed,
+        }
+
+    async def _op_fire_source(self, args: dict) -> dict:
+        """Run a source's check once on demand and return the observation (B25).
+
+        Reuses _fire_source -- the same body the scheduler runs -- so the
+        manual fire is indistinguishable from a scheduled one: it acquires
+        self.scheduler_semaphore (bounding it against concurrent scheduled
+        fires), runs the shell check, records the fire, and writes the
+        observation. _fire_source returns the (observation_id, outcome) the op
+        shapes its response from; the scheduler ignores that return.
+
+        An unknown source name is rejected before the fire (mirroring drain's
+        unknown-pipe rejection). A None result means the source was
+        hot-reloaded out between validation and the fire -- the vanished-target
+        race, surfaced as unknown.
+        """
+        name = args.get("name")
+        if not isinstance(name, str) or not name:
+            raise ValueError("fire_source requires a non-empty source name")
+        if name not in self.lodging.sources:
+            raise ValueError(f"unknown source: {name}")
+        result = await self._fire_source(name)
+        if result is None:
+            raise ValueError(f"unknown source: {name}")
+        observation_id, outcome = result
+        return {
+            "source": name,
+            "observation_id": observation_id,
+            "outcome": outcome,
+        }
+
     def _install_signal_handlers(self) -> None:
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -776,7 +849,7 @@ class AngelusDaemon:
         )
         LOGGER.info("registered pipe %s on %s", pipe_name, cadence)
 
-    async def _run_drain_job(self, pipe_name: str) -> None:
+    async def _run_drain_job(self, pipe_name: str) -> DrainSummary | None:
         """Scheduler job body for a non-immediate (cron/interval) pipe.
 
         Wraps drain.drain_once() so the running asyncio task is tracked in
@@ -784,15 +857,21 @@ class AngelusDaemon:
         cancels this task on daemon shutdown but does not await it, and it is
         not in run()'s `pending`; the tracking lets run()'s finally cancel and
         await it so the CancelledError reap arm runs before the loop closes.
+
+        Returns drain_once's DrainSummary (B25) so the manual `drain` op can
+        report dispatched/failed counts. The scheduler ignores the return; the
+        op runs this in its own create_task so a manually-triggered drain is a
+        standalone tracked task reaped on shutdown exactly like a scheduled one.
+        None is returned only if the pipe was hot-removed before the drain ran.
         """
         drain = self.pipe_drains.get(pipe_name)
         if drain is None:
-            return
+            return None
         task = asyncio.current_task()
         if task is not None:
             self._drain_tasks.add(task)
         try:
-            await drain.drain_once()
+            return await drain.drain_once()
         finally:
             if task is not None:
                 self._drain_tasks.discard(task)
@@ -899,11 +978,20 @@ class AngelusDaemon:
         except (asyncio.CancelledError, Exception):
             pass
 
-    async def _fire_source(self, source_ref: str) -> None:
+    async def _fire_source(self, source_ref: str) -> tuple[int, str] | None:
+        """Run a source's shell check, record the fire, write the observation.
+
+        Returns (observation_id, outcome) -- outcome is "ok" on a clean check
+        and "check_failed" on a non-zero/timeout/bad-payload check -- so the
+        manual `fire_source` op (B25) can surface what the fire produced. The
+        scheduler caller (the registered job) ignores the return; the change is
+        additive. Returns None only when the source was hot-removed before the
+        fire (the vanished-target race), matching how the op treats it.
+        """
         source = self.lodging.sources.get(source_ref)
         if source is None:
             LOGGER.info("scheduled source %s vanished before fire", source_ref)
-            return
+            return None
         async with self.scheduler_semaphore:
             ok, payload = await run_shell_source(source)
             outcome = "ok" if ok else "check_failed"
@@ -926,6 +1014,7 @@ class AngelusDaemon:
                     {"source": source.source_ref, "check": "shell", "outcome": outcome},
                 )
                 LOGGER.warning("source %s failed: %s", source.source_ref, payload)
+            return observation_id, outcome
 
     async def _triage_loop(self) -> None:
         in_flight: set[asyncio.Task[None]] = set()
