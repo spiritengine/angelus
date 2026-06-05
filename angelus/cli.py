@@ -460,6 +460,48 @@ def fault_inject(
     _render_armed(result)
 
 
+@main.command()
+@click.argument("pipe")
+@_ROOT_OPTION
+def drain(pipe: str, root: Path) -> None:
+    """Run PIPE's drain now and report the dispatch summary (B25).
+
+    Forces a named pipe's drain on demand instead of waiting for its cron
+    cadence -- a daily digest, the immediate `now` pipe, any kind. A WRITE: it
+    goes through the daemon (the single sqlite writer, and the only process
+    that can actually send), so it REQUIRES the daemon and has no read-only
+    fallback. The summary counts channel send ATTEMPTS this drain: `dispatched`
+    succeeded, `failed` raised (skips -- a muted finding, an already-unhealthy
+    channel, a rate-limit overflow -- are neither).
+    """
+    root = root.resolve()
+    result = _require_daemon(root, "drain", {"pipe": pipe}, "drain")
+    click.echo(f"pipe: {result['pipe']}")
+    click.echo(f"dispatched: {result['dispatched']}")
+    click.echo(f"failed: {result['failed']}")
+
+
+@main.command("fire-source")
+@click.argument("name")
+@_ROOT_OPTION
+def fire_source(name: str, root: Path) -> None:
+    """Run source NAME's check once now and report the observation (B25).
+
+    Forces a source's scheduled check on demand instead of waiting for its
+    cadence, producing one observation (which the triage loop then picks up as
+    usual). A WRITE: it goes through the daemon (the single sqlite writer, and
+    the only process that runs scheduled checks), so it REQUIRES the daemon and
+    has no read-only fallback. `outcome` is `ok` on a clean check or
+    `check_failed` on a non-zero/timeout/bad-payload check -- an observation is
+    written either way.
+    """
+    root = root.resolve()
+    result = _require_daemon(root, "fire_source", {"name": name}, "fire-source")
+    click.echo(f"source: {result['source']}")
+    click.echo(f"observation: {result['observation_id']}")
+    click.echo(f"outcome: {result['outcome']}")
+
+
 def _render_armed(result: dict[str, Any]) -> None:
     """Armed faults, one channel per line (screen-reader plain text)."""
     armed = result.get("armed") or []
