@@ -127,13 +127,17 @@ class AngelusDaemon:
         # on cadence change without disturbing others, and so cancelled tasks
         # don't accumulate in self.tasks across pipe churn.
         self._pipe_loop_tasks: dict[str, asyncio.Task[None]] = {}
-        # In-flight non-immediate (cron/interval) digest-drain job tasks.
-        # AsyncIOExecutor.shutdown() cancels these on shutdown but does not
-        # await them, and they are not in `pending` -- so a cancelled drain's
-        # reap arm (_render_llm_body -> _kill_and_reap) would race event-loop
-        # teardown and orphan the horizon cast subtree. Each drain registers
-        # its task here on entry and discards on exit; run()'s finally cancels
-        # and awaits the set. Mirrors _triage_loop's in_flight handling.
+        # In-flight drain job tasks: the scheduled (cron/interval) digest-drain
+        # jobs, plus any manually-triggered drain from the `drain` control op
+        # (_op_drain), which can target ANY pipe kind -- the immediate `now`
+        # pipe as well as a digest pipe. AsyncIOExecutor.shutdown() cancels
+        # these on shutdown but does not await them, and they are not in
+        # `pending` -- so a cancelled drain's reap arm (the digest path's
+        # _render_llm_body -> _kill_and_reap horizon cast subtree, or an
+        # immediate send's transport subprocess) would race event-loop teardown
+        # and orphan the child tree. Each drain registers its task here on entry
+        # and discards on exit; run()'s finally cancels and awaits the set.
+        # Mirrors _triage_loop's in_flight handling.
         self._drain_tasks: set[asyncio.Task[None]] = set()
         # The fixer-evaluation loop (B11). Held separately from self.tasks
         # because, unlike the triage loop (whose body only awaits sleep and
