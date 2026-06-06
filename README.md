@@ -130,6 +130,25 @@ reads `none` when nothing is armed — which is also what the daemon-down
 fallback always shows, since armed faults are in-memory live-daemon state. The
 section exists so an armed fault on the live daemon can't be silently forgotten.
 
+### Control-socket timeout (slow ≠ down)
+
+Read commands (`health`, `incident list`, `mute list`) reach the daemon over its
+control socket with a deadline, falling back to the read-only sqlite reader when
+it expires. The deadline defaults to **30 seconds** and is overridable with
+`ANGELUS_CONTROL_TIMEOUT` (a float number of seconds; a missing, empty,
+unparseable, or non-positive value silently uses the default rather than
+crashing). It was raised from the original 5s because a loaded daemon's health
+op can legitimately take several seconds server-side — at 5s a slow-but-alive
+daemon straddled the deadline and was misreported as down.
+
+A socket that **connects but does not answer** in time is a different state from
+a refused or absent one: the daemon is *alive, just slow*. `angelus health`
+labels it `daemon: alive but control socket did not respond within Ns` rather
+than `not reachable`, so an operator can tell a loaded-but-healthy daemon from a
+dead one. Either way the read command still falls back to the sqlite reader and
+exits 0 — only the classification changes. A refused or absent socket stays
+`not running`/`not reachable` as before.
+
 ### Logging
 
 The daemon writes one canonical, tail-able log at `state/angelus.log` (a
