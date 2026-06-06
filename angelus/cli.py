@@ -49,7 +49,24 @@ _ROOT_OPTION = click.option(
     help="Angelus root directory (where state/ lives).",
 )
 
-_SOCKET_TIMEOUT = 5.0
+# Default control-socket deadline, in seconds. Overridable per-invocation via
+# the ANGELUS_CONTROL_TIMEOUT env var (see _control_timeout). Raised from the
+# original 5.0s because a loaded daemon's health op can legitimately take
+# several seconds server-side: at 5.0s a slow-but-alive daemon straddled the
+# deadline and was misreported as down. 30.0s gives that headroom.
+_SOCKET_TIMEOUT = 30.0
+
+# Env var holding a float number of seconds that overrides _SOCKET_TIMEOUT.
+_CONTROL_TIMEOUT_ENV = "ANGELUS_CONTROL_TIMEOUT"
+
+# Sentinel distinct from None, returned by _request when the control socket
+# CONNECTED but the daemon did not answer within the timeout. The daemon is
+# ALIVE (it is the process holding the socket) -- just slow/unresponsive, a
+# different operational state from a refused/absent socket (down). Read commands
+# still fall back to read-only sqlite on this signal; only the rendered
+# daemon-status label changes, so a slow-but-healthy daemon is never misreported
+# as not running.
+_TIMED_OUT = object()
 
 # Window duration units for `timeline --window`, mirroring the mute-duration
 # parser in daemon.py: a unit suffix is required so a bare integer can never
@@ -68,23 +85,73 @@ def _socket_path(root: Path) -> Path:
     return root / "state" / "angelus.sock"
 
 
+def _control_timeout() -> float:
+    """Resolve the control-socket timeout in seconds.
+
+    Returns the float value of ANGELUS_CONTROL_TIMEOUT when it is set and parses
+    to a usable (positive, finite) number; otherwise the _SOCKET_TIMEOUT
+    default. A missing, empty, unparseable, or non-positive value never raises
+    -- a bad timeout must not turn `angelus health` into a traceback, so it
+    silently degrades to the default.
+    """
+    raw = os.environ.get(_CONTROL_TIMEOUT_ENV)
+    if not raw:
+        return _SOCKET_TIMEOUT
+    try:
+        value = float(raw)
+    except ValueError:
+        return _SOCKET_TIMEOUT
+    # Reject 0, negatives, NaN (value > 0 is False) and +inf: none is a usable
+    # socket deadline. Fall back to the default rather than disable the timeout.
+    if not value > 0 or value == float("inf"):
+        return _SOCKET_TIMEOUT
+    return value
+
+
+def _format_seconds(value: float) -> str:
+    """Render a timeout for operator output: whole seconds drop the trailing
+    '.0' ('30s'), fractional overrides keep their precision ('0.3s'). %g does
+    both and never shows a misleading rounded-to-zero value."""
+    return f"{value:g}s"
+
+
+def _slow_socket_status() -> str:
+    """Daemon-status label for the alive-but-slow case: the control socket
+    accepted the connection but did not answer within the deadline. The timeout
+    is resolved fresh so the rendered Ns matches the deadline actually used."""
+    return (
+        "alive but control socket did not respond within "
+        f"{_format_seconds(_control_timeout())}"
+    )
+
+
 def _request(root: Path, op: str, args: dict[str, Any]) -> dict[str, Any] | None:
     """Send one op over the control socket and return the parsed response.
 
     Returns None if the socket is absent, the connection is refused, or the
     daemon does not return a well-formed JSON line (e.g. killed mid-write,
     leaving a truncated or empty buffer) -- the signal for callers to fall
-    back to read-only sqlite. The contract is: any failure to get a complete,
-    parseable response is "daemon unreachable", which is exit-0 success with
-    the sqlite fallback, never a CLI traceback.
+    back to read-only sqlite and report the daemon as down. The contract is:
+    any such failure to get a complete, parseable response is "daemon down",
+    which is exit-0 success with the sqlite fallback, never a CLI traceback.
+
+    Returns the _TIMED_OUT sentinel when the connection SUCCEEDS but the daemon
+    does not answer within the control timeout: the daemon is alive, just slow.
+    Callers still fall back to sqlite, but render it as alive-but-slow rather
+    than down -- a loaded-but-healthy daemon must not be misreported as absent.
+    A timeout BEFORE connect (nothing accepting) is plain unreachable and stays
+    None.
     """
     sock_path = _socket_path(root)
     if not sock_path.exists():
         return None
+    timeout = _control_timeout()
+    connected = False
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
-            conn.settimeout(_SOCKET_TIMEOUT)
+            conn.settimeout(timeout)
             conn.connect(str(sock_path))
+            connected = True
             conn.sendall((json.dumps({"op": op, "args": args}) + "\n").encode("utf-8"))
             buffer = b""
             while not buffer.endswith(b"\n"):
@@ -96,6 +163,11 @@ def _request(root: Path, op: str, args: dict[str, Any]) -> dict[str, Any] | None
                     # Oversized/never-terminated response: treat as garbled,
                     # same as a daemon that died mid-write.
                     return None
+    except socket.timeout:
+        # Connected but no answer within the deadline: alive but slow, distinct
+        # from down. Only the post-connect case earns the slow signal; a timeout
+        # while still connecting means nothing is accepting -> unreachable.
+        return _TIMED_OUT if connected else None
     except (ConnectionError, FileNotFoundError, OSError):
         return None
     if not buffer:
@@ -158,6 +230,16 @@ def _require_daemon(
     from the daemon is surfaced verbatim and also exits non-zero.
     """
     response = _request(root, op, args)
+    if response is _TIMED_OUT:
+        # The daemon is alive but did not answer in time, so we cannot confirm
+        # the write landed. No sqlite fallback (would be a second writer) -> a
+        # clear, non-zero exit distinct from the daemon-down message.
+        click.echo(
+            f"angelus daemon did not respond within "
+            f"{_format_seconds(_control_timeout())}; {command} did not complete",
+            err=True,
+        )
+        raise SystemExit(1)
     if response is None:
         click.echo(
             f"angelus daemon is not running; {command} requires the daemon",
@@ -188,6 +270,11 @@ def health(root: Path) -> None:
     """Daemon status, sources, queue depths."""
     root = root.resolve()
     response = _request(root, "health", {})
+    if response is _TIMED_OUT:
+        # Connected but slow: fall back to sqlite (exit 0) but label the daemon
+        # alive-but-slow rather than down, so the operator is not misled.
+        _render_health_fallback(root, daemon_status=_slow_socket_status())
+        return
     if response is None:
         _render_health_fallback(root)
         return
@@ -208,13 +295,16 @@ def incident_list(root: Path) -> None:
     """List open and recently-closed incidents."""
     root = root.resolve()
     response = _request(root, "incident_list", {})
-    if response is not None:
-        if not response.get("ok"):
-            click.echo(f"error: {response.get('error')}", err=True)
-            raise SystemExit(1)
-        _render_incidents(response["result"])
+    if response is _TIMED_OUT:
+        _render_incidents_fallback(root, daemon_status=_slow_socket_status())
         return
-    _render_incidents_fallback(root)
+    if response is None:
+        _render_incidents_fallback(root)
+        return
+    if not response.get("ok"):
+        click.echo(f"error: {response.get('error')}", err=True)
+        raise SystemExit(1)
+    _render_incidents(response["result"])
 
 
 @incident.command("close")
@@ -280,13 +370,16 @@ def mute_list(root: Path) -> None:
     """
     root = root.resolve()
     response = _request(root, "mute_list", {})
-    if response is not None:
-        if not response.get("ok"):
-            click.echo(f"error: {response.get('error')}", err=True)
-            raise SystemExit(1)
-        _render_mutes(response["result"])
+    if response is _TIMED_OUT:
+        _render_mutes_fallback(root, daemon_status=_slow_socket_status())
         return
-    _render_mutes_fallback(root)
+    if response is None:
+        _render_mutes_fallback(root)
+        return
+    if not response.get("ok"):
+        click.echo(f"error: {response.get('error')}", err=True)
+        raise SystemExit(1)
+    _render_mutes(response["result"])
 
 
 @main.command()
@@ -981,11 +1074,16 @@ def _render_fault_injection(fault_injection: dict[str, Any]) -> None:
         click.echo(f"  {name}")
 
 
-def _render_health_fallback(root: Path) -> None:
+def _render_health_fallback(root: Path, daemon_status: str | None = None) -> None:
     from angelus.daemon import _belfry_status, _delivery_surface
     from angelus.lodging.config import _enabled_yaml_files
 
     status, pid = _pid_status(root / "state" / "angelus.pid")
+    # An explicit daemon_status overrides the pid-derived label: the alive-but-
+    # slow case knows the daemon is up (it connected) even though _pid_status,
+    # which only inspects the pid file, cannot tell slow from down.
+    if daemon_status is not None:
+        status = daemon_status
     click.echo(f"daemon: {status}")
     if pid is not None:
         click.echo(f"pid: {pid}")
@@ -1060,8 +1158,12 @@ def _render_incidents(result: dict[str, Any]) -> None:
         click.echo(f"    closed: {inc['closed_at']}")
 
 
-def _render_incidents_fallback(root: Path) -> None:
+def _render_incidents_fallback(root: Path, daemon_status: str | None = None) -> None:
     status, _pid = _pid_status(root / "state" / "angelus.pid")
+    # See _render_health_fallback: an explicit status carries the alive-but-slow
+    # label, which _pid_status cannot infer from the pid file alone.
+    if daemon_status is not None:
+        status = daemon_status
     connection = _ro_connect(root / "state" / "angelus.sqlite3")
     if connection is None:
         click.echo(f"daemon: {status}")
@@ -1092,8 +1194,12 @@ def _render_mutes(result: dict[str, Any]) -> None:
         )
 
 
-def _render_mutes_fallback(root: Path) -> None:
+def _render_mutes_fallback(root: Path, daemon_status: str | None = None) -> None:
     status, _pid = _pid_status(root / "state" / "angelus.pid")
+    # See _render_health_fallback: an explicit status carries the alive-but-slow
+    # label, which _pid_status cannot infer from the pid file alone.
+    if daemon_status is not None:
+        status = daemon_status
     connection = _ro_connect(root / "state" / "angelus.sqlite3")
     if connection is None:
         click.echo(f"daemon: {status}")
