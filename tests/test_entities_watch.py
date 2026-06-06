@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import subprocess
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -14,9 +16,8 @@ from angelus.lodging import load_lodging
 from angelus.lodging.dynamic import (
     Entity,
     Watch,
+    _substitute,
     expand,
-    load_entities,
-    load_watches,
     matches,
     parse_entity,
     parse_watch,
@@ -275,6 +276,74 @@ def test_expand_missing_placeholder_raises(tmp_path: Path) -> None:
     watch = _make_watch(tmp_path, "w", {})  # uses {url} in command
     with pytest.raises(ValueError, match="missing placeholders"):
         expand(entities, {"w": watch})
+
+
+def test_substitute_exposes_watch_metadata() -> None:
+    """A check command can reference watch `metadata:` fields (e.g.
+    {stale_days}) so a jq threshold can derive from the single source of
+    truth the handler also reads, instead of a duplicated literal."""
+    entity = _entity("skein", kind="repo", github="spiritengine/skein")
+    rendered = _substitute(
+        "echo {entity} {github} {stale_days}", entity, {"stale_days": 30}
+    )
+    assert rendered == "echo skein spiritengine/skein 30"
+
+
+def test_substitute_entity_fields_win_over_metadata() -> None:
+    """Precedence guard: a metadata key colliding with an entity field must
+    NOT retarget the check command. The entity value always takes effect, so
+    a stray `metadata: {github: ...}` can't silently point a check at the
+    wrong repo."""
+    entity = _entity("skein", kind="repo", github="spiritengine/skein")
+    rendered = _substitute(
+        "echo {github}", entity, {"github": "attacker/evil", "stale_days": 30}
+    )
+    assert rendered == "echo spiritengine/skein"
+
+
+def _run_stale_pr_jq(command: str, prs: list[dict]) -> str:
+    """Extract the jq program from a rendered stale-pr check command and run
+    it against a PR array, returning the observation-collapse `state` token.
+    The jq is the final `--jq '<program>'` segment; its body uses double
+    quotes only, so the single-quote delimiters bound it unambiguously."""
+    marker = "--jq '"
+    start = command.index(marker) + len(marker)
+    jq_program = command[start:].rstrip().rstrip("'")
+    out = subprocess.run(
+        ["jq", "-c", jq_program],
+        input=json.dumps(prs),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return json.loads(out.stdout)["state"]
+
+
+def test_stale_pr_jq_threshold_tracks_stale_days() -> None:
+    """The stale-pr check jq derives its staleness cutoff from the watch's
+    `stale_days` metadata, threaded through expand -> _substitute, NOT a
+    hardcoded literal. A PR aged 45 days is classified stale under
+    stale_days=30 (token names the PR) and fresh under stale_days=60 (token
+    "clear"). This pins the single-source-of-truth fix: it FAILS if the jq
+    reverts to a fixed 2592000 (30d), because then the 45d PR would read
+    stale under BOTH thresholds and the stale_days=60 assertion would break.
+    Goes through the real watch YAML and the real expand path so it also
+    proves expand threads watch metadata into the command render."""
+    watch = parse_watch(REPO_ROOT, REPO_ROOT / "watch" / "stale-pr.yaml")
+    entity = _entity(
+        "skein", kind="repo", labels=("active",), github="spiritengine/skein"
+    )
+    updated = (datetime.now(UTC) - timedelta(days=45)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    prs = [{"number": 7, "title": "x", "updatedAt": updated}]
+
+    def stale_token(stale_days: int) -> str:
+        w = dataclasses.replace(watch, extra_metadata={"stale_days": stale_days})
+        sources, _ = expand({"skein": entity}, {"stale-pr": w})
+        command = sources["scheduled/stale-pr__skein"].command
+        return _run_stale_pr_jq(command, prs)
+
+    assert stale_token(30) == "7", "45d PR must be stale under a 30d threshold"
+    assert stale_token(60) == "clear", "45d PR must be fresh under a 60d threshold"
 
 
 def test_load_lodging_rejects_synth_metadata_pipe_typo(tmp_path: Path) -> None:

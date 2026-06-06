@@ -210,7 +210,7 @@ def test_op_health_surfaces_belfry_after_real_belfry_tick(
     # Belfry takes the DOWN path (no live PID file). The sentinel-touch
     # contract is "every tick, success OR failure," so the failure path
     # exercises exactly the same touch the test cares about, without
-    # needing a hand-rolled source_fires table that would collide with
+    # needing a hand-rolled watch_state table that would collide with
     # init_db's migrations when the AngelusDaemon constructs below.
     (tmp_path / "state").mkdir()
 

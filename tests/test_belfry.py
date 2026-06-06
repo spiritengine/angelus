@@ -371,11 +371,12 @@ def test_systemd_main_pid_skips_xdg_when_dbus_present(monkeypatch) -> None:
 # --- M2 slice 6: belfry independence end-to-end --------------------------
 #
 # The unit tests above stage a synthetic state directory; this test brings
-# up a real angelus daemon subprocess, lets it write source_fires, SIGKILLs
+# up a real angelus daemon subprocess, lets it write watch_state, SIGKILLs
 # it, then drives a single belfry tick. The contract: belfry's pid_failure
 # detects the dead PID file and escalates (down ping + notify-pat) BEFORE
-# the wedge threshold can apply -- source_fires is deliberately recent so
-# wedge_failure returns None and pid_failure is the discriminating axis.
+# the wedge threshold can apply -- watch_state.last_checked_at is deliberately
+# recent so wedge_failure returns None and pid_failure is the discriminating
+# axis.
 
 
 def _alive(pid: int) -> bool:
@@ -388,7 +389,7 @@ def _alive(pid: int) -> bool:
 
 def _write_daemon_lodging(root: Path) -> None:
     """Minimal lodging the daemon can load. cadence: 1s on the source so
-    a source_fires row appears within ~2s and the wedge axis is taken off
+    a watch_state row appears within ~2s and the wedge axis is taken off
     the table for the discrimination inversion (a row exists and is fresh,
     so wedge_failure returns None on its own)."""
     (root / "sources" / "scheduled").mkdir(parents=True)
@@ -503,7 +504,7 @@ def _kill_and_wait(proc: subprocess.Popen, pid: int) -> None:
 def test_belfry_independence_against_sigkilled_daemon(
     tmp_path, monkeypatch
 ) -> None:
-    """Full integration: real angelus daemon subprocess -> source_fires
+    """Full integration: real angelus daemon subprocess -> watch_state
     populated -> SIGKILL -> single belfry tick on the orphaned state dir.
     Belfry's pid_failure must detect the dead-PID file, ping the down URL
     once, and call notify-pat with a payload identifying the dead-PID
@@ -529,7 +530,7 @@ def test_belfry_independence_against_sigkilled_daemon(
     try:
         pid = _read_pid_file(tmp_path, timeout=15.0)
         assert _alive(pid), f"daemon PID {pid} was not alive on PID-file read"
-        # Required for discrimination: source_fires must hold a fresh row
+        # Required for discrimination: watch_state must hold a fresh row
         # before SIGKILL, otherwise wedge_failure's "no rows" branch fires
         # under pid_failure inversion and the test can't distinguish the
         # two axes.
@@ -543,7 +544,7 @@ def test_belfry_independence_against_sigkilled_daemon(
             except subprocess.TimeoutExpired:
                 pass
 
-    # Confirm the orphaned state: PID file present, source_fires populated.
+    # Confirm the orphaned state: PID file present, watch_state populated.
     assert (tmp_path / "state" / "angelus.pid").exists(), (
         "SIGKILL should leave the PID file on disk (clean-shutdown unlink "
         "only runs in the daemon's finally clause, which SIGKILL bypasses)"
