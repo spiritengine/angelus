@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 import click
+import yaml
 
 from angelus.clock import SYSTEM_CLOCK
 from angelus.daemon import HEALTH_FAILED_DISPATCH_WINDOW_HOURS
@@ -500,6 +501,147 @@ def fire_source(name: str, root: Path) -> None:
     click.echo(f"source: {result['source']}")
     click.echo(f"observation: {result['observation_id']}")
     click.echo(f"outcome: {result['outcome']}")
+
+
+def _parse_sim_instant(value: Any) -> datetime:
+    """Parse a sim script's ISO8601 instant (with a trailing 'Z' or offset).
+    A naive value is read as UTC, matching FakeClock's own convention."""
+    if not isinstance(value, str) or not value:
+        raise click.ClickException("sim: 'start'/'set_time' must be an ISO8601 string")
+    text = value.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise click.ClickException(f"sim: bad instant {value!r}: {exc}") from exc
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _parse_sim_duration(value: Any) -> timedelta:
+    """Parse an 'advance' step's duration -- an integer with a unit suffix
+    (s/m/h/d), reusing the same units as `timeline --window` so a bare number
+    can never silently mean 'some unit'."""
+    if not isinstance(value, str) or len(value) < 2 or value[-1] not in _WINDOW_UNITS:
+        raise click.ClickException(
+            "sim: 'advance' must be <int><unit>, unit one of s/m/h/d (e.g. 1d)"
+        )
+    try:
+        amount = int(value[:-1])
+    except ValueError as exc:
+        raise click.ClickException(f"sim: bad duration {value!r}: {exc}") from exc
+    return timedelta(seconds=amount * _WINDOW_UNITS[value[-1]])
+
+
+def _sim_step(step: Any) -> tuple[str, Any]:
+    """Normalise one script step to (verb, arg). A step is a single-key mapping
+    (``{fire_source: scheduled/watch}``) or a bare verb string for the no-arg
+    steps (``run_triage``)."""
+    if isinstance(step, str):
+        return step, None
+    if isinstance(step, dict) and len(step) == 1:
+        (verb, arg), = step.items()
+        return str(verb), arg
+    raise click.ClickException(f"sim: malformed step {step!r}")
+
+
+async def _run_sim(harness: Any, steps: list[Any]) -> list[str]:
+    """Drive the harness through the scripted steps, returning a plain-text
+    report (one value per line, screen-reader friendly). Each step reuses the
+    matching production path via the harness; this only narrates the cycle."""
+    report: list[str] = []
+    for step in steps:
+        verb, arg = _sim_step(step)
+        if verb == "set_time":
+            instant = _parse_sim_instant(arg)
+            harness.set_time(instant)
+            report.append(f"set_time: now {_format_instant(instant)}")
+        elif verb == "advance":
+            harness.advance(_parse_sim_duration(arg))
+            report.append(f"advance {arg}: now {harness.clock.now_iso()}")
+        elif verb == "fire_source":
+            observation_id, outcome = await harness.fire_source(str(arg))
+            report.append(
+                f"fire_source {arg}: observation {observation_id} outcome {outcome}"
+            )
+        elif verb == "inject":
+            if not isinstance(arg, dict) or "source_ref" not in arg:
+                raise click.ClickException(
+                    "sim: 'inject' needs a mapping with source_ref (and payload)"
+                )
+            observation_id = harness.inject_observation(
+                str(arg["source_ref"]),
+                arg.get("payload") or {},
+                arg.get("meta"),
+            )
+            report.append(
+                f"inject {arg['source_ref']}: observation {observation_id}"
+            )
+        elif verb == "run_triage":
+            triaged = await harness.run_triage()
+            report.append(f"run_triage: {triaged} observations triaged")
+        elif verb == "drain":
+            summary = await harness.drain(str(arg))
+            report.append(
+                f"drain {arg}: dispatched {summary.dispatched} "
+                f"failed {summary.failed}"
+            )
+        else:
+            raise click.ClickException(f"sim: unknown step verb {verb!r}")
+    dispatched = harness.dispatches()
+    report.append(f"dispatches: {len(dispatched)}")
+    for line in dispatched:
+        report.append(f"  {line}")
+    return report
+
+
+@main.command()
+@click.argument(
+    "script", type=click.Path(exists=True, dir_okay=False, path_type=Path)
+)
+@_ROOT_OPTION
+def sim(script: Path, root: Path) -> None:
+    """Replay a scripted source -> dispatch cycle offline (B26).
+
+    Runs the production pipeline -- fire a source / inject an observation,
+    triage, drain a pipe -- against the lodging at --root with NO cron and NO
+    real waiting: time is pinned to the script's `start` and moved only by
+    `advance`/`set_time` steps, so a simulated day passes in seconds. Sends are
+    forced to dry-run, landing in `dispatches.log` instead of paging a phone, so
+    this is safe to run against a scratch copy of a lodging.
+
+    SCRIPT is a YAML (or JSON) step list:
+
+    \b
+        start: "2026-06-06T12:00:00Z"
+        steps:
+          - fire_source: scheduled/watch
+          - run_triage
+          - advance: 1d
+          - drain: now
+          - drain: daily
+
+    Step verbs: set_time (ISO instant), advance (<int>s/m/h/d), fire_source
+    (source name), inject ({source_ref, payload, meta}), run_triage, drain (pipe
+    name). The report prints what each step produced, one value per line.
+    """
+    from angelus.sim import SimHarness
+
+    root = root.resolve()
+    document = yaml.safe_load(script.read_text(encoding="utf-8")) or {}
+    if not isinstance(document, dict) or "start" not in document:
+        raise click.ClickException(
+            "sim: script must be a mapping with a 'start' instant and 'steps'"
+        )
+    start = _parse_sim_instant(document["start"])
+    steps = document.get("steps") or []
+    if not isinstance(steps, list):
+        raise click.ClickException("sim: 'steps' must be a list")
+
+    click.echo(f"sim start: {_format_instant(start)}")
+    with SimHarness(root, start) as harness:
+        report = asyncio.run(_run_sim(harness, steps))
+    for line in report:
+        click.echo(line)
+    click.echo("sim complete")
 
 
 def _render_armed(result: dict[str, Any]) -> None:
