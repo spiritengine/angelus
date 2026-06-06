@@ -9,7 +9,9 @@ from angelus.storage.migrations import migrate
 
 
 EXPECTED_TABLES = {
-    "source_fires",
+    # source_fires was dropped by migration 0012 (observation collapse) and
+    # replaced by watch_state -- the fixed-size per-source "last checked" row.
+    "watch_state",
     "observations",
     "findings",
     "incidents",
@@ -43,6 +45,10 @@ def test_import_and_migrate_temp_db(tmp_path) -> None:
 
     assert journal_mode == "wal"
     assert EXPECTED_TABLES <= tables
+    # source_fires must be GONE after the full migration chain: 0001 creates it,
+    # 0012 drops it (observation collapse). A fresh DB carrying it would mean the
+    # drop regressed.
+    assert "source_fires" not in tables
     assert "status" in observation_columns
     assert "status" in finding_columns
 

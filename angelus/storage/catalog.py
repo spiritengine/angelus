@@ -51,20 +51,84 @@ class Catalog:
         # in, and tests pass a FakeClock to control every timestamp/window.
         self._clock = clock or Clock()
 
-    def record_source_fire(
-        self, source_name: str, scheduled_at: str | None, outcome: str
+    def watch_state_for(self, source_ref: str) -> dict[str, Any] | None:
+        """The source's single overwritten watch_state row, or None on the
+        first-ever fire (no row yet). Read by _fire_source to decide whether a
+        fire CHANGED -- a None return is a first sighting and always counts as
+        a change so the first observation is never skipped."""
+        row = self.connection.execute(
+            "SELECT * FROM watch_state WHERE source_ref = ?",
+            (source_ref,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def record_watch_check(
+        self,
+        source_ref: str,
+        signature: str | None,
+        outcome: str,
+        observation_id: int | None,
     ) -> None:
-        # fired_at is the clock-pinned column every reader uses (latest_source_
-        # fires' max(fired_at), timeline_events' fired_at window). source_fires.
-        # created_at is never compared in a since/window query, so it is left on
-        # the schema's wall-clock DEFAULT.
-        self.connection.execute(
-            """
-            INSERT INTO source_fires (source_name, scheduled_at, fired_at, outcome)
-            VALUES (?, ?, ?, ?)
-            """,
-            (source_name, scheduled_at, self._clock.now_iso(), outcome),
-        )
+        """Overwrite the source's watch_state row each fire -- the collapse
+        bookkeeping that replaces the unbounded source_fires append.
+
+        last_checked_at/last_outcome/updated_at are bumped on EVERY call: this
+        is the "we checked at T" heartbeat belfry's wedge detection and
+        health's per-source last-fire read, and it is the whole point of the
+        collapse -- an unchanged tick still records that the daemon is alive
+        and checking, it just writes no observation.
+
+        observation_id distinguishes the two cases:
+          * not None -> this fire was a CHANGE (or first sighting): an
+            observation was just written. last_state advances to its signature,
+            last_changed_at moves to now (the last REAL transition), and
+            last_observation_id points at it.
+          * None -> a collapsed (unchanged) tick: only the heartbeat columns
+            move; last_state/last_changed_at/last_observation_id are left
+            untouched so they keep describing the last real transition.
+
+        signature is None only on the fail-safe path (signature computation
+        raised, so the fire was forced to write). It is stored as NULL, which
+        reads back as "unknown baseline" and makes the next fire compare unequal
+        -- i.e. the next tick also writes. Erring toward an extra write is the
+        correct direction: missing a transition is the one unacceptable failure.
+        Self-committing, clock-stamped, mirroring the catalog's write idioms.
+        """
+        now = self._clock.now_iso()
+        if observation_id is None:
+            # Collapsed tick: bump the heartbeat only. The INSERT arm runs only
+            # if no row exists yet, which cannot happen on a collapse (a first
+            # sighting always writes an observation, taking the branch below) --
+            # it is here so the upsert is total, leaving last_state NULL.
+            self.connection.execute(
+                """
+                INSERT INTO watch_state
+                    (source_ref, last_checked_at, last_outcome, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(source_ref) DO UPDATE SET
+                    last_checked_at = excluded.last_checked_at,
+                    last_outcome = excluded.last_outcome,
+                    updated_at = excluded.updated_at
+                """,
+                (source_ref, now, outcome, now),
+            )
+        else:
+            self.connection.execute(
+                """
+                INSERT INTO watch_state
+                    (source_ref, last_checked_at, last_state, last_outcome,
+                     last_changed_at, last_observation_id, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(source_ref) DO UPDATE SET
+                    last_checked_at = excluded.last_checked_at,
+                    last_state = excluded.last_state,
+                    last_outcome = excluded.last_outcome,
+                    last_changed_at = excluded.last_changed_at,
+                    last_observation_id = excluded.last_observation_id,
+                    updated_at = excluded.updated_at
+                """,
+                (source_ref, now, signature, outcome, now, observation_id, now),
+            )
         self.connection.commit()
 
     def write_observation(
@@ -650,16 +714,19 @@ class Catalog:
         return [dict(row) for row in rows]
 
     def latest_source_fires(self) -> dict[str, str | None]:
-        """Most recent fired_at per source, from the source_fires ledger.
-        Read-only; used by the health control op."""
+        """Most recent check time per source, from the watch_state row's
+        last_checked_at. Read-only; used by the health control op's per-source
+        last-fire line. (watch_state holds one overwritten row per source, so
+        no GROUP BY is needed -- last_checked_at IS the latest check.) The
+        method name is kept for its callers; the underlying ledger
+        (source_fires) was collapsed into watch_state."""
         rows = self.connection.execute(
             """
-            SELECT source_name, max(fired_at) AS last_fire_at
-            FROM source_fires
-            GROUP BY source_name
+            SELECT source_ref, last_checked_at
+            FROM watch_state
             """
         )
-        return {row["source_name"]: row["last_fire_at"] for row in rows}
+        return {row["source_ref"]: row["last_checked_at"] for row in rows}
 
     def observations_pending_triage_count(self) -> int:
         """Ready observations with no successful triage yet. Read-only.
@@ -843,41 +910,31 @@ class Catalog:
     def timeline_events(self, since: str, until: str) -> list[dict[str, Any]]:
         """Reconstruct the ordered story for a [since, until] window.
 
-        Interleaves source fires, observations, findings, and dispatches
-        (including failures) by timestamp into a single chronological list.
-        Read-only: four plain SELECTs unioned in Python so each event keeps
-        its own shape. Bounds are inclusive and compared as ISO strings,
-        which sort correctly because every timestamp column uses the same
-        '...Z' millisecond format.
+        Interleaves observations, findings, and dispatches (including failures)
+        by timestamp into a single chronological list. Read-only: three plain
+        SELECTs unioned in Python so each event keeps its own shape. Bounds are
+        inclusive and compared as ISO strings, which sort correctly because
+        every timestamp column uses the same '...Z' millisecond format.
 
-        Same-instant ties break by kind (fire, observation, finding,
-        dispatch) then by id. This ordering is deterministic and stable,
-        NOT causal: on an exact millisecond collision the originating event
-        and the event it provoked cannot be told apart from the stored data
-        alone. A failing dispatch and the channel_unhealthy finding it
-        provokes can share a millisecond, and the static kind order would
-        then render the finding above its dispatch -- the reverse of what
-        happened. Sub-millisecond ordering therefore may not reflect causal
-        order; only the millisecond timestamps disambiguate when they differ.
+        There is no per-fire event any more: observation collapse means a fire
+        writes an observation only on a state CHANGE, so the observations a
+        source produces ARE its transitions -- the per-tick "we fired" noise
+        (formerly read from source_fires) is exactly what collapse removed, and
+        surfacing it here would re-introduce it. The "we are still checking"
+        heartbeat now lives in watch_state.last_checked_at, which health and
+        belfry read; it is not a story event.
+
+        Same-instant ties break by kind (observation, finding, dispatch) then
+        by id. This ordering is deterministic and stable, NOT causal: on an
+        exact millisecond collision the originating event and the event it
+        provoked cannot be told apart from the stored data alone. A failing
+        dispatch and the channel_unhealthy finding it provokes can share a
+        millisecond, and the static kind order would then render the finding
+        above its dispatch -- the reverse of what happened. Sub-millisecond
+        ordering therefore may not reflect causal order; only the millisecond
+        timestamps disambiguate when they differ.
         """
         events: list[dict[str, Any]] = []
-        for row in self.connection.execute(
-            """
-            SELECT id, source_name, outcome, fired_at
-            FROM source_fires
-            WHERE fired_at >= ? AND fired_at <= ?
-            """,
-            (since, until),
-        ):
-            events.append(
-                {
-                    "ts": row["fired_at"],
-                    "kind": "fire",
-                    "id": int(row["id"]),
-                    "source": row["source_name"],
-                    "outcome": row["outcome"],
-                }
-            )
         for row in self.connection.execute(
             """
             SELECT id, source, status, created_at
@@ -937,7 +994,7 @@ class Catalog:
                 }
             )
         # Deterministic, stable tie-break -- not causal (see docstring).
-        kind_order = {"fire": 0, "observation": 1, "finding": 2, "dispatch": 3}
+        kind_order = {"observation": 0, "finding": 1, "dispatch": 2}
         events.sort(key=lambda e: (e["ts"], kind_order[e["kind"]], e["id"]))
         return events
 

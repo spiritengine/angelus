@@ -88,6 +88,39 @@ def test_health_surfaces_active_mute_on_unhealthy_dep(tmp_path) -> None:
     asyncio.run(driver())
 
 
+def test_health_per_source_last_fire_reflects_watch_state(tmp_path) -> None:
+    """The per-source last-fire line reads watch_state.last_checked_at (the
+    heartbeat that replaced source_fires under observation collapse).
+
+    Discrimination: seed a watch_state row whose last_checked_at is a known
+    value and assert the health source surfaces exactly it. A source with no
+    watch_state row reads as never-fired (None). If latest_source_fires still
+    pointed at the dropped source_fires table, the query would raise/return
+    nothing and last_fire_at would be None for the seeded source.
+    """
+    _write_lodging(tmp_path)
+
+    async def driver() -> None:
+        daemon = AngelusDaemon(tmp_path)
+        try:
+            daemon.catalog.record_watch_check(
+                "scheduled/watch", "200", "ok", observation_id=7
+            )
+            checked = daemon.connection.execute(
+                "SELECT last_checked_at FROM watch_state WHERE source_ref = ?",
+                ("scheduled/watch",),
+            ).fetchone()["last_checked_at"]
+            health = await daemon._op_health({})
+        finally:
+            daemon.connection.close()
+
+        sources = {s["name"]: s for s in health["sources"]}
+        assert sources["scheduled/watch"]["last_fire_at"] == checked
+        assert checked is not None
+
+    asyncio.run(driver())
+
+
 def test_health_leaves_healthy_dep_unannotated(tmp_path) -> None:
     _write_lodging(tmp_path)
 

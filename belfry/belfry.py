@@ -1019,10 +1019,10 @@ def wedge_failure(db_path: Path) -> str | None:
     try:
         fired_at = latest_fire(db_path)
     except sqlite3.Error as exc:
-        return f"wedged: cannot read source_fires from {db_path}: {exc}"
+        return f"wedged: cannot read watch_state from {db_path}: {exc}"
 
     if fired_at is None:
-        return "wedged: source_fires has no rows"
+        return "wedged: watch_state has no rows"
     age = datetime.now(UTC) - fired_at
     if age > threshold:
         return (
@@ -1048,11 +1048,24 @@ def wedge_threshold() -> timedelta:
 
 
 def latest_fire(db_path: Path) -> datetime | None:
+    # Reads the daemon's most recent source check from watch_state, which the
+    # daemon overwrites in place on every fire (last_checked_at bumps even when
+    # the fire writes no observation -- observation collapse). This is the live-
+    # daemon liveness heartbeat: a stale max(last_checked_at) means the daemon
+    # stopped checking sources (wedged). watch_state replaced the old
+    # source_fires append ledger; the SQL is the only change here -- the belt
+    # layer stays pure-stdlib and read-only. A fresh DB has the watch_state
+    # table (migration 0012) but zero rows, so max() returns NULL -> None, the
+    # same "not yet fired" signal the old empty-source_fires case produced; a DB
+    # too old to have the table raises sqlite3.Error, caught by wedge_failure as
+    # "cannot read".
     quoted = urllib.parse.quote(str(db_path), safe="/:")
     uri = f"file:{quoted}?mode=ro"
     connection = sqlite3.connect(uri, uri=True)
     try:
-        row = connection.execute("SELECT max(fired_at) FROM source_fires").fetchone()
+        row = connection.execute(
+            "SELECT max(last_checked_at) FROM watch_state"
+        ).fetchone()
     finally:
         connection.close()
     value = row[0] if row else None

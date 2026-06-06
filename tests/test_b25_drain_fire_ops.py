@@ -339,6 +339,36 @@ def test_op_fire_source_check_failed_still_observes(tmp_path) -> None:
         daemon.connection.close()
 
 
+def test_op_fire_source_unchanged_reports_no_observation(tmp_path) -> None:
+    """Under observation collapse, firing a source whose state has NOT changed
+    since its last check writes no observation: the op reports observation_id
+    None (a clean "no change"), while a state CHANGE reports the new id.
+
+    Discrimination: scheduled/watch echoes a constant payload, so the first fire
+    is a first sighting (id is an int) and the second is unchanged (id is None,
+    and the observations table did not grow). A daemon that wrote unconditionally
+    (collapse broken) would report a second id and two observation rows.
+    """
+    _write_lodging(tmp_path)
+    daemon = AngelusDaemon(tmp_path)
+    try:
+        first = asyncio.run(daemon._op_fire_source({"name": "scheduled/watch"}))
+        assert isinstance(first["observation_id"], int)
+
+        second = asyncio.run(daemon._op_fire_source({"name": "scheduled/watch"}))
+        assert second["observation_id"] is None, (
+            "an unchanged re-fire must collapse and report no observation"
+        )
+        assert second["outcome"] == "ok"
+
+        count = daemon.catalog.connection.execute(
+            "SELECT COUNT(*) AS n FROM observations WHERE source = 'scheduled/watch'"
+        ).fetchone()["n"]
+        assert count == 1, f"collapse must leave a single observation; got {count}"
+    finally:
+        daemon.connection.close()
+
+
 def test_op_fire_source_unknown_source_is_rejected(tmp_path) -> None:
     """Firing a source that is not configured is a structured error.
 
@@ -497,3 +527,29 @@ def test_cli_drain_and_fire_source_command_dispatch(tmp_path, monkeypatch) -> No
         ("drain", {"pipe": "now"}),
         ("fire_source", {"name": "scheduled/watch"}),
     ]
+
+
+def test_cli_fire_source_renders_no_change(tmp_path, monkeypatch) -> None:
+    """`angelus fire-source` renders a collapsed fire (observation_id None)
+    as a plain "no change" line rather than `observation: None`.
+
+    Discrimination: the op returns observation_id None on an unchanged fire
+    (observation collapse); a renderer that f-strung the id blindly would print
+    the literal "observation: None". The screen-reader-friendly line names the
+    state instead.
+    """
+    def fake_request(root, op, args):
+        return {
+            "ok": True,
+            "result": {"source": args["name"], "observation_id": None, "outcome": "ok"},
+        }
+
+    monkeypatch.setattr(cli, "_request", fake_request)
+    fired = CliRunner().invoke(
+        main, ["fire-source", "scheduled/watch", "--root", str(tmp_path)]
+    )
+    assert fired.exit_code == 0, fired.output
+    assert "source: scheduled/watch" in fired.output
+    assert "observation: none (state unchanged, collapsed)" in fired.output
+    assert "observation: None" not in fired.output
+    assert "outcome: ok" in fired.output
