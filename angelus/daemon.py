@@ -89,7 +89,7 @@ DEFAULT_FIXERS_LOG_FILENAME = "fixers.log"
 
 
 class AngelusDaemon:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, clock: Clock | None = None) -> None:
         self.root = root
         state_dir = root / "state"
         state_dir.mkdir(parents=True, exist_ok=True)
@@ -101,12 +101,17 @@ class AngelusDaemon:
         self.pid_file = state_dir / "angelus.pid"
         self.socket_path = state_dir / "angelus.sock"
         self.connection = init_db(state_dir / "angelus.sqlite3")
-        # Single real clock for the process (B24). Threaded into the catalog
-        # and every PipeDrain so all timestamp/window logic shares one notion
-        # of "now"; a sim/test build swaps this for a FakeClock. apscheduler
-        # keeps real time (B25 handles forcing work without time-travelling
-        # the scheduler).
-        self.clock = Clock()
+        # Single clock for the process (B24). Threaded into the catalog and
+        # every PipeDrain below so all timestamp/window logic shares one notion
+        # of "now". Defaults to the real wall Clock so production
+        # (`angelus daemon`, which passes no clock) is unchanged; the sim
+        # harness (B26) injects a FakeClock here, which then reaches the
+        # catalog and every PipeDrain automatically because both are built from
+        # self.clock in this same __init__ -- one injection point pins time
+        # everywhere. apscheduler keeps real time regardless (B25 forces work
+        # on demand without time-travelling the scheduler; the sim never starts
+        # it).
+        self.clock = clock or Clock()
         self.catalog = Catalog(self.connection, root, clock=self.clock)
         # Fault-injection registry (B28). One per process, threaded into every
         # PipeDrain below so a live `fault_inject` control op arms a fault
@@ -1016,24 +1021,47 @@ class AngelusDaemon:
                 LOGGER.warning("source %s failed: %s", source.source_ref, payload)
             return observation_id, outcome
 
+    def _discover_ready_triage(self) -> list[tuple]:
+        """One discovery sweep across every lodged triager: the ready
+        observations each can pick up, each marked 'processing' so a
+        concurrent/repeat sweep won't re-dispatch it.
+
+        Returns the (observation_row, triager_name) pairs to run, in
+        triager-then-observation-id order. Marking happens here, synchronously,
+        with no await between the read and the mark -- so the set of work and
+        the processing rows are written atomically from the loop's point of
+        view, exactly as the inline body did before.
+
+        Shared by the live _triage_loop (which spawns each pair under a task and
+        reaps across iterations) and the B26 sim harness (which awaits each pair
+        to completion before returning). Keeping the discover+mark step in one
+        place means the sim can never drift from the daemon's notion of "what is
+        ready" -- a sim that triaged a different set than production would be
+        worse than no sim. The per-observation execution path
+        (_triage_under_semaphore) is likewise shared, not forked.
+        """
+        work: list[tuple] = []
+        for triager in self.lodging.triagers.values():
+            rows = self.catalog.ready_observations_for(
+                triager.name, triager.source_ref
+            )
+            for row in rows:
+                self.catalog.mark_triage_processing(row["id"], triager.name)
+                work.append((row, triager.name))
+        return work
+
     async def _triage_loop(self) -> None:
         in_flight: set[asyncio.Task[None]] = set()
         try:
             while not self.stop_event.is_set():
                 self._reap_triage_tasks(in_flight)
-                did_work = False
-                for triager in self.lodging.triagers.values():
-                    rows = self.catalog.ready_observations_for(
-                        triager.name, triager.source_ref
+                work = self._discover_ready_triage()
+                for row, triager_name in work:
+                    task = asyncio.create_task(
+                        self._triage_under_semaphore(row, triager_name)
                     )
-                    for row in rows:
-                        did_work = True
-                        self.catalog.mark_triage_processing(row["id"], triager.name)
-                        task = asyncio.create_task(
-                            self._triage_under_semaphore(row, triager.name)
-                        )
-                        in_flight.add(task)
-                await asyncio.sleep(0.1 if did_work or in_flight else 1)
+                    in_flight.add(task)
+                await asyncio.sleep(0.1 if work or in_flight else 1)
         finally:
             if in_flight:
                 # Triager subprocesses (run_python_triager) await
@@ -1063,8 +1091,9 @@ class AngelusDaemon:
         # await in this method: queueing on the semaphore, queueing on
         # the per-triager lock, or inside _run_triager itself. In every
         # one of those cases mark_triage_processing has already written
-        # the row (it runs synchronously in _triage_loop's body just
-        # before this task is created), so we must clear it on the way
+        # the row (_discover_ready_triage marks every row synchronously while
+        # building the work list, before this method runs for any of them), so
+        # we must clear it on the way
         # out -- recover_writing_rows does not touch observation_triage
         # and ready_observations_for excludes 'processing' rows, so an
         # unrecovered row would orphan the observation across daemon

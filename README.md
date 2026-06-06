@@ -441,6 +441,53 @@ The injected failure is the same `RuntimeError` shape a real `send_email`/
 whole point — a test or scenario armed via either path proves the *real*
 detection and remediation code runs, not a stubbed approximation. (B28.)
 
+### Offline simulation (run a day in seconds)
+
+The whole pipeline — fire a source, triage the observation, drain a pipe — is a
+set of step methods the production loops and the scheduler drive. The **sim
+harness** drives those same methods directly, under a *pinned* clock, with no
+cron and no real waiting, so a scenario can replay a full source → dispatch
+cycle (or a simulated week) offline in seconds. It reuses the production code
+paths verbatim — `_fire_source`, the shared triage sweep, the B25 drain — so a
+sim can't drift from what the daemon actually does. (B26.)
+
+Two ways in:
+
+- **Programmatic** — `angelus.sim.SimHarness`, the core deliverable. Build it on
+  a lodging dir with a start instant, then call its step primitives:
+  `fire_source(name)` / `inject_observation(...)` to produce observations,
+  `run_triage()` to triage every ready one to completion, `drain(pipe)` to drain
+  on demand, and `set_time` / `advance` to move the clock (a day passes in
+  microseconds — nothing sleeps). Inspectors (`open_incidents`,
+  `findings_for_pipe`, `dead_letter_count`, `health`, `dispatches`) read the same
+  catalog/health surface production reports. It guarantees dry-run, so a send can
+  never page a real phone — it lands in `dispatches.log` instead. Constructing it
+  starts no scheduler, control socket, or loop. This is the harness pytest
+  scenarios drive directly; a scenario reads as a short script of harness calls.
+
+- **CLI** — `angelus sim <script> --root <dir>` runs a scripted cycle against the
+  lodging at `--root` and prints a plain-text report of what each step produced
+  (one value per line). The script is a YAML (or JSON) step list:
+
+  ```yaml
+  start: "2026-06-06T12:00:00Z"
+  steps:
+    - fire_source: scheduled/watch
+    - run_triage
+    - advance: 1d
+    - drain: now
+    - drain: daily
+  ```
+
+  Step verbs: `set_time` (ISO instant), `advance` (`<int>` + `s`/`m`/`h`/`d`),
+  `fire_source`, `inject` (`{source_ref, payload, meta}`), `run_triage`, `drain`.
+  Every pipeline timestamp and since-last-drain window reads off the pinned
+  clock — including the `created_at` columns the digest's drain window compares
+  against `last_drain_at` — so even a multi-drain digest is deterministic.
+  (Triagers run as real subprocesses; any wall-clock time a triager stamps into
+  its own finding body text is the triager's, not the harness clock's.) Sends
+  are forced to dry-run, so it is safe against a scratch copy of a lodging.
+
 ## Storage
 
 SQLite is the authoritative lifecycle store. Migrations live in `migrations/` as ordered SQL files named `<NNNN>_<name>.sql`. The storage initializer enables WAL mode and applies pending migrations in order, with each migration and its `schema_migrations` bookkeeping recorded atomically.

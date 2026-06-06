@@ -54,6 +54,10 @@ class Catalog:
     def record_source_fire(
         self, source_name: str, scheduled_at: str | None, outcome: str
     ) -> None:
+        # fired_at is the clock-pinned column every reader uses (latest_source_
+        # fires' max(fired_at), timeline_events' fired_at window). source_fires.
+        # created_at is never compared in a since/window query, so it is left on
+        # the schema's wall-clock DEFAULT.
         self.connection.execute(
             """
             INSERT INTO source_fires (source_name, scheduled_at, fired_at, outcome)
@@ -69,10 +73,16 @@ class Catalog:
         now = self._clock.now_iso()
         cursor = self.connection.execute(
             """
-            INSERT INTO observations (source, status, provenance, written_at)
-            VALUES (?, 'writing', ?, ?)
+            INSERT INTO observations
+                (source, status, provenance, written_at, created_at)
+            VALUES (?, 'writing', ?, ?, ?)
             """,
-            (source_ref, json.dumps(provenance, sort_keys=True), now),
+            # created_at stamped from the clock, not the wall-clock DEFAULT:
+            # timeline_events windows observations.created_at against its
+            # [since, until] bounds, and this row already clock-stamps
+            # written_at/updated_at -- leaving created_at on the wall clock
+            # would make a single row span two clocks under a FakeClock sim.
+            (source_ref, json.dumps(provenance, sort_keys=True), now, now),
         )
         observation_id = int(cursor.lastrowid)
         self.connection.commit()
@@ -318,9 +328,9 @@ class Catalog:
             """
             INSERT INTO findings (
                 observation_id, source, type, entity, dedup_key, target_pipes,
-                status, severity, occurred_at
+                status, severity, occurred_at, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, 'writing', ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, 'writing', ?, ?, ?)
             """,
             (
                 observation_id,
@@ -331,6 +341,21 @@ class Catalog:
                 json.dumps(target_pipes),
                 finding.get("severity"),
                 finding.get("timestamp") or now,
+                # created_at is stamped from the injected clock, NOT left to the
+                # schema's wall-clock DEFAULT. The digest's since-last-drain
+                # windows (findings_for_pipe_since / clearance_findings_since)
+                # compare f.created_at against last_drain_at, which is
+                # clock-pinned (mark_pipe_drained writes self._clock.now_iso()).
+                # A wall-clock created_at vs a clock-pinned last_drain_at is a
+                # mixed-clock comparison: consistent in production (one real
+                # clock) but silently wrong under a FakeClock sim, where it would
+                # drop genuinely-new findings from the window. now_iso() is
+                # byte-identical in shape to strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                # (millisecond ISO8601, trailing Z), so the catalog's
+                # text-comparison ordering and any pre-existing rows stay
+                # comparable; in production now_iso() equals the wall-clock
+                # default at insert, so this is behaviour-preserving there.
+                now,
             ),
         )
         finding_id = int(cursor.lastrowid)
@@ -367,10 +392,19 @@ class Catalog:
             if pipe in known_pipes:
                 self.connection.execute(
                     """
-                    INSERT OR IGNORE INTO pipe_queues (finding_id, pipe, status)
-                    VALUES (?, ?, 'pending')
+                    INSERT OR IGNORE INTO pipe_queues (
+                        finding_id, pipe, status, created_at, updated_at
+                    )
+                    VALUES (?, ?, 'pending', ?, ?)
                     """,
-                    (finding_id, pipe),
+                    # created_at clock-pinned for the same reason as the findings
+                    # row above: suppressed_findings_since windows pq.created_at
+                    # against last_drain_at (clock-pinned), and pending_pipe_items
+                    # / dead_letter_items order by pq.created_at -- a wall-clock
+                    # default would mix clocks under a sim. updated_at is pinned
+                    # too so a never-dispatched pending row stays internally
+                    # coherent with created_at under a FakeClock.
+                    (finding_id, pipe, now, now),
                 )
         self.connection.commit()
         return finding_id
@@ -404,6 +438,14 @@ class Catalog:
         source: str | None = None,
         mark_queue: bool = True,
     ) -> None:
+        # dispatched_at is the clock-pinned timestamp every windowed read uses
+        # (sent_dispatch_count_for_*, failed_dispatch_count,
+        # last_successful_dispatch_per_pipe, timeline_events all key off it and
+        # it is always set here). dispatches.created_at is therefore left on the
+        # schema's wall-clock DEFAULT: timeline_events reads
+        # COALESCE(dispatched_at, created_at), and since dispatched_at is never
+        # NULL on a row this method writes, the created_at fallback is
+        # unreachable -- it is never compared against a clock-pinned value.
         self.connection.execute(
             """
             INSERT INTO dispatches (
@@ -474,10 +516,16 @@ class Catalog:
         )
         self.connection.execute(
             """
-            INSERT OR IGNORE INTO pipe_queues (finding_id, pipe, status)
-            VALUES (?, ?, 'pending')
+            INSERT OR IGNORE INTO pipe_queues (
+                finding_id, pipe, status, created_at, updated_at
+            )
+            VALUES (?, ?, 'pending', ?, ?)
             """,
-            (finding_id, target_pipe),
+            # Clock-pin created_at like write_finding's enqueue so every
+            # pipe_queues row shares one clock -- pending_pipe_items orders by
+            # pq.created_at, so a wall-clock default here would sort wrongly
+            # against the clock-pinned rows under a sim.
+            (finding_id, target_pipe, now, now),
         )
         self.connection.commit()
 
@@ -1377,6 +1425,11 @@ class Catalog:
         """
         now = self._clock.now_iso()
         opened_new = self._open_incident_for_key(source, finding_type, entity) is None
+        # opened_at/closed_at are the clock-pinned incident timestamps every
+        # windowed read uses (recently_closed_incidents windows closed_at;
+        # open_incidents/recently_closed order by opened_at/closed_at).
+        # incidents.created_at is never compared in a since/window query, so it
+        # is left on the schema's wall-clock DEFAULT.
         self.connection.execute(
             """
             INSERT INTO incidents (
@@ -1613,12 +1666,18 @@ class Catalog:
                 (finding_id, pipe),
             ).fetchone()
             if existing is None:
+                now = self._clock.now_iso()
                 self.connection.execute(
                     """
-                    INSERT INTO pipe_queues (finding_id, pipe, status)
-                    VALUES (?, ?, 'pending')
+                    INSERT INTO pipe_queues (
+                        finding_id, pipe, status, created_at, updated_at
+                    )
+                    VALUES (?, ?, 'pending', ?, ?)
                     """,
-                    (finding_id, pipe),
+                    # Clock-pin created_at like every other pipe_queues enqueue
+                    # so the column is single-clock for pending_pipe_items'
+                    # ORDER BY pq.created_at under a sim.
+                    (finding_id, pipe, now, now),
                 )
                 requeued.append(pipe)
             elif existing["status"] != "pending":
