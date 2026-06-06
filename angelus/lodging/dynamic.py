@@ -178,13 +178,28 @@ def matches(selector: dict[str, Any], entity: Entity) -> bool:
     return True
 
 
-def _substitute(template: str, entity: Entity) -> str:
-    """Render a check command template with entity fields.
+def _substitute(
+    template: str, entity: Entity, metadata: dict[str, Any] | None = None
+) -> str:
+    """Render a check command template with entity fields and watch metadata.
 
     Available placeholders: `entity` (the entity name), every key in
-    entity.attrs, and `kind`. Raises if a placeholder has no value.
+    entity.attrs, `kind`, and every key in the watch's `metadata:` block
+    (e.g. `{stale_days}`, so the check jq can derive a threshold from the
+    same single source of truth the handler reads). Raises if a placeholder
+    has no value.
+
+    Precedence: entity fields win over watch metadata. We layer metadata
+    FIRST, then the computed entity identity (`entity`/`kind`) and entity
+    attrs on top, so a metadata key that happens to collide with an entity
+    field (e.g. a `metadata: {url: ...}` against a `url:` entity attr) can
+    never silently retarget the check command -- the entity value always
+    takes effect. This mirrors expand()'s metadata layering, where the
+    canonical routing keys likewise clobber extra_metadata, not the reverse.
     """
-    context: dict[str, Any] = {"entity": entity.name, "kind": entity.kind}
+    context: dict[str, Any] = dict(metadata or {})
+    context["entity"] = entity.name
+    context["kind"] = entity.kind
     context.update(entity.attrs)
     fmt = Formatter()
     referenced: set[str] = set()
@@ -229,7 +244,12 @@ def expand(
                     f"{source_ref!r}; check for collisions with hand-written "
                     f"sources/scheduled/ files"
                 )
-            command = _substitute(watch.check_command, entity)
+            # Pass the watch's `metadata:` block so a check command can
+            # derive thresholds from the same source of truth the handler
+            # reads (e.g. stale-pr's jq computes its staleness cutoff from
+            # {stale_days} rather than a duplicated literal). Entity fields
+            # still take precedence inside _substitute.
+            command = _substitute(watch.check_command, entity, watch.extra_metadata)
             sources[source_ref] = ScheduledSource(
                 name=synth_name,
                 source_ref=source_ref,

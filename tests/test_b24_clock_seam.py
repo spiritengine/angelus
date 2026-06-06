@@ -37,23 +37,28 @@ def test_fake_clock_set_and_advance() -> None:
 
 
 def test_catalog_timestamp_uses_injected_clock(tmp_path: Path) -> None:
+    # record_source_fire was collapsed into record_watch_check (observation
+    # collapse); the clock seam it exercises is now on watch_state's
+    # last_checked_at, which the heartbeat (belfry/health) reads.
     connection = init_db(tmp_path / "angelus.sqlite3")
     clock = FakeClock(PINNED)
     catalog = Catalog(connection, tmp_path, clock=clock)
     try:
-        catalog.record_source_fire("scheduled/test", None, "ok")
+        catalog.record_watch_check("scheduled/test", "200", "ok", None)
         first = connection.execute(
-            "SELECT fired_at FROM source_fires ORDER BY id DESC LIMIT 1"
-        ).fetchone()["fired_at"]
+            "SELECT last_checked_at FROM watch_state WHERE source_ref = ?",
+            ("scheduled/test",),
+        ).fetchone()["last_checked_at"]
         assert first == "2026-01-15T12:00:00.000Z"
 
         # Advancing the clock moves the next stamped row -- nothing reads the
-        # wall clock.
+        # wall clock. The overwrite-in-place keeps one row per source.
         clock.advance(timedelta(days=2, hours=3))
-        catalog.record_source_fire("scheduled/test", None, "ok")
+        catalog.record_watch_check("scheduled/test", "200", "ok", None)
         second = connection.execute(
-            "SELECT fired_at FROM source_fires ORDER BY id DESC LIMIT 1"
-        ).fetchone()["fired_at"]
+            "SELECT last_checked_at FROM watch_state WHERE source_ref = ?",
+            ("scheduled/test",),
+        ).fetchone()["last_checked_at"]
         assert second == "2026-01-17T15:00:00.000Z"
     finally:
         connection.close()
@@ -202,10 +207,11 @@ def test_catalog_defaults_to_real_clock(tmp_path: Path) -> None:
     connection = init_db(tmp_path / "angelus.sqlite3")
     catalog = Catalog(connection, tmp_path)
     try:
-        catalog.record_source_fire("scheduled/test", None, "ok")
+        catalog.record_watch_check("scheduled/test", "200", "ok", None)
         stamped = connection.execute(
-            "SELECT fired_at FROM source_fires ORDER BY id DESC LIMIT 1"
-        ).fetchone()["fired_at"]
+            "SELECT last_checked_at FROM watch_state WHERE source_ref = ?",
+            ("scheduled/test",),
+        ).fetchone()["last_checked_at"]
         parsed = datetime.fromisoformat(stamped.replace("Z", "+00:00"))
         assert abs((Clock().now() - parsed).total_seconds()) < 60
     finally:

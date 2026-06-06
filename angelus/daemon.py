@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import signal
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from apscheduler.jobstores.base import JobLookupError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -35,6 +38,46 @@ from angelus.storage import Catalog, init_db
 from angelus.triage import run_python_triager
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _change_signature(payload: dict[str, Any], outcome: str) -> str:
+    """The comparison token for observation collapse: a fire writes an
+    observation only when this value differs from the source's stored
+    last_state. The whole reliability invariant rides on this -- angelus
+    exists to catch state transitions, so the rule is NEVER MISS A
+    TRANSITION; over-writing (a redundant observation) is harmless, skipping
+    one is not.
+
+    The token is the SIMPLE state, not a whole-payload diff:
+      * If the payload carries an explicit `state` field, that is the token
+        (e.g. "200", "503", "success", "failure"). This is the preferred path
+        and the reason the watch checks emit `state`: it means a CI run that
+        stays green across a new sha/run_started does NOT churn an observation,
+        while a green->red conclusion always does. A whole-payload diff would
+        get this exactly wrong.
+      * Otherwise (an unconfigured check with no `state`) fall back to a
+        canonical hash of the full payload, so identical payloads still
+        collapse and nothing is silently lost.
+
+    OUTCOME is folded in so a check that starts failing or recovers is ALWAYS
+    a change even if the state token is unchanged: a check_failed fire is
+    prefixed so it can never collide with any ok signature. (An ok 200 and a
+    check_failed fire that happened to carry status 200 must read as different
+    states -- the latter means "we could not actually check".)
+
+    Raising is the caller's signal to fail safe: _fire_source treats ANY
+    exception here as a change and writes the observation.
+    """
+    if "state" in payload:
+        token = str(payload["state"])
+    else:
+        token = hashlib.sha256(
+            json.dumps(payload, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+    if outcome != "ok":
+        return f"{outcome}:{token}"
+    return token
+
 
 DEFAULT_BELFRY_SENTINEL_FILENAME = "belfry-pinged-at"
 DEFAULT_BELFRY_STALE_AFTER_SEC = 1200
@@ -782,14 +825,17 @@ class AngelusDaemon:
         }
 
     async def _op_fire_source(self, args: dict) -> dict:
-        """Run a source's check once on demand and return the observation (B25).
+        """Run a source's check once on demand and return what it produced (B25).
 
         Reuses _fire_source -- the same body the scheduler runs -- so the
         manual fire is indistinguishable from a scheduled one: it acquires
         self.scheduler_semaphore (bounding it against concurrent scheduled
-        fires), runs the shell check, records the fire, and writes the
-        observation. _fire_source returns the (observation_id, outcome) the op
-        shapes its response from; the scheduler ignores that return.
+        fires), runs the shell check, records the check, and writes an
+        observation IF the state changed. _fire_source returns the
+        (observation_id, outcome) the op shapes its response from; the scheduler
+        ignores that return. observation_id is None when the fire collapsed (no
+        state change, no observation written) -- the CLI renders that as "no
+        change" rather than an id.
 
         An unknown source name is rejected before the fire (mirroring drain's
         unknown-pipe rejection). A None result means the source was
@@ -983,15 +1029,34 @@ class AngelusDaemon:
         except (asyncio.CancelledError, Exception):
             pass
 
-    async def _fire_source(self, source_ref: str) -> tuple[int, str] | None:
-        """Run a source's shell check, record the fire, write the observation.
+    async def _fire_source(self, source_ref: str) -> tuple[int | None, str] | None:
+        """Run a source's shell check and write an observation ONLY when the
+        source's state changed (observation collapse).
 
-        Returns (observation_id, outcome) -- outcome is "ok" on a clean check
-        and "check_failed" on a non-zero/timeout/bad-payload check -- so the
-        manual `fire_source` op (B25) can surface what the fire produced. The
-        scheduler caller (the registered job) ignores the return; the change is
-        additive. Returns None only when the source was hot-removed before the
-        fire (the vanished-target race), matching how the op treats it.
+        Returns (observation_id, outcome). outcome is "ok" on a clean check and
+        "check_failed" on a non-zero/timeout/bad-payload check. observation_id
+        is the new observation's id when the fire was a CHANGE (or first
+        sighting), or None on a collapsed (unchanged) tick where no observation
+        was written -- the manual `fire_source` op (B25) surfaces both, and the
+        scheduler caller ignores the return. Returns None (the whole tuple) only
+        when the source was hot-removed before the fire (the vanished-target
+        race), matching how the op treats it.
+
+        Why collapse: nearly every tick is byte-identical to the prior one (a
+        web check returning 200 again), and writing an observation + a ledger
+        row for each grew the DB unboundedly for zero signal. We compare a
+        simple state signature against the source's stored last_state and write
+        an observation only on a difference -- but we ALWAYS bump watch_state's
+        last_checked_at heartbeat (the overwrite-in-place that replaces the old
+        source_fires append, and what belfry's wedge detection / health read).
+
+        The overriding invariant is NEVER MISS A STATE TRANSITION: the very
+        thing angelus exists to catch (a site going up->down within the check
+        cadence) must always produce an observation. So a missing prior row
+        (first sighting), an outcome flip (ok<->check_failed, folded into the
+        signature), and a signature-computation ERROR (fail-safe below) all
+        count as changes. The only thing we suppress is a fire that is provably
+        identical to the last one we already recorded.
         """
         source = self.lodging.sources.get(source_ref)
         if source is None:
@@ -1000,25 +1065,65 @@ class AngelusDaemon:
         async with self.scheduler_semaphore:
             ok, payload = await run_shell_source(source)
             outcome = "ok" if ok else "check_failed"
-            # scheduled_at left NULL: APScheduler does not pass planned-fire time
-            # into the job body. Belt overdue (slice 2) reads fired_at; belfry
-            # wedge detection (slice 4) reads fired_at. Wire the planned time
-            # via a job listener if a real consumer appears.
-            self.catalog.record_source_fire(source.source_ref, None, outcome)
-            if ok:
-                observation_id = self.catalog.write_observation(
+            # Fail-safe signature: ANY error computing it is treated as a change
+            # (signature=None forces the write below). Missing a transition is
+            # the one unacceptable failure, so a malformed payload must never
+            # silently skip the observation -- it errs toward writing.
+            try:
+                signature: str | None = _change_signature(payload, outcome)
+            except Exception:
+                LOGGER.exception(
+                    "change-signature failed for %s; writing observation "
+                    "(fail-safe: never skip a possible transition)",
                     source.source_ref,
-                    payload,
-                    {"source": source.source_ref, "check": "shell"},
                 )
-                LOGGER.info("observation %s ready for %s", observation_id, source.source_ref)
+                signature = None
+
+            prior = self.catalog.watch_state_for(source.source_ref)
+            changed = (
+                signature is None
+                or prior is None
+                or prior.get("last_state") != signature
+            )
+
+            observation_id: int | None = None
+            if changed:
+                if ok:
+                    observation_id = self.catalog.write_observation(
+                        source.source_ref,
+                        payload,
+                        {"source": source.source_ref, "check": "shell"},
+                    )
+                    LOGGER.info(
+                        "observation %s ready for %s (state changed)",
+                        observation_id,
+                        source.source_ref,
+                    )
+                else:
+                    observation_id = self.catalog.write_observation(
+                        source.source_ref,
+                        {"type": "check_failed", **payload},
+                        {
+                            "source": source.source_ref,
+                            "check": "shell",
+                            "outcome": outcome,
+                        },
+                    )
+                    LOGGER.warning("source %s failed: %s", source.source_ref, payload)
             else:
-                observation_id = self.catalog.write_observation(
+                LOGGER.debug(
+                    "source %s unchanged (state %s); collapsed, no observation",
                     source.source_ref,
-                    {"type": "check_failed", **payload},
-                    {"source": source.source_ref, "check": "shell", "outcome": outcome},
+                    signature,
                 )
-                LOGGER.warning("source %s failed: %s", source.source_ref, payload)
+
+            # ALWAYS record the check: the last_checked_at bump is the heartbeat
+            # belfry/health read, and replaces the source_fires append. On a
+            # collapsed tick observation_id is None, so record_watch_check
+            # preserves last_state/last_changed_at (the last real transition).
+            self.catalog.record_watch_check(
+                source.source_ref, signature, outcome, observation_id
+            )
             return observation_id, outcome
 
     def _discover_ready_triage(self) -> list[tuple]:

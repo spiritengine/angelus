@@ -582,17 +582,22 @@ def fire_source(name: str, root: Path) -> None:
     """Run source NAME's check once now and report the observation (B25).
 
     Forces a source's scheduled check on demand instead of waiting for its
-    cadence, producing one observation (which the triage loop then picks up as
-    usual). A WRITE: it goes through the daemon (the single sqlite writer, and
-    the only process that runs scheduled checks), so it REQUIRES the daemon and
-    has no read-only fallback. `outcome` is `ok` on a clean check or
-    `check_failed` on a non-zero/timeout/bad-payload check -- an observation is
-    written either way.
+    cadence. Under observation collapse it produces an observation ONLY if the
+    source's state changed since its last check; an unchanged fire writes no
+    observation (it just bumps the last-checked heartbeat), and the command
+    reports that as "no change". A WRITE: it goes through the daemon (the single
+    sqlite writer, and the only process that runs scheduled checks), so it
+    REQUIRES the daemon and has no read-only fallback. `outcome` is `ok` on a
+    clean check or `check_failed` on a non-zero/timeout/bad-payload check.
     """
     root = root.resolve()
     result = _require_daemon(root, "fire_source", {"name": name}, "fire-source")
     click.echo(f"source: {result['source']}")
-    click.echo(f"observation: {result['observation_id']}")
+    observation_id = result["observation_id"]
+    if observation_id is None:
+        click.echo("observation: none (state unchanged, collapsed)")
+    else:
+        click.echo(f"observation: {observation_id}")
     click.echo(f"outcome: {result['outcome']}")
 
 
@@ -652,9 +657,14 @@ async def _run_sim(harness: Any, steps: list[Any]) -> list[str]:
             report.append(f"advance {arg}: now {harness.clock.now_iso()}")
         elif verb == "fire_source":
             observation_id, outcome = await harness.fire_source(str(arg))
-            report.append(
-                f"fire_source {arg}: observation {observation_id} outcome {outcome}"
-            )
+            if observation_id is None:
+                report.append(
+                    f"fire_source {arg}: no change (collapsed) outcome {outcome}"
+                )
+            else:
+                report.append(
+                    f"fire_source {arg}: observation {observation_id} outcome {outcome}"
+                )
         elif verb == "inject":
             if not isinstance(arg, dict) or "source_ref" not in arg:
                 raise click.ClickException(
@@ -876,8 +886,9 @@ def _render_timeline(
 def _format_timeline_event(event: dict[str, Any]) -> str:
     ts = event["ts"]
     kind = event["kind"]
-    if kind == "fire":
-        return f"{ts} fire {event['source']} {event['outcome']}"
+    # No "fire" kind: observation collapse means a fire only surfaces as the
+    # observation it writes on a state change (timeline_events no longer emits
+    # per-tick fire events). The heartbeat lives in watch_state, read by health.
     if kind == "observation":
         return f"{ts} observation {event['source']} ({event['status']})"
     if kind == "finding":

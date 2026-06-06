@@ -561,6 +561,10 @@ def test_ci_watch_command_round_trips_through_jq_on_empty_runs() -> None:
         "run_started": None,
         "sha": None,
         "workflow": None,
+        # `state` is the observation-collapse token: the run conclusion. On an
+        # empty run array it is null (same as conclusion), so two consecutive
+        # no-runs ticks collapse rather than churn an observation.
+        "state": None,
     }
 
 
@@ -580,8 +584,19 @@ def test_stale_pr_watch_command_round_trips_through_jq() -> None:
         capture_output=True,
         check=True,
     )
-    assert json.loads(empty.stdout) == {"entity": "skein", "prs": []}
+    # `state` is the observation-collapse token: a canonical representation of
+    # the STALE set (PRs older than the threshold). Empty PR list -> "clear".
+    assert json.loads(empty.stdout) == {
+        "entity": "skein",
+        "prs": [],
+        "state": "clear",
+    }
 
+    # PR #7 was updated 2026-01-01 -- comfortably older than the 30d threshold
+    # the jq computes against jq's `now`, so it is in the stale set and the
+    # token is its number. (This is the time-dependent staleness the token must
+    # capture; a token built from the open-PR set alone would miss the
+    # fresh->stale transition.)
     populated_in = json.dumps(
         [{"number": 7, "title": "demo", "updatedAt": "2026-01-01T00:00:00Z"}]
     ).encode("utf-8")
@@ -594,6 +609,7 @@ def test_stale_pr_watch_command_round_trips_through_jq() -> None:
     payload = json.loads(populated.stdout)
     assert payload["entity"] == "skein"
     assert payload["prs"][0]["number"] == 7
+    assert payload["state"] == "7"
 
 
 def test_stale_pr_incident_lifecycle_through_handler_and_catalog(

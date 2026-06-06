@@ -1,11 +1,16 @@
 """B23 event-timeline: `angelus timeline` reconstructs the ordered story for
-a time window (fires, observations, findings, dispatches including failures)
+a time window (observations, findings, dispatches including failures)
 interleaved by timestamp, plain text, one event per line.
 
 The load-bearing assertion is chronological order across tables: the rows are
-seeded out of insertion order and across all four tables, and the rendered
-lines must come back sorted by timestamp -- the fire -> dispatch-failure
-sequence that today's incident postmortem depends on.
+seeded out of insertion order and across all three tables, and the rendered
+lines must come back sorted by timestamp -- the observation -> dispatch-failure
+sequence that an incident postmortem depends on.
+
+Note: there is no "fire" event any more. Observation collapse (migration 0012)
+dropped source_fires; a fire surfaces only as the OBSERVATION it writes on a
+state change, which the timeline already renders. The per-tick "we checked"
+heartbeat moved to watch_state and is not a story event.
 """
 
 from __future__ import annotations
@@ -24,12 +29,9 @@ def _seed(root: Path) -> None:
     state = root / "state"
     state.mkdir()
     connection = init_db(state / "angelus.sqlite3")
-    # Insert deliberately scrambled: a late dispatch first, an early fire last.
-    connection.execute(
-        "INSERT INTO source_fires (source_name, scheduled_at, fired_at, outcome) "
-        "VALUES (?, ?, ?, ?)",
-        ("scheduled/daily-drain", None, "2026-05-29T12:00:00.000Z", "ok"),
-    )
+    # Insert deliberately scrambled: a late dispatch first, an early
+    # observation last. (No source_fires: the fire of a source surfaces as the
+    # observation it writes on a state change -- observation collapse.)
     connection.execute(
         "INSERT INTO dispatches (pipe, channel, finding_ids, status, attempts, "
         "last_error, dispatched_at) VALUES (?, ?, ?, ?, 1, ?, ?)",
@@ -64,9 +66,8 @@ def _seed(root: Path) -> None:
     )
     # An event well outside the queried window: must not appear.
     connection.execute(
-        "INSERT INTO source_fires (source_name, scheduled_at, fired_at, outcome) "
-        "VALUES (?, ?, ?, ?)",
-        ("scheduled/yesterday", None, "2026-05-28T09:00:00.000Z", "ok"),
+        "INSERT INTO observations (source, status, created_at) VALUES (?, ?, ?)",
+        ("scheduled/yesterday", "ready", "2026-05-28T09:00:00.000Z"),
     )
     connection.commit()
     connection.close()
@@ -95,18 +96,16 @@ def test_timeline_renders_events_in_chronological_order(tmp_path) -> None:
     timestamps = [line.split(" ", 1)[0] for line in event_lines]
     assert timestamps == sorted(timestamps), event_lines
     assert timestamps == [
-        "2026-05-29T12:00:00.000Z",  # fire
         "2026-05-29T12:00:02.000Z",  # observation
         "2026-05-29T12:00:06.986Z",  # dispatch failure
         "2026-05-29T12:00:06.989Z",  # finding raised by the failure
     ]
-    # The four kinds and the failure detail all render on their own line.
-    assert "fire scheduled/daily-drain ok" in event_lines[0]
-    assert "observation scheduled/daily-drain (ready)" in event_lines[1]
+    # The three kinds and the failure detail all render on their own line.
+    assert "observation scheduled/daily-drain (ready)" in event_lines[0]
     assert "dispatch daily/email failed: email channel env var is unset" in (
-        event_lines[2]
+        event_lines[1]
     )
-    assert "finding internal/dispatch channel_unhealthy email" in event_lines[3]
+    assert "finding internal/dispatch channel_unhealthy email" in event_lines[2]
     # Out-of-window event is excluded.
     assert "yesterday" not in result.output
 

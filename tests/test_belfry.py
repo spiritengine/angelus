@@ -60,27 +60,38 @@ def _load_belfry():
 
 
 def _write_source_fire(root: Path, fired_at: datetime) -> None:
+    # belfry's wedge detection now reads watch_state.last_checked_at (the
+    # per-source "last checked" heartbeat that replaced the source_fires
+    # append). The helper name is kept; it seeds one watch_state row whose
+    # last_checked_at IS the fire time the wedge math compares against.
     state = root / "state"
     state.mkdir(exist_ok=True)
     connection = sqlite3.connect(state / "angelus.sqlite3")
     try:
         connection.execute(
             """
-            CREATE TABLE source_fires (
-                id INTEGER PRIMARY KEY,
-                source_name TEXT NOT NULL,
-                scheduled_at TEXT,
-                fired_at TEXT NOT NULL,
-                outcome TEXT NOT NULL
+            CREATE TABLE IF NOT EXISTS watch_state (
+                source_ref TEXT PRIMARY KEY,
+                last_checked_at TEXT NOT NULL,
+                last_state TEXT,
+                last_outcome TEXT,
+                last_changed_at TEXT,
+                last_observation_id INTEGER,
+                updated_at TEXT NOT NULL
             )
             """
         )
+        stamp = fired_at.isoformat(timespec="milliseconds").replace("+00:00", "Z")
         connection.execute(
             """
-            INSERT INTO source_fires (source_name, scheduled_at, fired_at, outcome)
-            VALUES ('scheduled/test', NULL, ?, 'ok')
+            INSERT INTO watch_state
+                (source_ref, last_checked_at, last_state, last_outcome, updated_at)
+            VALUES ('scheduled/test', ?, '200', 'ok', ?)
+            ON CONFLICT(source_ref) DO UPDATE SET
+                last_checked_at = excluded.last_checked_at,
+                updated_at = excluded.updated_at
             """,
-            (fired_at.isoformat(timespec="milliseconds").replace("+00:00", "Z"),),
+            (stamp, stamp),
         )
         connection.commit()
     finally:
@@ -360,11 +371,12 @@ def test_systemd_main_pid_skips_xdg_when_dbus_present(monkeypatch) -> None:
 # --- M2 slice 6: belfry independence end-to-end --------------------------
 #
 # The unit tests above stage a synthetic state directory; this test brings
-# up a real angelus daemon subprocess, lets it write source_fires, SIGKILLs
+# up a real angelus daemon subprocess, lets it write watch_state, SIGKILLs
 # it, then drives a single belfry tick. The contract: belfry's pid_failure
 # detects the dead PID file and escalates (down ping + notify-pat) BEFORE
-# the wedge threshold can apply -- source_fires is deliberately recent so
-# wedge_failure returns None and pid_failure is the discriminating axis.
+# the wedge threshold can apply -- watch_state.last_checked_at is deliberately
+# recent so wedge_failure returns None and pid_failure is the discriminating
+# axis.
 
 
 def _alive(pid: int) -> bool:
@@ -377,7 +389,7 @@ def _alive(pid: int) -> bool:
 
 def _write_daemon_lodging(root: Path) -> None:
     """Minimal lodging the daemon can load. cadence: 1s on the source so
-    a source_fires row appears within ~2s and the wedge axis is taken off
+    a watch_state row appears within ~2s and the wedge axis is taken off
     the table for the discrimination inversion (a row exists and is fresh,
     so wedge_failure returns None on its own)."""
     (root / "sources" / "scheduled").mkdir(parents=True)
@@ -442,10 +454,11 @@ def _read_pid_file(root: Path, timeout: float) -> int:
 
 
 def _wait_for_source_fire(root: Path, timeout: float) -> str:
-    """Wait until source_fires has at least one row and return its
-    fired_at. Required for the discriminating inversion: with a fresh row
-    on disk, wedge_failure returns None on its own, so pid_failure is the
-    only axis that can produce the down-ping."""
+    """Wait until watch_state has at least one row and return its
+    last_checked_at. Required for the discriminating inversion: with a fresh
+    heartbeat on disk, wedge_failure returns None on its own, so pid_failure is
+    the only axis that can produce the down-ping. (watch_state's last_checked_at
+    is what wedge detection reads now -- it replaced source_fires.)"""
     db = root / "state" / "angelus.sqlite3"
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -453,7 +466,7 @@ def _wait_for_source_fire(root: Path, timeout: float) -> str:
             conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
             try:
                 row = conn.execute(
-                    "SELECT max(fired_at) FROM source_fires"
+                    "SELECT max(last_checked_at) FROM watch_state"
                 ).fetchone()
             finally:
                 conn.close()
@@ -463,7 +476,7 @@ def _wait_for_source_fire(root: Path, timeout: float) -> str:
             pass
         time.sleep(0.1)
     raise AssertionError(
-        f"source_fires never gained a row within {timeout}s"
+        f"watch_state never gained a row within {timeout}s"
     )
 
 
@@ -491,7 +504,7 @@ def _kill_and_wait(proc: subprocess.Popen, pid: int) -> None:
 def test_belfry_independence_against_sigkilled_daemon(
     tmp_path, monkeypatch
 ) -> None:
-    """Full integration: real angelus daemon subprocess -> source_fires
+    """Full integration: real angelus daemon subprocess -> watch_state
     populated -> SIGKILL -> single belfry tick on the orphaned state dir.
     Belfry's pid_failure must detect the dead-PID file, ping the down URL
     once, and call notify-pat with a payload identifying the dead-PID
@@ -517,7 +530,7 @@ def test_belfry_independence_against_sigkilled_daemon(
     try:
         pid = _read_pid_file(tmp_path, timeout=15.0)
         assert _alive(pid), f"daemon PID {pid} was not alive on PID-file read"
-        # Required for discrimination: source_fires must hold a fresh row
+        # Required for discrimination: watch_state must hold a fresh row
         # before SIGKILL, otherwise wedge_failure's "no rows" branch fires
         # under pid_failure inversion and the test can't distinguish the
         # two axes.
@@ -531,7 +544,7 @@ def test_belfry_independence_against_sigkilled_daemon(
             except subprocess.TimeoutExpired:
                 pass
 
-    # Confirm the orphaned state: PID file present, source_fires populated.
+    # Confirm the orphaned state: PID file present, watch_state populated.
     assert (tmp_path / "state" / "angelus.pid").exists(), (
         "SIGKILL should leave the PID file on disk (clean-shutdown unlink "
         "only runs in the daemon's finally clause, which SIGKILL bypasses)"

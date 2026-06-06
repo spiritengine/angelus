@@ -170,11 +170,12 @@ class SimHarness:
 
     # -- step primitives (each reuses a production path) -------------------
 
-    async def fire_source(self, name: str) -> tuple[int, str]:
-        """Run a lodged source's shell check once and write its observation,
-        via the exact path APScheduler and the `fire_source` op use
-        (AngelusDaemon._fire_source). Returns (observation_id, outcome) where
-        outcome is "ok" or "check_failed".
+    async def fire_source(self, name: str) -> tuple[int | None, str]:
+        """Run a lodged source's shell check once via the exact path APScheduler
+        and the `fire_source` op use (AngelusDaemon._fire_source). Returns
+        (observation_id, outcome) where outcome is "ok" or "check_failed", and
+        observation_id is the new observation's id on a state CHANGE or None on
+        a collapsed (unchanged) fire that wrote no observation.
 
         Raises KeyError on an unknown source -- a scenario typo should fail
         loudly rather than silently do nothing.

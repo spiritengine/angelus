@@ -344,15 +344,17 @@ def test_three_source_multi_cadence_dedup_discriminates_on_source_ref(
             sent_after_now = list(sent_push)
 
             # Tick 3: canary-loose-a fires AGAIN with status_code still
-            # 503. The triager sees prior_state.last_status == 503 and
-            # emits NO new finding -- the within-source dedup property.
-            # If the triager state machine were broken (always emitting
-            # on a non-200), this would write a fresh finding and a
-            # subsequent now-drain would push a 4th dispatch.
+            # 503 -- an unchanged state. Under observation collapse the fire
+            # writes NO observation (the prior 503 already recorded), so there
+            # is nothing for the triager to pick up: the redundant down is
+            # suppressed at the observation layer, not just the triager's
+            # within-source dedup. If collapse were broken (always-write), a
+            # fresh 503 observation would appear and triaged would be 1.
             await daemon._fire_source("scheduled/canary-loose-a")
             triaged = await _drive_triage(daemon)
-            assert triaged == 1, (
-                "the third canary-loose-a fire produces one observation"
+            assert triaged == 0, (
+                "the third canary-loose-a fire is an unchanged 503 -> "
+                f"collapsed, no observation written; got triaged={triaged}"
             )
 
             canary_loose_a_findings = list(daemon.connection.execute(
@@ -360,10 +362,9 @@ def test_three_source_multi_cadence_dedup_discriminates_on_source_ref(
                 ("scheduled/canary-loose-a",),
             ))
             assert len(canary_loose_a_findings) == 1, (
-                "within-source dedup: a second canary-loose-a down-fire "
-                "must not write a new finding while the prior down is "
-                f"still the current state; got "
-                f"{len(canary_loose_a_findings)} findings"
+                "no new finding from the collapsed re-fire: the prior down "
+                "is still the current state and no observation was written; "
+                f"got {len(canary_loose_a_findings)} findings"
             )
 
             # Drain now-pipe again: no new dispatches (no new findings
