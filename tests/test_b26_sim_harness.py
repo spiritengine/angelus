@@ -27,11 +27,14 @@ its docstring; the module's mutation log is in the B26 deliverable note.
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
+import os
 import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import yaml
 from click.testing import CliRunner
 
 import angelus.channels.push as push_channel
@@ -399,3 +402,184 @@ def test_cli_sim_runs_scripted_cycle(tmp_path) -> None:
     assert "drain now: dispatched 1 failed 0" in out
     assert "[now] scheduled/watch down:site.example" in out
     assert "sim complete" in out
+
+
+# --------------------------------------------------------------------------
+# MULTI-DRAIN DIGEST WINDOW: the since-last-drain window is clock-pinned, so a
+# second digest selects findings by the FakeClock, not the wall clock (fell-r1,
+# Finding 1 -- the B24 clock seam was incomplete: findings.created_at fell to
+# the schema's wall-clock DEFAULT).
+# --------------------------------------------------------------------------
+
+
+def test_multi_drain_digest_window_is_clock_pinned(tmp_path, monkeypatch) -> None:
+    """Drain a digest once, advance the clock a day, create a second finding,
+    drain again: the since-last-drain window must select exactly the finding
+    created AFTER the first drain -- by the pinned clock, not the wall clock.
+
+    Discrimination: with the clock pinned far from real-now (2030), the digest's
+    findings_since_last_drain reads findings_for_pipe_since(pipe, last_drain_at),
+    which filters f.created_at > last_drain_at. last_drain_at is clock-pinned
+    (mark_pipe_drained writes the FakeClock). If findings.created_at is left on
+    the schema's wall-clock DEFAULT (the bug), the day-2 finding's created_at is
+    real-now (~2026), which is NOT > the 2030 last_drain_at -- so the window
+    comes back EMPTY and the second digest silently drops the new finding. With
+    created_at clock-pinned at the INSERT, the day-2 finding sorts after the
+    drain and the window selects it (and only it -- the already-dispatched day-1
+    finding, created exactly at the first drain instant, is excluded by the
+    strict `>`).
+
+    The existing test_advancing_a_day test does NOT cover this: its single drain
+    has last_drain_at=None, so the created_at filter never runs.
+    """
+    far = datetime(2030, 1, 1, 12, 0, tzinfo=UTC)
+    _write_lodging(tmp_path, status_code=503)
+
+    # A second, independent source+triager. canary_watch keys prior_state per
+    # (triager, source), so a finding created after the first drain needs its
+    # own up->down edge -- reusing the first source would dedup the repeat
+    # (last_status already 503) and emit nothing.
+    fixture2 = tmp_path / "fixtures" / "watch2.json"
+    _write_fixture(
+        fixture2,
+        {
+            "source_ref": "scheduled/watch2",
+            "entity": "site2.example",
+            "url": "https://site2.example",
+            "status_code": 503,
+        },
+    )
+    (tmp_path / "sources" / "scheduled" / "watch2.yaml").write_text(
+        f"cadence: 1h\ncheck:\n  kind: shell\n  command: 'cat {fixture2}'\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "triagers" / "watch2.yaml").write_text(
+        "inputs:\n  source: scheduled/watch2\n"
+        "handler:\n  kind: python\n  path: triagers/handlers/canary_watch.py\n",
+        encoding="utf-8",
+    )
+
+    async def fake_llm(self, _pipe, _structured):
+        # Render-only stub: a real chronicler body would burn a horizon cast.
+        return "synthesis paragraph.", None
+
+    monkeypatch.setattr(PipeDrain, "_render_llm_body", fake_llm)
+
+    async def scenario() -> None:
+        with SimHarness(tmp_path, far) as sim:
+            # Day 1: a down finding for site.example, drained in the first digest.
+            await sim.fire_source("scheduled/watch")
+            await sim.run_triage()
+            first = await sim.drain("daily")
+            assert first.dispatched == 1, first
+            last_drain_at = sim.daemon.catalog.last_pipe_drain_at("daily")
+            assert last_drain_at == "2030-01-01T12:00:00.000Z", last_drain_at
+
+            # Day 2: an independent down finding for site2.example.
+            sim.advance(timedelta(days=1))
+            await sim.fire_source("scheduled/watch2")
+            await sim.run_triage()
+
+            # THE DISCRIMINATOR: the exact query the second digest's
+            # findings_since_last_drain reads. It must contain only the day-2
+            # finding -- not the already-dispatched day-1 one, and not drop the
+            # new one. On the wall-clock-default bug this is [] (day-2 created_at
+            # ~2026 is not > the 2030 last_drain_at).
+            window = sim.findings_for_pipe("daily", last_drain_at)
+            entities = sorted(f["entity"] for f in window)
+            assert entities == ["site2.example"], (
+                "the since-last-drain window must select exactly the finding "
+                f"created after the first drain; got {entities}"
+            )
+
+            # And the second drain actually ships that new finding.
+            second = await sim.drain("daily")
+            assert second.dispatched == 1, second
+
+    asyncio.run(scenario())
+
+
+# --------------------------------------------------------------------------
+# CLI ERROR HANDLING: a broken YAML script exits non-zero with a clean message,
+# not a raw parser traceback (fell-r1, Finding 2).
+# --------------------------------------------------------------------------
+
+
+def test_cli_sim_invalid_yaml_exits_clean(tmp_path) -> None:
+    """A syntactically broken sim script exits non-zero with a clean
+    ``sim: invalid YAML:`` ClickException line, not a raw yaml ParserError.
+
+    Discrimination: the script has an unterminated flow sequence, so
+    yaml.safe_load raises a YAMLError. With the try/except the command surfaces
+    a clean ClickException (rendered as an ``Error: sim: invalid YAML: ...``
+    line, exit 1) and result.exception is the click SystemExit. Without it, the
+    raw YAMLError propagates uncaught -- result.exception is the YAMLError and
+    the clean message never appears.
+    """
+    _write_lodging(tmp_path, status_code=503)
+    script = tmp_path / "broken.yaml"
+    script.write_text(
+        "start: '2030-01-01T12:00:00Z'\nsteps: [unterminated\n",
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(
+        main, ["sim", str(script), "--root", str(tmp_path)]
+    )
+    assert result.exit_code != 0
+    assert "sim: invalid YAML:" in result.output
+    assert "Traceback (most recent call last)" not in result.output
+    assert not isinstance(result.exception, yaml.YAMLError), (
+        "the raw YAMLError must be turned into a clean ClickException"
+    )
+
+
+# --------------------------------------------------------------------------
+# ENV HYGIENE: the ANGELUS_DRY_RUN override never leaks past the harness's
+# lifetime -- restored on close() AND by a GC finalizer if close() is skipped
+# (fell-r1, Finding 3).
+# --------------------------------------------------------------------------
+
+
+def test_dry_run_env_never_leaks(tmp_path, monkeypatch) -> None:
+    """Constructing + closing a harness leaves ANGELUS_DRY_RUN exactly at its
+    prior value -- unset stays unset, a preset value is restored -- and a
+    harness built without ``with`` and never close()d still does not leak the
+    override (the weakref finalizer restores it on GC).
+
+    Discrimination: the harness sets ANGELUS_DRY_RUN=1 for its lifetime so a
+    send can never page a phone. If close() did not restore it, case 1's
+    post-close assertion (the var is unset again) would fail; if no finalizer
+    backstop existed, case 3 (no close(), object dropped) would leave the var
+    leaked at "1" after GC.
+    """
+    _write_lodging(tmp_path, status_code=200)
+
+    # Case 1: prior unset -> restored to unset on close.
+    monkeypatch.delenv("ANGELUS_DRY_RUN", raising=False)
+    sim = SimHarness(tmp_path, START)
+    assert os.environ.get("ANGELUS_DRY_RUN") == "1", "set for the harness's life"
+    sim.close()
+    assert "ANGELUS_DRY_RUN" not in os.environ, "restored to unset on close"
+
+    # Case 2: a preset prior value is restored verbatim on close.
+    monkeypatch.setenv("ANGELUS_DRY_RUN", "preset")
+    sim2 = SimHarness(tmp_path, START)
+    assert os.environ["ANGELUS_DRY_RUN"] == "1"
+    sim2.close()
+    assert os.environ["ANGELUS_DRY_RUN"] == "preset", "prior value restored"
+
+    # Case 3 (the footgun): no `with`, no close(). Dropping the harness must
+    # still restore the env via the GC finalizer.
+    monkeypatch.delenv("ANGELUS_DRY_RUN", raising=False)
+    sim3 = SimHarness(tmp_path, START)
+    assert os.environ.get("ANGELUS_DRY_RUN") == "1"
+    # Close the sqlite connection by hand (the part close() would do) so the
+    # dropped harness leaves no open handle -- without calling close(), so the
+    # env restore is exercised purely through the finalizer.
+    sim3.daemon.connection.close()
+    del sim3
+    gc.collect()
+    assert "ANGELUS_DRY_RUN" not in os.environ, (
+        "a harness dropped without close() must not leak the dry-run override"
+    )

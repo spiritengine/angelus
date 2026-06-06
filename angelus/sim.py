@@ -24,15 +24,18 @@ thin wrapper for an ad-hoc scripted run. The harness is therefore the core
 deliverable; build a scenario as a short, legible script of harness calls.
 
 Dry-run is guaranteed by the harness, not left to the caller: on construction
-it sets ANGELUS_DRY_RUN=1 (restored on close), so every channel send writes a
-line to ``dispatches.log`` instead of shelling ``notify-pat`` / email. A
-scenario can never accidentally page a real phone. Triagers still run as real
-subprocesses -- faithful and fine offline.
+it sets ANGELUS_DRY_RUN=1 (restored on close, with a weakref-finalizer backstop
+that restores it on GC / interpreter exit even if the caller forgets both
+``with`` and close()), so every channel send writes a line to ``dispatches.log``
+instead of shelling ``notify-pat`` / email. A scenario can never accidentally
+page a real phone. Triagers still run as real subprocesses -- faithful and fine
+offline.
 """
 
 from __future__ import annotations
 
 import os
+import weakref
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import TracebackType
@@ -43,6 +46,17 @@ from angelus.daemon import AngelusDaemon
 from angelus.pipes import DrainSummary
 
 _DRY_RUN_ENV = "ANGELUS_DRY_RUN"
+
+
+def _restore_env(key: str, prior: str | None) -> None:
+    """Restore an env var to a captured prior value -- None means it was
+    unset and is popped, otherwise it is put back verbatim. Module-level (not
+    a bound method) so a weakref finalizer can hold it without keeping the
+    SimHarness alive."""
+    if prior is None:
+        os.environ.pop(key, None)
+    else:
+        os.environ[key] = prior
 
 
 class SimHarness:
@@ -80,6 +94,20 @@ class SimHarness:
         # found it (important when many scenarios run in one pytest process).
         self._prior_dry_run = os.environ.get(_DRY_RUN_ENV)
         os.environ[_DRY_RUN_ENV] = "1"
+        # Backstop: register the restore as a weakref finalizer the instant
+        # after the env is mutated. A caller who constructs the harness without
+        # `with` and never calls close() would otherwise leak ANGELUS_DRY_RUN=1
+        # into the whole process (a latent footgun for the B27 consumer). The
+        # finalizer runs the restore when the harness is garbage-collected or at
+        # interpreter exit, so the leak is impossible regardless of how the
+        # caller manages the object. It captures only the prior value (str|None)
+        # via _restore_env, never self, so it does not keep the harness alive;
+        # weakref.finalize guarantees it runs at most once, so the explicit
+        # close() path and the GC path never double-restore. Registered before
+        # building the daemon so even a constructor failure restores the env.
+        self._restore_dry_run = weakref.finalize(
+            self, _restore_env, _DRY_RUN_ENV, self._prior_dry_run
+        )
         self.daemon = AngelusDaemon(self.root, clock=self.clock)
         self._closed = False
         self._startup_recovery()
@@ -112,10 +140,10 @@ class SimHarness:
             return
         self._closed = True
         self.daemon.connection.close()
-        if self._prior_dry_run is None:
-            os.environ.pop(_DRY_RUN_ENV, None)
-        else:
-            os.environ[_DRY_RUN_ENV] = self._prior_dry_run
+        # Run the finalizer explicitly for a deterministic restore now. It is
+        # idempotent (weakref.finalize fires at most once) and detaches itself
+        # after running, so the GC backstop won't restore a second time.
+        self._restore_dry_run()
 
     def __enter__(self) -> SimHarness:
         return self

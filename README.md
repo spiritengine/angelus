@@ -481,8 +481,12 @@ Two ways in:
 
   Step verbs: `set_time` (ISO instant), `advance` (`<int>` + `s`/`m`/`h`/`d`),
   `fire_source`, `inject` (`{source_ref, payload, meta}`), `run_triage`, `drain`.
-  Time comes only from the pinned clock, so the run is deterministic; sends are
-  forced to dry-run, so it is safe against a scratch copy of a lodging.
+  Every pipeline timestamp and since-last-drain window reads off the pinned
+  clock — including the `created_at` columns the digest's drain window compares
+  against `last_drain_at` — so even a multi-drain digest is deterministic.
+  (Triagers run as real subprocesses; any wall-clock time a triager stamps into
+  its own finding body text is the triager's, not the harness clock's.) Sends
+  are forced to dry-run, so it is safe against a scratch copy of a lodging.
 
 ## Storage
 

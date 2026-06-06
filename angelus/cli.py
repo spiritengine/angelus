@@ -626,7 +626,12 @@ def sim(script: Path, root: Path) -> None:
     from angelus.sim import SimHarness
 
     root = root.resolve()
-    document = yaml.safe_load(script.read_text(encoding="utf-8")) or {}
+    try:
+        document = yaml.safe_load(script.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as exc:
+        # A syntactically broken script is operator error, not a crash: turn the
+        # raw parser traceback into a clean, non-zero ClickException line.
+        raise click.ClickException(f"sim: invalid YAML: {exc}") from exc
     if not isinstance(document, dict) or "start" not in document:
         raise click.ClickException(
             "sim: script must be a mapping with a 'start' instant and 'steps'"

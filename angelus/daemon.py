@@ -1091,8 +1091,9 @@ class AngelusDaemon:
         # await in this method: queueing on the semaphore, queueing on
         # the per-triager lock, or inside _run_triager itself. In every
         # one of those cases mark_triage_processing has already written
-        # the row (it runs synchronously in _triage_loop's body just
-        # before this task is created), so we must clear it on the way
+        # the row (_discover_ready_triage marks every row synchronously while
+        # building the work list, before this method runs for any of them), so
+        # we must clear it on the way
         # out -- recover_writing_rows does not touch observation_triage
         # and ready_observations_for excludes 'processing' rows, so an
         # unrecovered row would orphan the observation across daemon
