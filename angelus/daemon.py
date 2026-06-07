@@ -863,15 +863,42 @@ class AngelusDaemon:
             loop.add_signal_handler(sig, self.request_stop)
 
     def _register_initial_jobs(self) -> None:
+        # Startup-only sources fire immediately so each populates its
+        # watch_state heartbeat within seconds of boot (see _add_source_job's
+        # `immediate`). On a fresh/wiped DB watch_state is empty until the first
+        # fire; belfry's wedge detector reads max(last_checked_at) and, if it
+        # ticks in that gap, restarts a daemon that is merely still coming up --
+        # the restart-loop incident this guards against. apply_lodging's
+        # hot-add path deliberately does NOT pass immediate=True: that is a
+        # steady-state cadence change, not a (re)start, so it keeps the normal
+        # start+interval first fire.
         for source in self.lodging.sources.values():
-            self._add_source_job(source)
+            self._add_source_job(source, immediate=True)
         for pipe in self.lodging.pipes.values():
             if pipe.cadence == "immediate":
                 continue
             self._add_pipe_job(pipe.name, pipe.cadence)
 
-    def _add_source_job(self, source: ScheduledSource) -> None:
+    def _add_source_job(
+        self, source: ScheduledSource, *, immediate: bool = False
+    ) -> None:
         trigger = _make_trigger(source.cadence)
+        # `immediate` (startup only) brings the FIRST fire forward to now via
+        # next_run_time -- the clean APScheduler idiom for "fire now, then keep
+        # the trigger's cadence". Without it IntervalTrigger defaults its first
+        # fire to now+interval (and a crontab to its next match), so a fresh DB
+        # has no watch_state heartbeat for a whole interval after boot. The
+        # immediate fire runs the same _fire_source body, so it is still bounded
+        # by self.scheduler_semaphore (the boot burst of ~25 sources cannot fan
+        # out unbounded) and honours the collapse semantics (first fire on a
+        # fresh DB has no prior row -> writes an observation). Steady-state
+        # cadence is the trigger's and is unchanged: after the first fire
+        # IntervalTrigger computes previous_fire + interval. The injected clock
+        # supplies "now" (production real Clock; the sim never starts the
+        # scheduler, so this never reads the wall clock there).
+        extra: dict[str, Any] = (
+            {"next_run_time": self.clock.now()} if immediate else {}
+        )
         self.scheduler.add_job(
             self._fire_source,
             trigger,
@@ -880,11 +907,13 @@ class AngelusDaemon:
             max_instances=1,
             coalesce=True,
             replace_existing=True,
+            **extra,
         )
         LOGGER.info(
-            "registered scheduled source %s on %s",
+            "registered scheduled source %s on %s%s",
             source.source_ref,
             source.cadence,
+            " (immediate first fire)" if immediate else "",
         )
 
     def _add_pipe_job(self, pipe_name: str, cadence: str) -> None:
