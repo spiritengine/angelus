@@ -292,6 +292,7 @@ class AngelusDaemon:
             self._reconcile_orphaned_internal_incidents()
             self._validate_channel_config()
             self._sync_pipe_sla()
+            self._sync_source_sla()
             self._register_initial_jobs()
             self.scheduler.start()
             scheduler_started = True
@@ -531,6 +532,65 @@ class AngelusDaemon:
                 ", ".join(
                     f"{name}={seconds}s" for name, seconds in sorted(slas.items())
                 ),
+            )
+
+    def _sync_source_sla(self) -> None:
+        """Persist each interval-cadence source's check SLA to sqlite so belfry
+        -- the out-of-band, pure-stdlib layer -- can read the contract and
+        assert each source is still being CHECKED on cadence (0014). The
+        input-side mirror of _sync_pipe_sla.
+
+        belfry's wedge check reads a GLOBAL max(last_checked_at); it only fires
+        when EVERY source goes stale, so one healthy source masks a single stale
+        one. This per-source SLA closes that gap: belfry pings DOWN (alert-only,
+        never a restart) when any one source's heartbeat lapses past its window.
+
+        The window is cadence + max(cadence, SOURCE_SLA_SLACK_FLOOR_SECONDS) --
+        2x cadence for normal cadences ("missed an entire extra cycle"), floored
+        so a sub-floor cadence (e.g. 30s) still gets cadence + floor of slack and
+        can't flap belfry on transient boot-burst scheduler jitter. The
+        last_checked_at heartbeat bumps on EVERY fire (observation collapse
+        always advances it), so a live source's heartbeat age is at most ~one
+        cadence plus tiny jitter; 2x never false-alarms a slow daily/4h/12h
+        source that fires a few minutes late.
+
+        Only interval-cadence sources are tracked. A crontab-cadence source has
+        no single interval to convert (_cadence_seconds raises on it); rather
+        than guess a max-gap from an arbitrary crontab it is left to the global
+        wedge backstop and named in a one-line warning so the gap is visible,
+        never silent. Deriving a conservative crontab max-gap bound is future
+        work.
+
+        depends_on is advisory today -- _fire_source does not actually block on
+        an unhealthy dep, so a dep-"blocked" source still fires and stays fresh
+        and will NOT false-alarm here. If dep-blocking is ever made real,
+        revisit: a truly blocked source would stop firing and this check would
+        correctly flag it.
+        """
+        slas: dict[str, int] = {}
+        skipped_crontab: list[str] = []
+        for ref, source in self.lodging.sources.items():
+            if _is_crontab_cadence(source.cadence):
+                skipped_crontab.append(ref)
+                continue
+            cadence_seconds = _cadence_seconds(source.cadence)
+            slas[ref] = cadence_seconds + max(
+                cadence_seconds, SOURCE_SLA_SLACK_FLOOR_SECONDS
+            )
+        self.catalog.sync_source_sla(slas)
+        if slas:
+            LOGGER.info(
+                "source check SLAs tracked: %s",
+                ", ".join(
+                    f"{ref}={seconds}s" for ref, seconds in sorted(slas.items())
+                ),
+            )
+        if skipped_crontab:
+            LOGGER.warning(
+                "source check SLA NOT tracked for crontab-cadence source(s) "
+                "-- covered only by the global wedge backstop, not per-source: "
+                "%s",
+                ", ".join(sorted(skipped_crontab)),
             )
 
     def request_stop(self) -> None:
@@ -987,6 +1047,13 @@ class AngelusDaemon:
         # belfry red. Synchronous, self-committing, no await before its commit
         # -- cancel-safe like the rest of the reload.
         self._sync_pipe_sla()
+        # Same for the per-source check SLA (0014): a hot source add/remove or
+        # cadence change must be reflected so belfry tracks the live source set
+        # -- a hot-added source becomes monitored, a hot-removed one's stale row
+        # is dropped, and a cadence change resizes its window. Synchronous,
+        # self-committing, no await before its commit -- cancel-safe like the
+        # rest of the reload.
+        self._sync_source_sla()
 
         old_sources = old.sources
         new_sources = new_lodging.sources
@@ -1656,6 +1723,25 @@ _CADENCE_UNITS = {
     "hr": 3600,
 }
 
+# Slack floor for the per-source check SLA (0014). The window is
+# cadence + max(cadence, this), i.e. 2x cadence except for sub-floor cadences,
+# which get cadence + this so a fast source can't flap belfry on boot-burst
+# scheduler jitter. See AngelusDaemon._sync_source_sla.
+SOURCE_SLA_SLACK_FLOOR_SECONDS = 300
+
+
+def _is_crontab_cadence(cadence: str) -> bool:
+    """True for a crontab cadence ('0 7 * * *'), False for an interval ('4h').
+
+    The single source of truth for the crontab/interval split, shared by
+    _make_trigger (which builds a CronTrigger vs IntervalTrigger) and
+    _sync_source_sla (which can convert only interval cadences to a seconds
+    window). Keeping one predicate guarantees a source is never classified one
+    way for scheduling and the other for SLA tracking. A crontab cadence is any
+    string containing whitespace between its fields.
+    """
+    return any(char.isspace() for char in cadence.strip())
+
 
 def _cadence_seconds(cadence: str) -> int:
     """Parse interval cadence strings like '15m', '30s', '2h'.
@@ -1718,7 +1804,7 @@ def _mute_duration_seconds(duration: str) -> int:
 
 def _make_trigger(cadence: str):
     """Build an APScheduler trigger from an interval or crontab cadence."""
-    if any(char.isspace() for char in cadence.strip()):
+    if _is_crontab_cadence(cadence):
         return CronTrigger.from_crontab(cadence)
     return IntervalTrigger(seconds=_cadence_seconds(cadence))
 

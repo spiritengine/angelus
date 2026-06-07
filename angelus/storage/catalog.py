@@ -652,6 +652,47 @@ class Catalog:
             self.connection.execute("DELETE FROM pipe_sla")
         self.connection.commit()
 
+    def sync_source_sla(self, slas: dict[str, int]) -> None:
+        """Reconcile the source_sla table to the sources that currently declare
+        a check SLA (0014). `slas` maps source_ref -> max_interval_seconds.
+
+        The input-side mirror of sync_pipe_sla: belfry reads this table
+        read-only to assert each source is still being CHECKED on cadence --
+        belfry cannot parse the sources/*.yaml, so the daemon (the single sqlite
+        writer) persists the contract here. Called at daemon startup and on hot
+        reload from the loaded lodging.
+
+        tracking_since is written ONCE per source and preserved by the upsert
+        (ON CONFLICT updates only max_interval_seconds), so it is never moved on
+        a later sync and stays the baseline for a never-checked source across
+        daemon restarts (a stall spanning restarts is still caught).
+        max_interval_seconds is updated so a changed cadence takes effect.
+        Sources no longer tracked (removed, or reclassified to a crontab cadence
+        this check does not cover) are deleted so a stale row can't keep belfry
+        red after the source is gone.
+        """
+        now = self._clock.now_iso()
+        for source_ref, seconds in slas.items():
+            self.connection.execute(
+                """
+                INSERT INTO source_sla
+                    (source_ref, max_interval_seconds, tracking_since)
+                VALUES (?, ?, ?)
+                ON CONFLICT (source_ref) DO UPDATE SET
+                    max_interval_seconds = excluded.max_interval_seconds
+                """,
+                (source_ref, seconds, now),
+            )
+        if slas:
+            placeholders = ",".join("?" for _ in slas)
+            self.connection.execute(
+                f"DELETE FROM source_sla WHERE source_ref NOT IN ({placeholders})",
+                tuple(slas),
+            )
+        else:
+            self.connection.execute("DELETE FROM source_sla")
+        self.connection.commit()
+
     def suppressed_findings_since(self, since: str | None) -> list[dict[str, Any]]:
         clause = "AND pq.created_at > ?" if since else ""
         params: tuple[Any, ...] = (since,) if since else ()
