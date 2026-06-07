@@ -132,11 +132,12 @@ def main(argv: list[str] | None = None) -> int:
     # untouched here).
     touch_sentinel(sentinel_path(state))
 
-    # Five checks, split by what they imply for autoremediation:
+    # The checks, split by what they imply for autoremediation:
     #
-    # ABSENCE reasons (daemon not running / not delivering):
+    # ABSENCE reasons (daemon not running / not firing anything):
     #   pid_failure  -- dead process: restart is the right tool.
-    #   wedge_failure -- alive but not firing sources: also absence.
+    #   wedge_failure -- alive but the GLOBAL heartbeat (max last_checked_at)
+    #       has stalled, i.e. not firing ANY source: also absence.
     #
     # OTHER reasons (daemon IS alive; restart is the wrong tool):
     #   failure_surface -- daemon self-reporting live errors: alerting only,
@@ -147,6 +148,12 @@ def main(argv: list[str] | None = None) -> int:
     #   stale_deployment -- alive but running code older than the latest
     #       commit: alerting only (a restart is a deliberate deploy action;
     #       auto-restarting could load half-merged code mid-edit).
+    #   sla_failure -- a pipe alive-but-not-delivering on its cadence (output
+    #       side): alerting only.
+    #   source_overdue_failure -- a SINGLE source alive-but-not-being-checked
+    #       on its cadence (input side): alerting only. The per-source precision
+    #       the GLOBAL wedge check above cannot give -- wedge fires only when
+    #       EVERY source stalls, so one fresh source masks any stale subset.
     #
     # A dead process short-circuits the live-daemon checks: with no daemon a
     # stale sqlite tells us nothing useful, and there is no live pid to
@@ -185,6 +192,20 @@ def main(argv: list[str] | None = None) -> int:
         sla_reason = sla_failure(state / "angelus.sqlite3")
         if sla_reason:
             other_reasons.append(sla_reason)
+        # Per-source check SLA: a single source alive-but-not-being-checked.
+        # Alert-only (OTHER), never restart -- one stale source is not a dead
+        # daemon, and the wedge check already owns the all-sources-stopped
+        # absence case; restarting on a single stale source is the wrong tool
+        # (it could auto-deploy half-merged code) per the autoremediation rule.
+        # This is the additive precision the global max(last_checked_at) wedge
+        # cannot give: it fires only when EVERY source goes stale. Pass the pid
+        # file so a young daemon still establishing its first heartbeats is not
+        # flagged (same startup grace wedge_failure applies).
+        source_overdue_reason = source_overdue_failure(
+            state / "angelus.sqlite3", state / "angelus.pid"
+        )
+        if source_overdue_reason:
+            other_reasons.append(source_overdue_reason)
 
     all_reasons = absence_reasons + other_reasons
     if all_reasons:
@@ -780,6 +801,112 @@ def sla_failure(db_path: Path, now: datetime | None = None) -> str | None:
     if overdue:
         return "; ".join(overdue)
     return None
+
+
+def source_overdue_failure(
+    db_path: Path, pid_file: Path | None = None, now: datetime | None = None
+) -> str | None:
+    """Assert each source with a tracked check SLA is still being CHECKED on
+    cadence -- the input-side mirror of sla_failure (the output side).
+
+    belfry's wedge check (wedge_failure) reads a GLOBAL max(last_checked_at):
+    it fires only when the daemon stops checking ALL sources, so one healthy
+    source masks any stale subset -- a single source whose APScheduler job
+    vanishes on a hot-reload edge goes silent while the others keep max() fresh
+    and belfry stays green. This closes that gap: the daemon persists each
+    interval-cadence source's window into source_sla (0014), and here belfry
+    reads it read-only alongside each source's watch_state.last_checked_at
+    heartbeat and pings DOWN if any single source is overdue.
+
+    Baseline for "overdue" is the source's last_checked_at if it has ever fired,
+    else tracking_since -- so a source that has never been checked gets a full
+    window of grace from registration rather than alerting the instant it is
+    registered, while a source that has fired is measured from its real last
+    check (even one older than tracking_since, the stricter choice). Same
+    first-non-null shape as sla_failure.
+
+    LEVEL-triggered: re-reports every tick until the source is checked again (no
+    watermark). This is wired as an OTHER/alert-only reason in main() -- a
+    single stale source is not a dead daemon, so a restart is the wrong tool
+    (it could auto-deploy); the wedge/pid checks remain the absence backstop.
+
+    Startup grace: a just-(re)started daemon fires each source once at boot, but
+    a belfry tick can land before those first fires populate watch_state. While
+    the process is young (within_startup_grace), suppress per-source overdue --
+    the same gate wedge_failure uses, passed the same pid_file.
+    within_startup_grace fails toward NOT suppressing when process age is
+    unknown, so a genuine overdue is never silently hidden; the
+    never-fired-but-OLD case is still caught after grace via tracking_since.
+
+    Fails OPEN: any sqlite/parse error -- including a pre-migration db with no
+    source_sla table -- returns None. An SLA read must never manufacture a false
+    DOWN; the pid/wedge checks remain the liveness backstop.
+    """
+    now = now or datetime.now(UTC)
+    quoted = urllib.parse.quote(str(db_path), safe="/:")
+    uri = f"file:{quoted}?mode=ro"
+    try:
+        connection = sqlite3.connect(uri, uri=True)
+    except sqlite3.Error as exc:
+        log_err(f"angelus belfry: source-sla cannot open {db_path}: {exc}")
+        return None
+    try:
+        try:
+            sla_rows = connection.execute(
+                "SELECT source_ref, max_interval_seconds, tracking_since "
+                "FROM source_sla"
+            ).fetchall()
+        except sqlite3.Error:
+            # No source_sla table yet (db predates the 0014 migration): nothing
+            # to assert. Fail open.
+            return None
+        if not sla_rows:
+            return None
+        last_checked = dict(
+            connection.execute(
+                "SELECT source_ref, last_checked_at FROM watch_state"
+            ).fetchall()
+        )
+    except sqlite3.Error as exc:
+        log_err(f"angelus belfry: source-sla query failed: {exc}")
+        return None
+    finally:
+        connection.close()
+
+    overdue: list[str] = []
+    for source_ref, max_seconds, tracking_since in sla_rows:
+        checked = last_checked.get(source_ref)
+        baseline = _parse_iso(checked or tracking_since)
+        if baseline is None:
+            continue  # unparseable timestamp -> fail open for this source
+        age_sec = (now - baseline).total_seconds()
+        if age_sec <= max_seconds:
+            continue
+        age_hr = age_sec / 3600.0
+        max_hr = max_seconds / 3600.0
+        if checked is None:
+            detail = f"never checked in {age_hr:.1f}h"
+        else:
+            detail = f"last checked {age_hr:.1f}h ago"
+        overdue.append(f"{source_ref} overdue: {detail} (max {max_hr:.1f}h)")
+    if not overdue:
+        return None
+
+    # A real overdue holds. Suppress it ONLY while the daemon process is young:
+    # a freshly-(re)started daemon is still establishing its first heartbeats
+    # and a belfry tick can land in that gap. Same grace gate wedge_failure
+    # uses; fails toward NOT suppressing when process age is unknown, so an
+    # old/genuine overdue is never hidden. pid_file is None only on call paths
+    # that opt out of the grace; it always reaches here with a live pid from
+    # main (pid_failure already confirmed the daemon is alive).
+    if pid_file is not None and within_startup_grace(pid_file):
+        log_out(
+            f"angelus belfry: source(s) overdue but within {startup_grace_sec()}s "
+            "startup grace; daemon still establishing heartbeats: "
+            + "; ".join(overdue)
+        )
+        return None
+    return "; ".join(overdue)
 
 
 def systemd_unit() -> str:
