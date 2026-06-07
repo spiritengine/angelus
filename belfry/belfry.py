@@ -28,6 +28,12 @@ DEFAULT_WEDGE_THRESHOLD_SEC = 600
 # incident). The grace is gated on PROCESS age: it applies only while the
 # daemon process itself is young, so a daemon up longer than this with the same
 # empty/stale heartbeat is still a genuine wedge and is reported as today.
+# SAFETY INVARIANT: keep this BELOW belfry's cron interval (belfry/crontab.example
+# runs every 300s). belfry cannot read the cron cadence to enforce it. As long as
+# grace < interval, at most ONE tick per restart is graced, so even if the daemon
+# never establishes its heartbeat the next tick wedges and the 3-restarts/30min cap
+# still escalates to a human. Set grace >= the interval and a fully-broken startup
+# could mask a real wedge on every tick indefinitely.
 DEFAULT_STARTUP_GRACE_SEC = 180
 DEFAULT_SENTINEL_FILENAME = "belfry-pinged-at"
 DEFAULT_FAILCHECK_FILENAME = "belfry-failcheck-at"
