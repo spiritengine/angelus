@@ -117,18 +117,19 @@ def _seed(
 
 def test_single_stale_source_pings_down_while_others_fresh(tmp_path) -> None:
     """THE discriminating test (the gap today): one source's last_checked_at is
-    stale past its window while every other source is fresh, so the global
-    max(last_checked_at) wedge check stays green -- but per-source detection
-    names the one stale source. Fails today (no per-source check) and fails if
-    the change is reverted."""
+    stale past its window while every other source is fresh enough to keep the
+    global max(last_checked_at) below the wedge threshold (600s) -- so the wedge
+    check stays green, but per-source detection still names the one stale source.
+    Fails today (no per-source check) and fails if the change is reverted."""
     belfry = _load_belfry()
     db = _seed(
         tmp_path,
         FakeClock(PINNED),
         sla={"scheduled/stale": 8 * 3600, "scheduled/fresh": 8 * 3600},
         checks={
-            # fresh checked 1h ago -> keeps the global max() fresh.
-            "scheduled/fresh": PINNED - timedelta(hours=1),
+            # fresh checked 2m ago -> global max() stays under the 600s wedge
+            # threshold, so the global wedge check stays green.
+            "scheduled/fresh": PINNED - timedelta(minutes=2),
             # stale last checked 10h ago, window 8h -> overdue.
             "scheduled/stale": PINNED - timedelta(hours=10),
         },
