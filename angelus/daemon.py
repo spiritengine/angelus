@@ -564,13 +564,16 @@ class AngelusDaemon:
         window (86400 + 86400). All cron reasoning lives daemon-side; belfry only
         ever reads the resulting max_interval_seconds.
 
-        FAIL-SAFE: if the max-gap computation fails for a crontab source (trigger
-        build error, no fire times, a zero/negative gap, etc.) that ONE source
-        falls back to the old skip-with-warning behavior -- left to the global
-        wedge backstop and named in a warning so the gap is visible, never
-        silent. _sync_source_sla never crashes on any cadence and never writes a
-        too-small bound that would false-alarm; a failed crontab is simply not
-        tracked per-source.
+        FAIL-SAFE (per source, symmetric across both cadence kinds): if bounding
+        a source's cadence fails -- a crontab whose max-gap can't be proven (no
+        fire times, a zero/negative gap, or the fire cap exhausted before a full
+        period is observed: a too-dense / DST-stalling cron), OR a malformed
+        interval cadence that won't parse -- that ONE source falls back to
+        skip-with-warning: left to the global wedge backstop and named in a
+        warning so the gap is visible, never silent. _sync_source_sla never
+        crashes on any cadence, never writes a too-small bound that would
+        false-alarm, and never loses coverage for the OTHER sources over one bad
+        one; a failed source is simply not tracked per-source.
 
         depends_on is advisory today -- _fire_source does not actually block on
         an unhealthy dep, so a dep-"blocked" source still fires and stays fresh
@@ -579,26 +582,36 @@ class AngelusDaemon:
         correctly flag it.
         """
         slas: dict[str, int] = {}
-        skipped_crontab: list[str] = []
+        skipped: list[str] = []
+        # Per-source robustness: BOTH cadence branches (crontab max-gap walk and
+        # interval parse) run under the same try, so a single bad source --
+        # whichever kind -- is skipped-with-warning and every OTHER source is
+        # still tracked. Without this, a malformed interval cadence ('banana')
+        # would raise straight out of the loop and abort the whole sync, dropping
+        # per-source SLA tracking for ALL sources over one bad source.
+        # (A truly malformed cadence will still crash the daemon later at
+        # _add_source_job/_make_trigger; that pre-existing load-time gap is out
+        # of scope here -- this only keeps _sync_source_sla itself from losing
+        # ALL coverage over one bad source.)
         for ref, source in self.lodging.sources.items():
-            if _is_crontab_cadence(source.cadence):
-                try:
+            try:
+                if _is_crontab_cadence(source.cadence):
                     cadence_seconds = _crontab_max_gap_seconds(source.cadence)
-                except Exception as exc:  # noqa: BLE001 -- fail safe, never crash
-                    # Could not bound this crontab. Fall back to the global wedge
-                    # backstop for this one source rather than crash the whole
-                    # sync or write a bad (possibly too-small) bound.
-                    LOGGER.warning(
-                        "source check SLA could not bound crontab cadence %r "
-                        "for %s (%s); leaving it to the global wedge backstop",
-                        source.cadence,
-                        ref,
-                        exc,
-                    )
-                    skipped_crontab.append(ref)
-                    continue
-            else:
-                cadence_seconds = _cadence_seconds(source.cadence)
+                else:
+                    cadence_seconds = _cadence_seconds(source.cadence)
+            except Exception as exc:  # noqa: BLE001 -- fail safe, never crash
+                # Could not bound this source. Fall back to the global wedge
+                # backstop for this one source rather than crash the whole sync
+                # or write a bad (possibly too-small) bound.
+                LOGGER.warning(
+                    "source check SLA could not bound cadence %r for %s (%s); "
+                    "leaving it to the global wedge backstop",
+                    source.cadence,
+                    ref,
+                    exc,
+                )
+                skipped.append(ref)
+                continue
             slas[ref] = cadence_seconds + max(
                 cadence_seconds, SOURCE_SLA_SLACK_FLOOR_SECONDS
             )
@@ -610,12 +623,12 @@ class AngelusDaemon:
                     f"{ref}={seconds}s" for ref, seconds in sorted(slas.items())
                 ),
             )
-        if skipped_crontab:
+        if skipped:
             LOGGER.warning(
-                "source check SLA NOT tracked for crontab-cadence source(s) "
-                "whose max-gap could not be bounded -- covered only by the "
-                "global wedge backstop, not per-source: %s",
-                ", ".join(sorted(skipped_crontab)),
+                "source check SLA NOT tracked for source(s) whose cadence could "
+                "not be bounded -- covered only by the global wedge backstop, "
+                "not per-source: %s",
+                ", ".join(sorted(skipped)),
             )
 
     def request_stop(self) -> None:
@@ -1772,14 +1785,34 @@ def _is_crontab_cadence(cadence: str) -> bool:
 # Bounds on the consecutive-fire walk in _crontab_max_gap_seconds. The walk
 # stops at whichever comes first: spanning more than _CRONTAB_GAP_SPAN_SECONDS
 # of fire time (so every gap shape of any 5-field cron -- whose pattern repeats
-# within a year -- is seen), or _CRONTAB_GAP_FIRE_CAP fires (a runaway guard for
-# sub-hourly crons). The span governs for the infrequent crons we actually run
-# (a daily cron settles in ~401 fires); the cap only bites for sub-hourly crons,
-# and is set high enough that even a once-a-minute cron spans well over a week
-# of fire time -- long enough to capture overnight and weekend gaps -- before it
-# trips. (A cron firing densely for longer than that span before one rarer, even
-# larger gap could in principle under-bound; no realistic watch cadence does,
-# and the slack added on top absorbs ordinary slop.)
+# within a year -- has been seen, and the max gap is PROVEN), or
+# _CRONTAB_GAP_FIRE_CAP fires (a backstop). The contract: a bound is returned
+# ONLY when the SPAN is reached. If the FIRE CAP trips first the walk has NOT
+# observed a full period, so the max gap is unproven and _crontab_max_gap_seconds
+# RAISES -- _sync_source_sla then fail-safe-skips that one source rather than
+# persist a possibly-too-small window. (Reverting that distinction reintroduces
+# the bug a dense month-restricted cron like '* * * 1 *' triggers: 12000 fires
+# all land inside January, the walk never leaves January, and it would otherwise
+# return a 60s max gap -> a 360s window -> a healthy source false-alarms 11
+# months a year.)
+#
+# Why a MODERATE cap and not a huge one (option b, not a): the scheduler builds
+# triggers in the LOCAL timezone (CronTrigger.from_crontab, no tz arg), and at
+# the autumn DST fall-back the consecutive-fire walk for any cron that fires
+# inside the ambiguous 01:00-01:59 hour OSCILLATES (01:59-04:00 -> 01:00-05:00
+# and back) instead of advancing -- so sub-hourly and 1am-touching crons can
+# NEVER reach the span no matter how high the cap is set (measured: '* * * * *'
+# and '*/15 * * * *' stall at ~305 days from the 2020-01-01 anchor even at
+# 700,000 fires). Raising the cap toward ~600k therefore cannot bound them; it
+# would only burn startup time (~20s for a stalled 1/min cron) before skipping
+# anyway. So the cap is sized as a pure backstop: comfortably above the densest
+# cadence that DOES make monotonic DST-safe progress to the span -- every-two-
+# hours '0 */2 * * *' reaches it in ~4,800 fires; production's daily crons in
+# ~401 -- while bounding a stalled/too-dense cron to ~0.5s of wasted walk.
+# Anything denser than the cap-over-span resolves (sub-hourly, or hourly/half-
+# hourly cadences that touch the fall-back hour) is INTENTIONALLY left untracked
+# per-source: it is fail-safe-skipped with a visible warning and covered by the
+# global wedge backstop -- the safe direction (never a too-small bound).
 _CRONTAB_GAP_SPAN_SECONDS = 400 * 86400
 _CRONTAB_GAP_FIRE_CAP = 12000
 
@@ -1809,9 +1842,13 @@ def _crontab_max_gap_seconds(cadence: str) -> int:
     never disagree. The walk is anchored at the fixed _CRONTAB_GAP_ANCHOR and
     bounded by _CRONTAB_GAP_SPAN_SECONDS / _CRONTAB_GAP_FIRE_CAP (see those).
 
-    Raises if the trigger yields no fire times or a non-positive max gap, so
-    _sync_source_sla can fail safe (skip-with-warning) rather than persist a
-    bad/too-small bound.
+    The max gap is only PROVEN once the walk has spanned a full period
+    (_CRONTAB_GAP_SPAN_SECONDS of fire time). Raises if the trigger yields no
+    fire times, a non-positive max gap, OR the fire cap is exhausted before the
+    span is reached (the period was never observed, so the max gap could be far
+    too small -- e.g. a dense month-restricted cron whose 12000 fires all land in
+    one month). In every raising case _sync_source_sla fails safe
+    (skip-with-warning) rather than persist a bad/too-small bound.
     """
     trigger = _make_trigger(cadence)
     prev = trigger.get_next_fire_time(None, _CRONTAB_GAP_ANCHOR)
@@ -1820,6 +1857,7 @@ def _crontab_max_gap_seconds(cadence: str) -> int:
     start = prev
     max_gap = 0.0
     fires = 0
+    spanned = False
     # `now` is nudged one microsecond past `prev` so get_next_fire_time returns
     # the STRICTLY next fire, not `prev` again.
     while fires < _CRONTAB_GAP_FIRE_CAP:
@@ -1832,7 +1870,21 @@ def _crontab_max_gap_seconds(cadence: str) -> int:
         prev = nxt
         fires += 1
         if (prev - start).total_seconds() > _CRONTAB_GAP_SPAN_SECONDS:
+            spanned = True
             break
+    # The bound is trustworthy ONLY if the walk reached the span: it has then
+    # seen at least one full ~400-day window, so the true max gap of any cron
+    # whose period fits the span has been observed. If instead the fire cap ran
+    # out first (a sub-hourly cron, or one that stalls at the DST fall-back) the
+    # period was NOT observed -- refuse to bound it rather than emit a window
+    # that could be far too small and false-alarm a healthy source.
+    if not spanned:
+        raise ValueError(
+            f"crontab cadence {cadence!r} did not complete a full period within "
+            f"{_CRONTAB_GAP_FIRE_CAP} fires (too dense, or it stalls at the DST "
+            f"fall-back); its max gap is unproven, so it is left to the global "
+            f"wedge backstop rather than bounded with a possibly-too-small window"
+        )
     if max_gap <= 0:
         raise ValueError(
             f"crontab cadence {cadence!r} yields no positive inter-fire gap"

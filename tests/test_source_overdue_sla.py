@@ -354,6 +354,141 @@ def test_daemon_unboundable_crontab_falls_back_to_skip(tmp_path, caplog) -> None
         daemon.connection.close()
 
 
+def test_daemon_dense_month_restricted_cron_skipped_not_underbounded(
+    tmp_path, caplog
+) -> None:
+    """FINDING 1 regression. A dense month-restricted cron ('* * * 1 *' -- every
+    minute, but only in January) hits the fire cap with all ~12000 fires still
+    inside January, so the walk NEVER observes the ~11-month Jan->Jan gap. The
+    old code returned that unproven 60s max gap -> a 360s window -> a healthy
+    source false-alarms most of the year. The fix: a cap-terminated walk has not
+    proven a full period, so the source is fail-safe-SKIPPED (no row, visible
+    warning) -- never a too-small bound. A sibling interval source is still
+    tracked. Fails if the span/cap distinction is reverted (the cron would get a
+    bogus 360s row)."""
+    import logging
+
+    from angelus.daemon import AngelusDaemon
+
+    _write_min_lodging(tmp_path)
+    (tmp_path / "sources" / "scheduled" / "interval.yaml").write_text(
+        "cadence: 4h\ncheck:\n  kind: shell\n  command: 'echo {}'\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "sources" / "scheduled" / "jan-only.yaml").write_text(
+        "cadence: '* * * 1 *'\ncheck:\n  kind: shell\n  command: 'echo {}'\n",
+        encoding="utf-8",
+    )
+
+    daemon = AngelusDaemon(tmp_path)
+    try:
+        with caplog.at_level(logging.WARNING, logger="angelus.daemon"):
+            daemon._sync_source_sla()
+        rows = _sla_rows(daemon.catalog)
+        # The dense month-restricted cron is NOT tracked, and crucially did NOT
+        # get the too-small 360s window the unproven 60s max gap would produce.
+        assert "scheduled/jan-only" not in rows
+        # The interval sibling IS still tracked.
+        assert "scheduled/interval" in rows
+        assert rows["scheduled/interval"][0] == 4 * 3600 + max(
+            4 * 3600, SOURCE_SLA_SLACK_FLOOR_SECONDS
+        )
+        # The skip is visible, not silent.
+        warnings = "\n".join(
+            r.message for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        assert "scheduled/jan-only" in warnings
+    finally:
+        daemon.connection.close()
+
+
+def test_daemon_subhourly_always_cron_fail_safe_skipped(tmp_path, caplog) -> None:
+    """Option (b) tradeoff, made explicit. A frequent always-cron ('*/15 * * * *')
+    cannot reach the 400-day span within the moderate fire cap (it stalls at the
+    DST fall-back, where the local-tz walk oscillates instead of advancing), so
+    its period is never proven. Rather than emit an unproven (possibly too-small)
+    window it is INTENTIONALLY fail-safe-skipped -- no row, visible warning,
+    covered by the global wedge backstop. This is the deliberate cost of a
+    moderate cap (option b): a higher cap could not rescue it either, since the
+    DST stall is independent of the cap. A sibling interval source is still
+    tracked. Fails if the span/cap distinction is reverted (it would get an
+    unproven row)."""
+    import logging
+
+    from angelus.daemon import AngelusDaemon
+
+    _write_min_lodging(tmp_path)
+    (tmp_path / "sources" / "scheduled" / "interval.yaml").write_text(
+        "cadence: 4h\ncheck:\n  kind: shell\n  command: 'echo {}'\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "sources" / "scheduled" / "frequent.yaml").write_text(
+        "cadence: '*/15 * * * *'\ncheck:\n  kind: shell\n  command: 'echo {}'\n",
+        encoding="utf-8",
+    )
+
+    daemon = AngelusDaemon(tmp_path)
+    try:
+        with caplog.at_level(logging.WARNING, logger="angelus.daemon"):
+            daemon._sync_source_sla()
+        rows = _sla_rows(daemon.catalog)
+        assert "scheduled/frequent" not in rows
+        assert "scheduled/interval" in rows
+        warnings = "\n".join(
+            r.message for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        assert "scheduled/frequent" in warnings
+    finally:
+        daemon.connection.close()
+
+
+def test_daemon_malformed_interval_skipped_others_still_tracked(
+    tmp_path, caplog
+) -> None:
+    """FINDING 2 regression. A malformed INTERVAL cadence ('banana' -- no unit
+    suffix) must skip just that one source with a warning, not abort the whole
+    sync. Before the fix the interval branch was not wrapped, so the parse error
+    propagated out of _sync_source_sla and NO source got a row -- one bad source
+    silently dropped per-source coverage for ALL of them. Here a daily cron and
+    a good interval source must both still be tracked alongside the skip. Fails
+    if the interval branch's try/except is reverted (no rows for anyone)."""
+    import logging
+
+    from angelus.daemon import AngelusDaemon
+
+    _write_min_lodging(tmp_path)
+    (tmp_path / "sources" / "scheduled" / "good-interval.yaml").write_text(
+        "cadence: 4h\ncheck:\n  kind: shell\n  command: 'echo {}'\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "sources" / "scheduled" / "good-cron.yaml").write_text(
+        "cadence: '0 3 * * *'\ncheck:\n  kind: shell\n  command: 'echo {}'\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "sources" / "scheduled" / "malformed.yaml").write_text(
+        "cadence: 'banana'\ncheck:\n  kind: shell\n  command: 'echo {}'\n",
+        encoding="utf-8",
+    )
+
+    daemon = AngelusDaemon(tmp_path, clock=FakeClock(PINNED))
+    try:
+        with caplog.at_level(logging.WARNING, logger="angelus.daemon"):
+            daemon._sync_source_sla()  # must not raise on the malformed cadence
+        rows = _sla_rows(daemon.catalog)
+        assert "scheduled/malformed" not in rows
+        # The other two sources -- one interval, one crontab -- are still tracked.
+        assert rows["scheduled/good-interval"][0] == 4 * 3600 + max(
+            4 * 3600, SOURCE_SLA_SLACK_FLOOR_SECONDS
+        )
+        assert rows["scheduled/good-cron"][0] == 172800
+        warnings = "\n".join(
+            r.message for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        assert "scheduled/malformed" in warnings
+    finally:
+        daemon.connection.close()
+
+
 def _daemon_with_source(tmp_path, clock, stem: str, cadence: str):
     """A daemon whose lodging holds one extra scheduled source with `cadence`,
     sharing `clock` so source_sla timestamps and recorded heartbeats agree."""
