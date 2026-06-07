@@ -291,11 +291,39 @@ def test_daemon_startup_syncs_source_sla_with_slack_policy(tmp_path) -> None:
         daemon.connection.close()
 
 
-def test_daemon_skips_crontab_source_without_crashing(tmp_path, caplog) -> None:
-    """A crontab-cadence source must not crash _sync_source_sla and must not be
-    silently dropped: it is skipped (left to the global wedge backstop) and
-    named in a WARNING so the gap is visible. The interval sibling is still
-    tracked."""
+def test_daemon_tracks_daily_crontab_via_max_gap(tmp_path) -> None:
+    """A crontab-cadence source is now TRACKED, not skipped: the daemon bounds
+    it by the MAX gap between consecutive fires of the same trigger the scheduler
+    uses, then applies the same 2x-with-floor slack the interval path uses. A
+    daily cron's max gap is 86400, so its window is 86400 + max(86400, floor) =
+    172800 -- the documented 2-day window. Fails if the crontab-coverage change
+    is reverted (the source would get no row at all)."""
+    from angelus.daemon import AngelusDaemon
+
+    _write_min_lodging(tmp_path)
+    (tmp_path / "sources" / "scheduled" / "daily-cron.yaml").write_text(
+        "cadence: '0 3 * * *'\ncheck:\n  kind: shell\n  command: 'echo {}'\n",
+        encoding="utf-8",
+    )
+
+    daemon = AngelusDaemon(tmp_path, clock=FakeClock(PINNED))
+    try:
+        daemon._sync_source_sla()
+        rows = _sla_rows(daemon.catalog)
+        assert "scheduled/daily-cron" in rows
+        expected = 86400 + max(86400, SOURCE_SLA_SLACK_FLOOR_SECONDS)
+        assert expected == 172800  # the documented 2-day window
+        assert rows["scheduled/daily-cron"][0] == expected
+    finally:
+        daemon.connection.close()
+
+
+def test_daemon_unboundable_crontab_falls_back_to_skip(tmp_path, caplog) -> None:
+    """FAIL-SAFE: a crontab that builds a trigger but can never fire ('0 0 30 2
+    *' -- Feb 30 does not exist) must NOT crash _sync_source_sla and must NOT
+    write a bogus bound. That one source falls back to the old
+    skip-with-warning (left to the global wedge backstop, named so the gap is
+    visible); the interval sibling is still tracked."""
     import logging
 
     from angelus.daemon import AngelusDaemon
@@ -305,23 +333,148 @@ def test_daemon_skips_crontab_source_without_crashing(tmp_path, caplog) -> None:
         "cadence: 4h\ncheck:\n  kind: shell\n  command: 'echo {}'\n",
         encoding="utf-8",
     )
-    (tmp_path / "sources" / "scheduled" / "daily-cron.yaml").write_text(
-        "cadence: '0 7 * * *'\ncheck:\n  kind: shell\n  command: 'echo {}'\n",
+    (tmp_path / "sources" / "scheduled" / "impossible.yaml").write_text(
+        "cadence: '0 0 30 2 *'\ncheck:\n  kind: shell\n  command: 'echo {}'\n",
         encoding="utf-8",
     )
 
     daemon = AngelusDaemon(tmp_path)
     try:
         with caplog.at_level(logging.WARNING, logger="angelus.daemon"):
-            daemon._sync_source_sla()  # must not raise on the crontab source
+            daemon._sync_source_sla()  # must not raise on the impossible cron
         rows = _sla_rows(daemon.catalog)
         assert set(rows) == {"scheduled/interval"}
-        assert "scheduled/daily-cron" not in rows
-        # The skip is visible, not silent: a warning names the crontab source.
+        assert "scheduled/impossible" not in rows
+        # The skip is visible, not silent: a warning names the source.
         warnings = "\n".join(
             r.message for r in caplog.records if r.levelno >= logging.WARNING
         )
-        assert "scheduled/daily-cron" in warnings
+        assert "scheduled/impossible" in warnings
+    finally:
+        daemon.connection.close()
+
+
+def _daemon_with_source(tmp_path, clock, stem: str, cadence: str):
+    """A daemon whose lodging holds one extra scheduled source with `cadence`,
+    sharing `clock` so source_sla timestamps and recorded heartbeats agree."""
+    from angelus.daemon import AngelusDaemon
+
+    _write_min_lodging(tmp_path)
+    (tmp_path / "sources" / "scheduled" / f"{stem}.yaml").write_text(
+        f"cadence: '{cadence}'\ncheck:\n  kind: shell\n  command: 'echo {{}}'\n",
+        encoding="utf-8",
+    )
+    return AngelusDaemon(tmp_path, clock=clock)
+
+
+def test_daily_crontab_stale_past_window_alarms(tmp_path) -> None:
+    """End-to-end: the daemon computes a daily cron's 2-day window, and belfry
+    alarms on it. A heartbeat 3 days stale (past the 2-day window) -> DOWN
+    naming the source; one inside the window -> no alarm. Mirrors the interval
+    discriminating test, but the window comes from the crontab max-gap walk, so
+    it fails if that coverage is reverted (no row -> belfry can't alarm)."""
+    belfry = _load_belfry()
+
+    # Stale: last checked 3 days ago, window is 2 days -> overdue.
+    clock = FakeClock(PINNED)
+    daemon = _daemon_with_source(tmp_path, clock, "daily", "0 3 * * *")
+    daemon._sync_source_sla()  # tracking_since = PINNED, window = 172800
+    clock.set(PINNED - timedelta(days=3))
+    daemon.catalog.record_watch_check("scheduled/daily", "200", "ok", None)
+    daemon.connection.close()
+    db = tmp_path / "state" / "angelus.sqlite3"
+
+    reason = belfry.source_overdue_failure(db, now=PINNED)
+    assert reason is not None
+    assert "scheduled/daily overdue" in reason
+
+    # Inside the window: last checked 1 day ago, window 2 days -> no alarm.
+    clock2 = FakeClock(PINNED)
+    daemon2 = _daemon_with_source(tmp_path / "ok", clock2, "daily", "0 3 * * *")
+    daemon2._sync_source_sla()
+    clock2.set(PINNED - timedelta(days=1))
+    daemon2.catalog.record_watch_check("scheduled/daily", "200", "ok", None)
+    daemon2.connection.close()
+    db2 = tmp_path / "ok" / "state" / "angelus.sqlite3"
+    assert belfry.source_overdue_failure(db2, now=PINNED) is None
+
+
+def test_weekday_crontab_weekend_gap_no_alarm(tmp_path) -> None:
+    """The key correctness test for the max-gap computation. A weekday-only cron
+    ('0 3 * * 1-5') legitimately goes 72h without firing over a weekend
+    (Fri 03:00 -> Mon 03:00). The window must be bounded by that MAX gap, not the
+    24h min daily gap:
+      max-gap policy -> window 259200 + 259200 = 518400 (a Fri->Mon gap is well
+                        inside it -> NO alarm, correct)
+      min-gap policy -> window  86400 +  86400 = 172800 (a 72h gap exceeds it ->
+                        false alarm every weekend, the bug this guards against)
+    A source last checked Friday 03:00 with 'now' Monday 02:00 (~71h, just before
+    Monday's fire) must NOT alarm. Asserting the exact 518400 window also fails
+    the test if crontab coverage is reverted (no row at all)."""
+    belfry = _load_belfry()
+
+    # Friday 2026-06-05 03:00 UTC, Monday 2026-06-08 02:00 UTC (~71h later).
+    last_check = datetime(2026, 6, 5, 3, 0, 0, tzinfo=UTC)
+    now = datetime(2026, 6, 8, 2, 0, 0, tzinfo=UTC)
+
+    clock = FakeClock(now)
+    daemon = _daemon_with_source(tmp_path, clock, "weekday", "0 3 * * 1-5")
+    daemon._sync_source_sla()
+    rows = _sla_rows(daemon.catalog)
+    # Bounded by the 72h weekend max-gap, not the 24h daily min-gap.
+    assert rows["scheduled/weekday"][0] == 259200 + max(
+        259200, SOURCE_SLA_SLACK_FLOOR_SECONDS
+    )
+    assert rows["scheduled/weekday"][0] == 518400
+    clock.set(last_check)
+    daemon.catalog.record_watch_check("scheduled/weekday", "200", "ok", None)
+    daemon.connection.close()
+    db = tmp_path / "state" / "angelus.sqlite3"
+
+    # ~71h since last check, inside the 6-day window -> no false weekend alarm.
+    assert belfry.source_overdue_failure(db, now=now) is None
+
+
+def test_production_shaped_set_all_sources_tracked(tmp_path) -> None:
+    """The whole production-shaped mix -- daily crons (ci-failing '30 3 * * *',
+    stale-pr '0 3 * * *') AND interval sources (4h, 5m) -- each gets a source_sla
+    row. No source is silently untracked: 12 of 22 live sources are daily crons,
+    and before this change every one of them had zero per-source coverage."""
+    from angelus.daemon import AngelusDaemon
+
+    _write_min_lodging(tmp_path)
+    layout = {
+        "ci-failing": "'30 3 * * *'",  # daily cron (ci-failing-on-main.yaml)
+        "stale-pr": "'0 3 * * *'",  # daily cron (stale-pr.yaml)
+        "web-archive": "4h",  # interval (web-archive.yaml)
+        "web-important": "5m",  # interval (web-important.yaml)
+    }
+    for stem, cadence in layout.items():
+        (tmp_path / "sources" / "scheduled" / f"{stem}.yaml").write_text(
+            f"cadence: {cadence}\ncheck:\n  kind: shell\n  command: 'echo {{}}'\n",
+            encoding="utf-8",
+        )
+
+    daemon = AngelusDaemon(tmp_path, clock=FakeClock(PINNED))
+    try:
+        daemon._sync_source_sla()
+        rows = _sla_rows(daemon.catalog)
+        assert {
+            "scheduled/ci-failing",
+            "scheduled/stale-pr",
+            "scheduled/web-archive",
+            "scheduled/web-important",
+        } <= set(rows)
+        # The daily crons are bounded by their 24h max-gap (2-day window)...
+        assert rows["scheduled/ci-failing"][0] == 172800
+        assert rows["scheduled/stale-pr"][0] == 172800
+        # ...the interval sources by their parsed cadence + 2x/floor slack.
+        assert rows["scheduled/web-archive"][0] == 4 * 3600 + max(
+            4 * 3600, SOURCE_SLA_SLACK_FLOOR_SECONDS
+        )
+        assert rows["scheduled/web-important"][0] == 300 + max(
+            300, SOURCE_SLA_SLACK_FLOOR_SECONDS
+        )
     finally:
         daemon.connection.close()
 

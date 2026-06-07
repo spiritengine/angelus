@@ -26,12 +26,18 @@
 -- 12h source that fires a few minutes late, tight enough to catch a stop within
 -- one extra period. See AngelusDaemon._sync_source_sla for the exact policy.
 --
--- Only interval-cadence sources are tracked here. A crontab-cadence source
--- (cadence string containing whitespace, e.g. '0 7 * * *') has no single
--- interval to convert; the daemon LOGs a warning naming each such source
--- (so the gap is visible, never silent) and leaves it to the global wedge
--- backstop rather than guessing a max-gap from an arbitrary crontab. Deriving a
--- conservative crontab max-gap bound is future work.
+-- Both interval- and crontab-cadence sources are tracked. An interval cadence
+-- ('4h') converts directly to seconds. A crontab cadence (a string with
+-- whitespace between its fields, e.g. '0 3 * * *') has no single interval, so
+-- the daemon walks consecutive fire times of the SAME trigger the scheduler
+-- uses and takes the MAX gap between adjacent fires as the cadence: a daily
+-- cron -> 86400 (a 2-day window after slack), a weekday-only cron -> 259200
+-- (the Fri->Mon weekend gap, captured so a weekday source does not false-alarm
+-- over a weekend). All cron reasoning lives daemon-side; belfry only reads the
+-- resulting max_interval_seconds and stays pure-stdlib. If a crontab's max-gap
+-- cannot be bounded for any reason the daemon fails safe -- that one source is
+-- skipped with a warning (visible, never silent) and left to the global wedge
+-- backstop rather than persisting a possibly too-small bound.
 --
 -- tracking_since is the baseline for a source that has NEVER fired: belfry
 -- measures overdue against last_checked_at, or tracking_since when the source

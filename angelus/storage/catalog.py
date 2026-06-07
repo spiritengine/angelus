@@ -667,9 +667,9 @@ class Catalog:
         a later sync and stays the baseline for a never-checked source across
         daemon restarts (a stall spanning restarts is still caught).
         max_interval_seconds is updated so a changed cadence takes effect.
-        Sources no longer tracked (removed, or reclassified to a crontab cadence
-        this check does not cover) are deleted so a stale row can't keep belfry
-        red after the source is gone.
+        Sources no longer tracked (removed, or a crontab source whose max-gap
+        could not be bounded and so fell back to the global wedge backstop) are
+        deleted so a stale row can't keep belfry red after the source is gone.
         """
         now = self._clock.now_iso()
         for source_ref, seconds in slas.items():
