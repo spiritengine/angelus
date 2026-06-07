@@ -18,6 +18,23 @@ from pathlib import Path
 
 
 DEFAULT_WEDGE_THRESHOLD_SEC = 600
+# Grace window during which a freshly-(re)started daemon is NOT declared wedged
+# for an empty/young watch_state heartbeat. A just-booted daemon fires each
+# source once at startup to establish its watch_state row, but a belfry cron
+# tick can land in the seconds BEFORE that first fire completes -- on a fresh
+# (migrated/wiped) DB watch_state then has zero rows, which wedge_failure reads
+# as "no rows". Without this grace belfry restarts the daemon ~2s before it
+# would have fired and never lets it establish the heartbeat (the restart-loop
+# incident). The grace is gated on PROCESS age: it applies only while the
+# daemon process itself is young, so a daemon up longer than this with the same
+# empty/stale heartbeat is still a genuine wedge and is reported as today.
+# SAFETY INVARIANT: keep this BELOW belfry's cron interval (belfry/crontab.example
+# runs every 300s). belfry cannot read the cron cadence to enforce it. As long as
+# grace < interval, at most ONE tick per restart is graced, so even if the daemon
+# never establishes its heartbeat the next tick wedges and the 3-restarts/30min cap
+# still escalates to a human. Set grace >= the interval and a fully-broken startup
+# could mask a real wedge on every tick indefinitely.
+DEFAULT_STARTUP_GRACE_SEC = 180
 DEFAULT_SENTINEL_FILENAME = "belfry-pinged-at"
 DEFAULT_FAILCHECK_FILENAME = "belfry-failcheck-at"
 DEFAULT_ENV_FILENAME = "angelus.env"
@@ -142,7 +159,10 @@ def main(argv: list[str] | None = None) -> int:
     else:
         absence_reasons = []
         other_reasons = []
-        wedge_reason = wedge_failure(state / "angelus.sqlite3")
+        # Pass the pid file so wedge_failure can apply the startup grace: a
+        # young daemon still establishing its first watch_state heartbeat is
+        # not wedged. pid_failure above already confirmed this pid is alive.
+        wedge_reason = wedge_failure(state / "angelus.sqlite3", state / "angelus.pid")
         if wedge_reason:
             absence_reasons.append(wedge_reason)
         failure_reason = failure_surface(
@@ -1014,22 +1034,68 @@ def pid_failure(pid_file: Path) -> str | None:
     return None
 
 
-def wedge_failure(db_path: Path) -> str | None:
+def wedge_failure(db_path: Path, pid_file: Path | None = None) -> str | None:
     threshold = wedge_threshold()
     try:
         fired_at = latest_fire(db_path)
     except sqlite3.Error as exc:
+        # A genuine read error is NOT a startup-heartbeat gap (the table exists
+        # by the time belfry runs), so it bypasses the startup grace below and
+        # reports as today.
         return f"wedged: cannot read watch_state from {db_path}: {exc}"
 
     if fired_at is None:
-        return "wedged: watch_state has no rows"
-    age = datetime.now(UTC) - fired_at
-    if age > threshold:
-        return (
+        wedged_reason = "wedged: watch_state has no rows"
+    else:
+        age = datetime.now(UTC) - fired_at
+        if age <= threshold:
+            return None
+        wedged_reason = (
             f"wedged: last source fire at {fired_at.isoformat()} "
             f"({int(age.total_seconds())}s ago)"
         )
-    return None
+
+    # A wedge condition holds (empty or stale heartbeat). Suppress it ONLY
+    # while the daemon process is young: a freshly-(re)started daemon fires
+    # each source once at boot to establish its watch_state heartbeat, and a
+    # belfry tick can land in the gap before that first fire lands. Restarting
+    # then is exactly the loop this guards against. within_startup_grace fails
+    # toward NOT suppressing whenever process age is unknown, so an old/genuine
+    # wedge is never silently hidden. pid_file is None only on call paths that
+    # opt out of the grace entirely (it always reaches here with a live pid
+    # from main, since pid_failure has already confirmed the daemon is alive).
+    if pid_file is not None and within_startup_grace(pid_file):
+        log_out(
+            f"angelus belfry: {wedged_reason} -- within {startup_grace_sec()}s "
+            f"startup grace; daemon still establishing heartbeat, not wedged"
+        )
+        return None
+    return wedged_reason
+
+
+def within_startup_grace(pid_file: Path, now: float | None = None) -> bool:
+    """True when the daemon process is younger than the startup grace window.
+
+    Reads the live pid from pid_file and its wall-clock start time from
+    process_start_epoch (the same /proc-derived value the stale-deploy check
+    uses). Fails toward NOT-in-grace -- returns False -- whenever the answer
+    cannot be established: a missing/invalid pid file, an unreadable /proc, or
+    a process_start_epoch that returns None. That is the safe direction: an
+    UNKNOWN process age must never suppress a wedge; only a provably-young
+    process may. A grace of 0 (env-disabled) likewise never suppresses.
+    """
+    grace = startup_grace_sec()
+    if grace <= 0:
+        return False
+    try:
+        pid = int(pid_file.read_text(encoding="utf-8").strip())
+    except (FileNotFoundError, ValueError):
+        return False
+    start_at = process_start_epoch(pid)
+    if start_at is None:
+        return False
+    now_epoch = time.time() if now is None else now
+    return (now_epoch - start_at) < grace
 
 
 def wedge_threshold() -> timedelta:
@@ -1045,6 +1111,28 @@ def wedge_threshold() -> timedelta:
         )
         seconds = DEFAULT_WEDGE_THRESHOLD_SEC
     return timedelta(seconds=max(1, seconds))
+
+
+def startup_grace_sec() -> int:
+    """Startup grace window in seconds (see DEFAULT_STARTUP_GRACE_SEC).
+
+    ANGELUS_BELFRY_STARTUP_GRACE_SEC overrides the default, following the same
+    env-override + invalid-falls-back-to-default convention as the other belfry
+    thresholds. Clamped at 0 (a negative value would otherwise invert the age
+    comparison); 0 disables the grace entirely.
+    """
+    raw = os.environ.get("ANGELUS_BELFRY_STARTUP_GRACE_SEC")
+    if raw is None:
+        return DEFAULT_STARTUP_GRACE_SEC
+    try:
+        seconds = int(raw)
+    except ValueError:
+        log_err(
+            "angelus belfry: invalid ANGELUS_BELFRY_STARTUP_GRACE_SEC; "
+            "using default"
+        )
+        return DEFAULT_STARTUP_GRACE_SEC
+    return max(0, seconds)
 
 
 def latest_fire(db_path: Path) -> datetime | None:

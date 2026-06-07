@@ -265,6 +265,10 @@ def test_wedge_path_hits_down_and_escalates(tmp_path, monkeypatch) -> None:
     (tmp_path / "state").mkdir()
     (tmp_path / "state" / "angelus.pid").write_text(str(os.getpid()), encoding="utf-8")
     _write_source_fire(tmp_path, datetime.now(UTC) - timedelta(minutes=30))
+    # Age the daemon past the startup grace so the wedge fires as this test
+    # intends (the live pytest pid would otherwise look freshly-started and the
+    # grace would suppress the wedge). The grace itself has dedicated coverage.
+    monkeypatch.setattr(belfry, "process_start_epoch", lambda _pid: 1_000.0)
     pings: list[str] = []
     calls: list[list[str]] = []
 
@@ -1626,6 +1630,9 @@ def test_restart_fires_on_wedge(tmp_path, monkeypatch) -> None:
     )
     _write_source_fire(tmp_path, datetime.now(UTC) - timedelta(minutes=30))
     monkeypatch.setattr(belfry, "systemd_main_pid", lambda: None)
+    # Age the daemon past the startup grace so the wedge (and its restart) fires
+    # -- the live pytest pid would otherwise look young and the grace suppress.
+    monkeypatch.setattr(belfry, "process_start_epoch", lambda _pid: 1_000.0)
 
     all_calls: list[list[str]] = []
 
@@ -2024,6 +2031,9 @@ def test_no_restart_on_wedge_and_drift(tmp_path, monkeypatch) -> None:
         str(os.getpid()), encoding="utf-8"
     )
     _write_source_fire(tmp_path, datetime.now(UTC) - timedelta(minutes=30))
+    # Age the daemon past the startup grace so the wedge fires -- the live
+    # pytest pid would otherwise look young and the grace suppress the wedge.
+    monkeypatch.setattr(belfry, "process_start_epoch", lambda _pid: 1_000.0)
     # Also drifted: live pid != systemd MainPID (other reason).
     monkeypatch.setattr(belfry, "systemd_main_pid", lambda: os.getpid() + 9999)
 
@@ -2138,4 +2148,260 @@ def test_failed_restart_counts_toward_guard(tmp_path, monkeypatch) -> None:
     )
     assert len(escalate_lines) == 1, (
         f"expected 1 escalate entry; got {escalate_lines}"
+    )
+
+
+# --- startup grace: a freshly-(re)started daemon is not wedge-killed --------
+#
+# Source-side change-detection upserts a per-source watch_state row on every
+# fire; a fresh/wiped DB has the table but ZERO rows until the daemon's first
+# fire. The daemon now fires each source once at startup (Fix A), but belfry's
+# cron tick can land in the gap before that first fire lands -> "no rows".
+# Restarting then is the production restart-loop incident. wedge_failure
+# suppresses the wedge ONLY while the daemon PROCESS is young; an old daemon
+# with the same empty/stale heartbeat is a genuine wedge and is still reported.
+# The young/old axis is driven by stubbing process_start_epoch (the /proc-derived
+# start time), mirroring the stale-deployment tests above.
+
+
+def _empty_watch_state(root: Path) -> None:
+    """Create the watch_state table with ZERO rows -- the fresh/wiped-DB shape
+    (migration creates the table; the daemon's first fire has not yet upserted a
+    row). Distinct from a MISSING table, which is wedge_failure's 'cannot read'
+    branch, not the empty-heartbeat case."""
+    state = root / "state"
+    state.mkdir(exist_ok=True)
+    connection = sqlite3.connect(state / "angelus.sqlite3")
+    try:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS watch_state (
+                source_ref TEXT PRIMARY KEY,
+                last_checked_at TEXT NOT NULL,
+                last_state TEXT,
+                last_outcome TEXT,
+                last_changed_at TEXT,
+                last_observation_id INTEGER,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_startup_grace_suppresses_wedge_for_young_daemon_empty_watch_state(
+    tmp_path, monkeypatch
+) -> None:
+    """The exact restart-loop scenario: a YOUNG daemon process with an EMPTY
+    watch_state (no rows yet) is NOT wedged -- it is still establishing its
+    heartbeat.
+
+    Discrimination: remove the grace (or its young-process gate) and
+    wedge_failure returns the 'no rows' reason, failing this assertion. It is
+    the inverse of the old-daemon test below: same empty heartbeat, opposite
+    verdict, decided solely by process age."""
+    belfry = _load_belfry()
+    _empty_watch_state(tmp_path)
+    pid_file = _write_pid(tmp_path, os.getpid())
+    monkeypatch.setattr(belfry, "process_start_epoch", lambda _pid: time.time())
+
+    assert (
+        belfry.wedge_failure(tmp_path / "state" / "angelus.sqlite3", pid_file)
+        is None
+    )
+
+
+def test_startup_grace_young_daemon_present_heartbeat_not_wedged(
+    tmp_path, monkeypatch
+) -> None:
+    """A young daemon whose first fire already landed (a fresh, present
+    heartbeat) is not wedged -- and the grace does not spuriously flip a healthy
+    young daemon to wedged. The fresh heartbeat clears the wedge on its own."""
+    belfry = _load_belfry()
+    _write_source_fire(tmp_path, datetime.now(UTC))
+    pid_file = _write_pid(tmp_path, os.getpid())
+    monkeypatch.setattr(belfry, "process_start_epoch", lambda _pid: time.time())
+
+    assert (
+        belfry.wedge_failure(tmp_path / "state" / "angelus.sqlite3", pid_file)
+        is None
+    )
+
+
+def test_old_daemon_empty_watch_state_still_wedged(tmp_path, monkeypatch) -> None:
+    """The real-wedge guard: a daemon up FAR longer than the grace with an empty
+    watch_state is genuinely wedged and MUST still be reported -- the grace must
+    not blind belfry to a real wedge.
+
+    Discrimination: over-broaden the grace to ignore process age (always
+    suppress) and wedge_failure returns None here, failing the assertion."""
+    belfry = _load_belfry()
+    _empty_watch_state(tmp_path)
+    pid_file = _write_pid(tmp_path, os.getpid())
+    monkeypatch.setattr(
+        belfry, "process_start_epoch", lambda _pid: time.time() - 10_000
+    )
+
+    reason = belfry.wedge_failure(
+        tmp_path / "state" / "angelus.sqlite3", pid_file
+    )
+    assert reason is not None
+    assert "no rows" in reason
+
+
+def test_old_daemon_stale_heartbeat_still_wedged(tmp_path, monkeypatch) -> None:
+    """An old daemon with a STALE (past-threshold) heartbeat is wedged too: the
+    grace only ever covers a young process, never an old one, regardless of why
+    the heartbeat is bad."""
+    belfry = _load_belfry()
+    _write_source_fire(tmp_path, datetime.now(UTC) - timedelta(minutes=30))
+    pid_file = _write_pid(tmp_path, os.getpid())
+    monkeypatch.setattr(
+        belfry, "process_start_epoch", lambda _pid: time.time() - 10_000
+    )
+
+    reason = belfry.wedge_failure(
+        tmp_path / "state" / "angelus.sqlite3", pid_file
+    )
+    assert reason is not None
+    assert "last source fire" in reason
+
+
+def test_startup_grace_unknown_process_age_falls_back_to_wedge(
+    tmp_path, monkeypatch
+) -> None:
+    """If belfry cannot determine the process start time (process_start_epoch
+    -> None: no /proc, unreadable), the grace must NOT suppress -- it falls back
+    to the existing wedge behavior. An unknown age is never treated as young.
+
+    Discrimination: a grace that suppressed on unknown age would return None
+    here. This is the 'fail toward existing behavior' contract."""
+    belfry = _load_belfry()
+    _empty_watch_state(tmp_path)
+    pid_file = _write_pid(tmp_path, os.getpid())
+    monkeypatch.setattr(belfry, "process_start_epoch", lambda _pid: None)
+
+    reason = belfry.wedge_failure(
+        tmp_path / "state" / "angelus.sqlite3", pid_file
+    )
+    assert reason is not None
+    assert "no rows" in reason
+
+
+def test_startup_grace_missing_pid_file_falls_back_to_wedge(tmp_path) -> None:
+    """No pid file -> within_startup_grace cannot read a pid -> no suppression.
+    (In main this path is unreachable because pid_failure owns the missing-pid
+    case, but wedge_failure must still fail safe on its own.)"""
+    belfry = _load_belfry()
+    _empty_watch_state(tmp_path)
+    reason = belfry.wedge_failure(
+        tmp_path / "state" / "angelus.sqlite3",
+        tmp_path / "state" / "angelus.pid",
+    )
+    assert reason is not None
+    assert "no rows" in reason
+
+
+def test_wedge_failure_without_pid_file_opts_out_of_grace(tmp_path) -> None:
+    """Called with no pid_file (the opt-out signature), wedge_failure reports the
+    wedge unconditionally -- the grace is consulted only when a pid file is
+    supplied."""
+    belfry = _load_belfry()
+    _empty_watch_state(tmp_path)
+    reason = belfry.wedge_failure(tmp_path / "state" / "angelus.sqlite3")
+    assert reason is not None
+    assert "no rows" in reason
+
+
+def test_startup_grace_env_override_honored(tmp_path, monkeypatch) -> None:
+    """ANGELUS_BELFRY_STARTUP_GRACE_SEC overrides the default window. With a
+    daemon 100s old -- inside the 180s default but OUTSIDE a 10s override -- the
+    override makes it old enough to be wedged. Mirrors the other threshold
+    overrides."""
+    belfry = _load_belfry()
+    _empty_watch_state(tmp_path)
+    pid_file = _write_pid(tmp_path, os.getpid())
+    monkeypatch.setattr(
+        belfry, "process_start_epoch", lambda _pid: time.time() - 100
+    )
+    monkeypatch.setenv("ANGELUS_BELFRY_STARTUP_GRACE_SEC", "10")
+
+    reason = belfry.wedge_failure(
+        tmp_path / "state" / "angelus.sqlite3", pid_file
+    )
+    assert reason is not None
+    assert "no rows" in reason
+
+
+def test_startup_grace_disabled_when_zero(tmp_path, monkeypatch) -> None:
+    """Grace 0 disables suppression entirely: even a brand-new daemon with an
+    empty watch_state is reported wedged."""
+    belfry = _load_belfry()
+    _empty_watch_state(tmp_path)
+    pid_file = _write_pid(tmp_path, os.getpid())
+    monkeypatch.setattr(belfry, "process_start_epoch", lambda _pid: time.time())
+    monkeypatch.setenv("ANGELUS_BELFRY_STARTUP_GRACE_SEC", "0")
+
+    reason = belfry.wedge_failure(
+        tmp_path / "state" / "angelus.sqlite3", pid_file
+    )
+    assert reason is not None
+
+
+def test_startup_grace_invalid_env_uses_default(tmp_path, monkeypatch, capsys) -> None:
+    """An unparseable ANGELUS_BELFRY_STARTUP_GRACE_SEC logs and falls back to the
+    default, like the other threshold env readers -- a typo must not crash the
+    tick or silently disable the grace."""
+    belfry = _load_belfry()
+    monkeypatch.setenv("ANGELUS_BELFRY_STARTUP_GRACE_SEC", "not-a-number")
+    assert belfry.startup_grace_sec() == belfry.DEFAULT_STARTUP_GRACE_SEC
+    assert "invalid ANGELUS_BELFRY_STARTUP_GRACE_SEC" in capsys.readouterr().err
+
+
+def test_startup_grace_end_to_end_no_restart_for_young_daemon(
+    tmp_path, monkeypatch
+) -> None:
+    """The full loop scenario through main(): a live YOUNG daemon with an empty
+    watch_state must NOT be restarted -- belfry pings SUCCESS. Without the grace
+    belfry saw 'no rows', declared wedged, and restarted the daemon ~2s before
+    its first fire (the incident).
+
+    Discrimination: remove the grace and belfry pings DOWN and calls systemctl
+    restart here -- both the ping assertion and the no-restart assertion flip."""
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    monkeypatch.setenv("ANGELUS_BELFRY_RECOVER_WAIT_SEC", "0")
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "angelus.pid").write_text(
+        str(os.getpid()), encoding="utf-8"
+    )
+    _empty_watch_state(tmp_path)
+    monkeypatch.setattr(belfry, "process_start_epoch", lambda _pid: time.time())
+    # Take the other axes off the table: no systemd drift, no stale-deploy.
+    monkeypatch.setattr(belfry, "systemd_main_pid", lambda: None)
+
+    pings: list[str] = []
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        belfry.urllib.request,
+        "urlopen",
+        lambda url, timeout: pings.append(url) or _Response(),
+    )
+    monkeypatch.setattr(
+        belfry.subprocess,
+        "run",
+        lambda args, check=False, **_: calls.append(list(args))
+        or subprocess.CompletedProcess(args, 0),
+    )
+
+    assert belfry.main([str(tmp_path)]) == 0
+    assert pings == ["https://hc.example/success"]
+    restart_calls = [
+        c for c in calls if c[:3] == ["systemctl", "--user", "restart"]
+    ]
+    assert restart_calls == [], (
+        f"a young daemon establishing its heartbeat must not be restarted; "
+        f"got {calls}"
     )
