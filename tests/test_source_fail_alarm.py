@@ -311,6 +311,203 @@ def test_hot_removed_source_clears_its_open_incident(tmp_path: Path) -> None:
         daemon.connection.close()
 
 
+def test_outcome_dropped_when_source_hot_removed_mid_fire(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The mid-flight hot-remove race (ztc2 fell finding): _fire_source
+    captures the source and then AWAITS its shell check, so apply_lodging can
+    remove the source while the check runs. apply_lodging pops the tally and
+    clears any incident at removal -- a late outcome landing after that must
+    be dropped, not recorded: a recorded check_failed would open an
+    internal/source incident with NO remaining recovery edge (the source
+    never fires again), keeping belfry red until restart reconciliation, and
+    the tally re-increment would leave residue that makes a re-added source
+    alarm early.
+
+    Reproduces the reviewer's interleaving exactly: threshold 1, a slow
+    failing check held open by a flag file, hot-remove + apply_lodging while
+    it runs, then release the check and let the fire finish. Asserts no
+    incident, no finding/clearance rows, no tally residue -- and that a
+    still-lodged sibling alarms normally, so the guard only drops unlodged
+    outcomes."""
+    monkeypatch.setenv("ANGELUS_SOURCE_FAIL_ALARM_AFTER", "1")
+    fixtures = _lodge(tmp_path, sources=("s", "keep"))
+    for fixture in fixtures.values():
+        _ok(fixture)
+    started = tmp_path / "fire-started"
+    release = tmp_path / "fire-release"
+    # Replace s's check with one that signals it is running, then blocks
+    # until released, then fails -- a deterministic slow failing command.
+    (tmp_path / "sources" / "scheduled" / "s.yaml").write_text(
+        "cadence: 1h\ncheck:\n  kind: shell\n"
+        f"  command: 'touch {started}; until [ -f {release} ]; "
+        "do sleep 0.05; done; exit 1'\n",
+        encoding="utf-8",
+    )
+    daemon = AngelusDaemon(tmp_path)
+    try:
+
+        async def scenario() -> tuple[int | None, str]:
+            fire = asyncio.create_task(daemon._fire_source("scheduled/s"))
+            # The marker proves the fire captured the source and is awaiting
+            # the check subprocess before we pull the source out from under it.
+            while not started.exists():
+                await asyncio.sleep(0.01)
+            (tmp_path / "sources" / "scheduled" / "s.yaml").unlink()
+            await daemon.apply_lodging(load_lodging(tmp_path))
+            release.touch()
+            result = await fire
+            assert result is not None
+            return result
+
+        _, outcome = asyncio.run(scenario())
+        assert outcome == "check_failed"
+
+        assert _open_alarm_incidents(daemon) == []
+        assert _alarm_findings(daemon) == []
+        assert "scheduled/s" not in daemon._source_fail_counts
+        all_internal = daemon.connection.execute(
+            "SELECT COUNT(*) AS n FROM findings WHERE source = 'internal/source'"
+        ).fetchone()["n"]
+        assert all_internal == 0, "dropped outcome must leave no rows at all"
+
+        # The guard drops ONLY unlodged outcomes: the surviving sibling still
+        # alarms on its own failure (threshold 1).
+        fixtures["keep"].unlink()
+        _, outcome = _fire(daemon, "keep")
+        assert outcome == "check_failed"
+        incidents = _open_alarm_incidents(daemon)
+        assert [i["entity"] for i in incidents] == ["scheduled/keep"]
+    finally:
+        daemon.connection.close()
+
+
+def test_outcome_dropped_when_source_removed_and_readded_mid_fire(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The remove-then-RE-ADD interleaving (fell-r1 finding): a membership
+    guard alone cannot catch a fire launched against a source that was
+    hot-removed and then re-added under the same ref while the check ran --
+    the ref IS lodged again when the stale outcome lands, so membership
+    passes, the stale check_failed opens an incident and seeds the re-added
+    source's tally with residue from a generation that no longer exists. The
+    outcome must be tied to the lodging GENERATION the fire was launched
+    against and dropped when removal has bumped it since.
+
+    Reproduces the reviewer's interleaving exactly: threshold 1, a slow
+    failing check held open by a flag file, hot-remove + apply_lodging, then
+    re-add the same ref + apply_lodging, then release the check. Asserts no
+    incident, no rows, and NO tally residue on the re-added source -- then
+    proves the re-added source's own (current-generation) fires still record
+    normally by failing it once and seeing the alarm open on schedule."""
+    monkeypatch.setenv("ANGELUS_SOURCE_FAIL_ALARM_AFTER", "1")
+    fixtures = _lodge(tmp_path)
+    _ok(fixtures["s"])
+    started = tmp_path / "fire-started"
+    release = tmp_path / "fire-release"
+    source_yaml = tmp_path / "sources" / "scheduled" / "s.yaml"
+    readded_yaml = source_yaml.read_text(encoding="utf-8")
+    source_yaml.write_text(
+        "cadence: 1h\ncheck:\n  kind: shell\n"
+        f"  command: 'touch {started}; until [ -f {release} ]; "
+        "do sleep 0.05; done; exit 1'\n",
+        encoding="utf-8",
+    )
+    daemon = AngelusDaemon(tmp_path)
+    try:
+
+        async def scenario() -> tuple[int | None, str]:
+            fire = asyncio.create_task(daemon._fire_source("scheduled/s"))
+            while not started.exists():
+                await asyncio.sleep(0.01)
+            # Remove, reload, RE-ADD the same ref, reload again -- all while
+            # the old generation's check is still running.
+            source_yaml.unlink()
+            await daemon.apply_lodging(load_lodging(tmp_path))
+            source_yaml.write_text(readded_yaml, encoding="utf-8")
+            await daemon.apply_lodging(load_lodging(tmp_path))
+            release.touch()
+            result = await fire
+            assert result is not None
+            return result
+
+        _, outcome = asyncio.run(scenario())
+        assert outcome == "check_failed"
+
+        # The stale outcome belongs to the removed generation: no incident,
+        # no rows, and -- the contamination the membership guard missed -- no
+        # tally residue on the freshly re-added source.
+        assert _open_alarm_incidents(daemon) == []
+        assert _alarm_findings(daemon) == []
+        assert "scheduled/s" not in daemon._source_fail_counts
+        all_internal = daemon.connection.execute(
+            "SELECT COUNT(*) AS n FROM findings WHERE source = 'internal/source'"
+        ).fetchone()["n"]
+        assert all_internal == 0, "dropped outcome must leave no rows at all"
+
+        # Control: the re-added source's OWN fires are current-generation and
+        # record normally -- one genuine failure (threshold 1) alarms.
+        fixtures["s"].unlink()
+        _, outcome = _fire(daemon)
+        assert outcome == "check_failed"
+        incidents = _open_alarm_incidents(daemon)
+        assert [i["entity"] for i in incidents] == ["scheduled/s"]
+        assert daemon._source_fail_counts.get("scheduled/s") == 1
+    finally:
+        daemon.connection.close()
+
+
+def test_outcome_recorded_when_reload_keeps_source_lodged_mid_fire(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Control for the generation guard's other edge: a hot-reload that KEEPS
+    the source lodged (here: an unrelated source added) swaps in a fresh
+    Source object mid-fire, but the in-flight outcome is still from the
+    current lodging generation and must record normally. This pins the guard
+    to removal -- an object-identity check would wrongly drop this outcome
+    and silently eat real consecutive failures across every reload."""
+    monkeypatch.setenv("ANGELUS_SOURCE_FAIL_ALARM_AFTER", "1")
+    fixtures = _lodge(tmp_path)
+    _ok(fixtures["s"])
+    started = tmp_path / "fire-started"
+    release = tmp_path / "fire-release"
+    (tmp_path / "sources" / "scheduled" / "s.yaml").write_text(
+        "cadence: 1h\ncheck:\n  kind: shell\n"
+        f"  command: 'touch {started}; until [ -f {release} ]; "
+        "do sleep 0.05; done; exit 1'\n",
+        encoding="utf-8",
+    )
+    daemon = AngelusDaemon(tmp_path)
+    try:
+
+        async def scenario() -> tuple[int | None, str]:
+            fire = asyncio.create_task(daemon._fire_source("scheduled/s"))
+            while not started.exists():
+                await asyncio.sleep(0.01)
+            # Reload with s still lodged: a new Lodging snapshot (and a new
+            # Source object for s), same generation.
+            (tmp_path / "sources" / "scheduled" / "other.yaml").write_text(
+                "cadence: 1h\ncheck:\n  kind: shell\n  command: 'true'\n",
+                encoding="utf-8",
+            )
+            await daemon.apply_lodging(load_lodging(tmp_path))
+            release.touch()
+            result = await fire
+            assert result is not None
+            return result
+
+        _, outcome = asyncio.run(scenario())
+        assert outcome == "check_failed"
+
+        # Still lodged, same generation: the failure counts and (threshold 1)
+        # alarms exactly as it would without the reload.
+        assert daemon._source_fail_counts.get("scheduled/s") == 1
+        incidents = _open_alarm_incidents(daemon)
+        assert [i["entity"] for i in incidents] == ["scheduled/s"]
+    finally:
+        daemon.connection.close()
+
+
 def test_startup_reconcile_clears_only_unlodged_source_incidents(
     tmp_path: Path,
 ) -> None:

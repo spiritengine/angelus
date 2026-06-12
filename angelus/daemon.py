@@ -304,6 +304,18 @@ class AngelusDaemon:
         # already-open incident stays open (and still clears off the first
         # successful fire, because the ok-path clearance is unconditional).
         self._source_fail_counts: dict[str, int] = {}
+        # Per-ref lodging generation for in-flight fire outcomes. Bumped by
+        # apply_lodging ONLY when it removes a source; _fire_source captures
+        # the value at launch and _note_source_fire_outcome drops the outcome
+        # on a mismatch. Membership alone cannot guard the remove-then-RE-ADD
+        # interleaving (the ref is lodged again when the stale outcome lands,
+        # so a stale check_failed would contaminate the new source's tally and
+        # open an incident for the dead generation). Keyed by ref and never
+        # pruned: entries exist only for refs that have actually been
+        # hot-removed, and the bumped value must survive a re-add to keep
+        # outliving fires droppable. In-memory like the tally -- a restart
+        # resets it together with the in-flight fires it describes.
+        self._source_lodge_generations: dict[str, int] = {}
         self._source_fail_alarm_after = _source_fail_alarm_after()
         self.stop_event = asyncio.Event()
         self.tasks: list[asyncio.Task[None]] = []
@@ -1442,6 +1454,14 @@ class AngelusDaemon:
             # removed-while-down equivalent is reconciled at startup by
             # _reconcile_orphaned_internal_incidents.
             self._source_fail_counts.pop(ref, None)
+            # Invalidate in-flight fires launched against the removed source:
+            # a later re-add of the same ref starts a NEW generation, and a
+            # stale outcome carrying the old value is dropped by
+            # _note_source_fire_outcome instead of seeding the new source's
+            # tally / opening an incident for the dead generation.
+            self._source_lodge_generations[ref] = (
+                self._source_lodge_generations.get(ref, 0) + 1
+            )
             self.catalog.write_internal_clearance(
                 "internal/source",
                 ref,
@@ -1547,6 +1567,11 @@ class AngelusDaemon:
         if source is None:
             LOGGER.info("scheduled source %s vanished before fire", source_ref)
             return None
+        # Captured with the source, before any await: which lodging generation
+        # this fire belongs to. _note_source_fire_outcome drops the outcome if
+        # a hot-remove has bumped it by the time the check finishes -- even if
+        # the same ref has been re-added since (membership cannot see that).
+        generation = self._source_lodge_generations.get(source_ref, 0)
         async with self.scheduler_semaphore:
             ok, payload = await run_shell_source(source)
             outcome = "ok" if ok else "check_failed"
@@ -1613,11 +1638,13 @@ class AngelusDaemon:
             # failure writes no observation (and the heartbeat above stays
             # green), so this is the only seam that can count consecutive
             # check_failed fires. See _note_source_fire_outcome.
-            self._note_source_fire_outcome(source.source_ref, outcome, payload)
+            self._note_source_fire_outcome(
+                source.source_ref, outcome, payload, generation
+            )
             return observation_id, outcome
 
     def _note_source_fire_outcome(
-        self, source_ref: str, outcome: str, payload: dict
+        self, source_ref: str, outcome: str, payload: dict, generation: int
     ) -> None:
         """Per-source persistent-failure alarm, evaluated on EVERY fire.
 
@@ -1652,7 +1679,49 @@ class AngelusDaemon:
 
         Domain-agnostic on purpose: nothing here names gh. ANY source whose
         check persistently fails gets the same alarm.
+
+        Outcomes from a STALE LODGING GENERATION are DROPPED. _fire_source
+        captures the source object (and the ref's lodging generation) and then
+        awaits its shell check, so a hot-reload can remove the source
+        mid-flight; apply_lodging pops the tally, clears any open incident,
+        and bumps the ref's generation when it drops a source. A late outcome
+        landing after that would undo the cleanup: a check_failed would open
+        an internal/source incident whose only recovery edge (the next fire)
+        no longer exists -- belfry red until restart reconciliation -- and the
+        tally re-increment would leave residue that makes a re-added source
+        alarm early. The guard is the generation, not current membership,
+        because membership cannot see a remove-then-RE-ADD interleaving: the
+        ref is lodged again by the time the stale outcome lands, but the fire
+        was launched against the dead generation and must not contaminate the
+        new one. The converse holds too -- a reload that merely swaps Lodging
+        snapshots while keeping the source lodged does NOT bump the
+        generation, so in-flight outcomes across an unrelated reload still
+        record (an object-identity check would wrongly drop them). No
+        interleaving hazard in the check: apply_lodging swaps self.lodging and
+        runs the pop+bump+clearance in one synchronous block (no await between
+        them), so a stale generation observed here proves that cleanup already
+        ran.
         """
+        if generation != self._source_lodge_generations.get(source_ref, 0):
+            LOGGER.info(
+                "source %s hot-removed mid-fire (lodging generation %s, "
+                "now %s); dropping %s outcome",
+                source_ref,
+                generation,
+                self._source_lodge_generations.get(source_ref, 0),
+                outcome,
+            )
+            return
+        # Backstop only: every lodging path that unlodges a source also bumps
+        # its generation, so this cannot trip unless that invariant breaks --
+        # in which case dropping is still the safe side (see above).
+        if source_ref not in self.lodging.sources:
+            LOGGER.info(
+                "source %s hot-removed mid-fire; dropping %s outcome",
+                source_ref,
+                outcome,
+            )
+            return
         known_pipes = set(self.lodging.pipes)
         if outcome == "check_failed":
             count = self._source_fail_counts.get(source_ref, 0) + 1
