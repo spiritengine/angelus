@@ -30,6 +30,8 @@ _BELFRY_ENV_VARS = [
     "ANGELUS_BELFRY_NEEDS_SRE_PATH",
     "ANGELUS_BELFRY_RESTART_PATH",
     "ANGELUS_BELFRY_FIXERS_LOG_PATH",
+    "ANGELUS_BELFRY_STARTUP_GRACE_SEC",
+    "ANGELUS_BELFRY_TICK_INTERVAL_SEC",
     "ANGELUS_SYSTEMD_UNIT",
 ]
 
@@ -2448,3 +2450,293 @@ def test_startup_grace_end_to_end_no_restart_for_young_daemon(
         f"a young daemon establishing its heartbeat must not be restarted; "
         f"got {calls}"
     )
+
+
+# --- grace < tick-interval safety invariant ----------------------------------
+#
+# The startup grace masks a wedge while the daemon process is young. That is
+# only safe while grace < belfry's own cron interval: at most one tick per
+# restart then lands inside the grace, so a fully-broken startup still wedges
+# on the NEXT tick and the restart cap escalates. belfry cannot read the
+# crontab, so its cadence is the explicit ANGELUS_BELFRY_TICK_INTERVAL_SEC
+# knob (default 300, matching crontab.example). Enforcement is two-sided:
+# grace_invariant_failure() is the loud per-tick config-invariant DOWN reason,
+# and startup_grace_sec() silently clamps the effective grace to interval-1
+# (fail safe: a possible early restart beats an indefinitely-masked wedge).
+
+
+def test_tick_interval_default_and_env_override(monkeypatch) -> None:
+    belfry = _load_belfry()
+    assert belfry.tick_interval_sec() == belfry.DEFAULT_TICK_INTERVAL_SEC == 300
+    monkeypatch.setenv("ANGELUS_BELFRY_TICK_INTERVAL_SEC", "600")
+    assert belfry.tick_interval_sec() == 600
+
+
+def test_tick_interval_invalid_env_uses_default(monkeypatch, capsys) -> None:
+    belfry = _load_belfry()
+    monkeypatch.setenv("ANGELUS_BELFRY_TICK_INTERVAL_SEC", "five-minutes")
+    assert belfry.tick_interval_sec() == belfry.DEFAULT_TICK_INTERVAL_SEC
+    assert "invalid ANGELUS_BELFRY_TICK_INTERVAL_SEC" in capsys.readouterr().err
+
+
+def test_tick_interval_floored_at_one(monkeypatch) -> None:
+    """An interval of 0 (or negative) would make the invariant unsatisfiable
+    for ANY grace; floor it at 1, where the clamp degrades the grace to 0
+    (disabled) -- the safe direction."""
+    belfry = _load_belfry()
+    monkeypatch.setenv("ANGELUS_BELFRY_TICK_INTERVAL_SEC", "0")
+    assert belfry.tick_interval_sec() == 1
+    monkeypatch.setenv("ANGELUS_BELFRY_STARTUP_GRACE_SEC", "180")
+    assert belfry.startup_grace_sec() == 0
+
+
+def test_grace_invariant_holds_with_defaults() -> None:
+    """Defaults (grace 180, interval 300) satisfy the invariant: no reason, no
+    clamp. Guards against the check itself manufacturing a false DOWN on a
+    stock deployment."""
+    belfry = _load_belfry()
+    assert belfry.grace_invariant_failure() is None
+    assert belfry.startup_grace_sec() == belfry.DEFAULT_STARTUP_GRACE_SEC
+
+
+def test_grace_invariant_violation_reason_and_clamp(monkeypatch) -> None:
+    """Grace raised past the interval -> loud config-invariant reason naming
+    both values, and the effective grace clamps to interval-1."""
+    belfry = _load_belfry()
+    monkeypatch.setenv("ANGELUS_BELFRY_STARTUP_GRACE_SEC", "400")
+    reason = belfry.grace_invariant_failure()
+    assert reason is not None
+    assert reason.startswith("config-invariant:")
+    assert "400s" in reason and "300s" in reason
+    assert belfry.startup_grace_sec() == 299
+
+
+def test_grace_equal_to_interval_violates(monkeypatch) -> None:
+    """grace == interval is already unsafe (every tick of a broken startup can
+    land inside the grace), so the check is >=, not >."""
+    belfry = _load_belfry()
+    monkeypatch.setenv("ANGELUS_BELFRY_STARTUP_GRACE_SEC", "300")
+    assert belfry.grace_invariant_failure() is not None
+    assert belfry.startup_grace_sec() == 299
+
+
+def test_grace_invariant_violated_by_slowed_interval(monkeypatch) -> None:
+    """The other operator path to a violation: the DEFAULT grace (180) with a
+    crontab slowed below it (interval 120). Same reason, same clamp."""
+    belfry = _load_belfry()
+    monkeypatch.setenv("ANGELUS_BELFRY_TICK_INTERVAL_SEC", "120")
+    reason = belfry.grace_invariant_failure()
+    assert reason is not None
+    assert "180s" in reason and "120s" in reason
+    assert belfry.startup_grace_sec() == 119
+
+
+def test_clamped_grace_unmasks_wedge(tmp_path, monkeypatch) -> None:
+    """The fail-safe direction made concrete: a daemon 350s old with an empty
+    watch_state, under a misconfigured grace of 400. The RAW grace would
+    suppress this wedge (350 < 400); the clamp (299) does not.
+
+    Discrimination: honor the raw grace instead of the clamped one and
+    wedge_failure returns None here."""
+    belfry = _load_belfry()
+    _empty_watch_state(tmp_path)
+    pid_file = _write_pid(tmp_path, os.getpid())
+    monkeypatch.setenv("ANGELUS_BELFRY_STARTUP_GRACE_SEC", "400")
+    monkeypatch.setattr(
+        belfry, "process_start_epoch", lambda _pid: time.time() - 350
+    )
+
+    reason = belfry.wedge_failure(
+        tmp_path / "state" / "angelus.sqlite3", pid_file
+    )
+    assert reason is not None
+    assert "no rows" in reason
+
+
+def test_clamped_grace_still_covers_young_daemon(tmp_path, monkeypatch) -> None:
+    """The clamp must not destroy the grace itself: under the same
+    misconfiguration, a genuinely-young daemon (30s) is still graced -- the
+    restart-loop protection survives the invariant enforcement."""
+    belfry = _load_belfry()
+    _empty_watch_state(tmp_path)
+    pid_file = _write_pid(tmp_path, os.getpid())
+    monkeypatch.setenv("ANGELUS_BELFRY_STARTUP_GRACE_SEC", "400")
+    monkeypatch.setattr(
+        belfry, "process_start_epoch", lambda _pid: time.time() - 30
+    )
+
+    assert (
+        belfry.wedge_failure(tmp_path / "state" / "angelus.sqlite3", pid_file)
+        is None
+    )
+
+
+def test_grace_invariant_main_pings_down_alert_only(tmp_path, monkeypatch, capsys) -> None:
+    """End-to-end through main(): a HEALTHY young daemon under a violated
+    invariant pings DOWN with the config-invariant reason but is NOT restarted
+    -- the misconfiguration is a belfry problem, not daemon absence, so it
+    rides the alert-only (OTHER) path. LEVEL-triggered: a second tick fires it
+    again."""
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    monkeypatch.setenv("ANGELUS_BELFRY_RECOVER_WAIT_SEC", "0")
+    monkeypatch.setenv("ANGELUS_BELFRY_STARTUP_GRACE_SEC", "400")
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "angelus.pid").write_text(
+        str(os.getpid()), encoding="utf-8"
+    )
+    _empty_watch_state(tmp_path)
+    monkeypatch.setattr(belfry, "process_start_epoch", lambda _pid: time.time())
+    monkeypatch.setattr(belfry, "systemd_main_pid", lambda: None)
+
+    pings: list[str] = []
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        belfry.urllib.request,
+        "urlopen",
+        lambda url, timeout: pings.append(url) or _Response(),
+    )
+    monkeypatch.setattr(
+        belfry.subprocess,
+        "run",
+        lambda args, check=False, **_: calls.append(list(args))
+        or subprocess.CompletedProcess(args, 0),
+    )
+
+    assert belfry.main([str(tmp_path)]) == 1
+    assert pings == ["https://hc.example/down"]
+    assert "config-invariant" in capsys.readouterr().err
+    restart_calls = [
+        c for c in calls if c[:3] == ["systemctl", "--user", "restart"]
+    ]
+    assert restart_calls == [], (
+        f"a config-invariant violation is alert-only, never a restart; "
+        f"got {calls}"
+    )
+
+    # LEVEL-triggered: still red on the next tick until the config is fixed.
+    assert belfry.main([str(tmp_path)]) == 1
+    assert pings == ["https://hc.example/down"] * 2
+    assert "config-invariant" in capsys.readouterr().err
+
+
+def test_grace_invariant_fires_even_when_daemon_dead(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """The invariant is about belfry's own config, so it must reach the DOWN
+    reason even on the dead-daemon short-circuit path that skips every
+    grace-dependent check."""
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    monkeypatch.setenv("ANGELUS_BELFRY_RECOVER_WAIT_SEC", "0")
+    monkeypatch.setenv("ANGELUS_BELFRY_STARTUP_GRACE_SEC", "400")
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "angelus.pid").write_text("999999", encoding="utf-8")
+
+    pings: list[str] = []
+    monkeypatch.setattr(
+        belfry.urllib.request,
+        "urlopen",
+        lambda url, timeout: pings.append(url) or _Response(),
+    )
+    monkeypatch.setattr(
+        belfry.subprocess,
+        "run",
+        lambda args, check=False, **_: subprocess.CompletedProcess(args, 0),
+    )
+
+    assert belfry.main([str(tmp_path)]) == 1
+    assert pings == ["https://hc.example/down"]
+    err = capsys.readouterr().err
+    assert "dead:" in err
+    assert "config-invariant" in err
+
+
+# --- crash-loop within grace: the path the invariant comment reasons about ---
+#
+# A daemon whose startup is fully broken (never writes watch_state) under a
+# correctly-configured belfry (grace 180 < interval 300). The grace covers AT
+# MOST the first tick after each (re)start; every subsequent tick lands a full
+# interval after the restart, so process age (300) exceeds the grace (180),
+# the wedge reports, belfry restarts, and after max-restarts the loop guard
+# escalates to the SRE tier instead of restarting forever. This timeline was
+# previously only reasoned about in the DEFAULT_STARTUP_GRACE_SEC comment;
+# here it is executable. Simulated by driving time.time() as a fake clock and
+# resetting the stubbed process_start_epoch whenever the systemctl-restart
+# mock fires (a restart births a new young process).
+
+
+def test_crash_loop_within_grace_escalates(tmp_path, monkeypatch, capsys) -> None:
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    monkeypatch.setenv("ANGELUS_BELFRY_RECOVER_WAIT_SEC", "0")
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "angelus.pid").write_text(
+        str(os.getpid()), encoding="utf-8"
+    )
+    _empty_watch_state(tmp_path)  # broken startup: heartbeat never lands
+    monkeypatch.setattr(belfry, "systemd_main_pid", lambda: None)
+
+    t0 = 1_000_000.0
+    clock = {"now": t0}
+    # The daemon was (re)started 30s before belfry's first tick -- inside the
+    # 180s grace.
+    daemon = {"started_at": t0 - 30.0}
+    monkeypatch.setattr(belfry.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(
+        belfry, "process_start_epoch", lambda _pid: daemon["started_at"]
+    )
+
+    pings: list[str] = []
+    restart_calls: list[float] = []
+
+    def fake_run(args, check=False, **_):
+        args = list(args)
+        if args[:3] == ["systemctl", "--user", "restart"]:
+            # A restart births a new daemon process: its age resets to 0 at
+            # the moment of the restart. The new process is just as broken
+            # (still never writes watch_state).
+            restart_calls.append(clock["now"])
+            daemon["started_at"] = clock["now"]
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(
+        belfry.urllib.request,
+        "urlopen",
+        lambda url, timeout: pings.append(url) or _Response(),
+    )
+    monkeypatch.setattr(belfry.subprocess, "run", fake_run)
+
+    interval = belfry.tick_interval_sec()
+    assert belfry.startup_grace_sec() < interval  # the invariant under test
+
+    results: list[int] = []
+    errs: list[str] = []
+    for _tick in range(5):
+        results.append(belfry.main([str(tmp_path)]))
+        errs.append(capsys.readouterr().err)
+        clock["now"] += interval
+
+    # Tick 1: daemon 30s old -> graced, the ONLY green tick. Ticks 2-4: age is
+    # a full interval (>= grace) -> wedged -> one loop-guarded restart each.
+    # Tick 5: 3 restarts already in the 30min window -> escalate, no restart.
+    assert results == [0, 1, 1, 1, 1]
+    assert pings[0] == "https://hc.example/success"
+    assert pings[1:] == ["https://hc.example/down"] * 4, (
+        "at most ONE tick per restart may be graced; every later tick must "
+        "report the wedge"
+    )
+    assert restart_calls == [t0 + interval, t0 + 2 * interval, t0 + 3 * interval]
+    for err in errs[1:4]:
+        assert "wedged" in err
+    assert "crash-loop" in errs[4]
+    assert "needs-sre" in errs[4]
+
+    # The escalation artifacts: needs-sre sentinel for the out-of-band SRE
+    # runner, and an audit trail of 3 restarts + 1 escalate in fixers.log.
+    needs_sre = tmp_path / "state" / "belfry-needs-sre"
+    assert needs_sre.exists()
+    assert "crash-loop" in needs_sre.read_text(encoding="utf-8")
+    fixers = (tmp_path / "state" / "fixers.log").read_text(encoding="utf-8")
+    assert fixers.count("action=restart") == 3
+    assert fixers.count("action=escalate") == 1

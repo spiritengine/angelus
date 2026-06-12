@@ -55,6 +55,16 @@
 # systemctl is unavailable the check fails open (no false DOWN).
 # ANGELUS_SYSTEMD_UNIT=angelus
 #
+# If you change the */5 cadence below, also set
+# ANGELUS_BELFRY_TICK_INTERVAL_SEC in state/angelus.env to match (seconds;
+# default 300). belfry cannot read this crontab, so that knob is how it knows
+# its own cadence -- it checks the startup grace
+# (ANGELUS_BELFRY_STARTUP_GRACE_SEC, default 180) stays BELOW the interval
+# every tick. A grace >= interval would let a fully-broken startup hide
+# inside the grace on every tick, masking a real wedge forever; on violation
+# belfry pings DOWN with a config-invariant reason and clamps the grace to
+# interval-1 until the config is fixed.
+#
 # Every line belfry writes to state/belfry.log is prefixed with an ISO8601
 # UTC timestamp (e.g. 2026-05-29T14:03:00Z), so the log below can be placed
 # on an incident timeline.

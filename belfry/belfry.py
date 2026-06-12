@@ -29,12 +29,28 @@ DEFAULT_WEDGE_THRESHOLD_SEC = 600
 # daemon process itself is young, so a daemon up longer than this with the same
 # empty/stale heartbeat is still a genuine wedge and is reported as today.
 # SAFETY INVARIANT: keep this BELOW belfry's cron interval (belfry/crontab.example
-# runs every 300s). belfry cannot read the cron cadence to enforce it. As long as
-# grace < interval, at most ONE tick per restart is graced, so even if the daemon
-# never establishes its heartbeat the next tick wedges and the 3-restarts/30min cap
-# still escalates to a human. Set grace >= the interval and a fully-broken startup
-# could mask a real wedge on every tick indefinitely.
+# runs every 300s). As long as grace < interval, at most ONE tick per restart is
+# graced, so even if the daemon never establishes its heartbeat the next tick
+# wedges and the 3-restarts/30min cap still escalates to a human. Set grace >=
+# the interval and a fully-broken startup could mask a real wedge on every tick
+# indefinitely. belfry cannot read the crontab itself, so the interval it checks
+# against is ANGELUS_BELFRY_TICK_INTERVAL_SEC (default below, matching
+# crontab.example); grace_invariant_failure() checks grace < interval every tick
+# and startup_grace_sec() clamps the grace to interval-1 on violation -- see both
+# for the loud-alert + fail-safe behavior.
 DEFAULT_STARTUP_GRACE_SEC = 180
+# belfry's own cron cadence in seconds, as configured (NOT measured). Must match
+# the cron line in belfry/crontab.example; ANGELUS_BELFRY_TICK_INTERVAL_SEC
+# overrides for deployments that edit the crontab. An explicit knob was chosen
+# over deriving the cadence empirically from successive sentinel mtimes: the
+# sentinel approach self-tunes but a manual/extra belfry run between cron ticks
+# compresses the observed interval to seconds, which would falsely clamp the
+# startup grace to ~0 and restart a daemon mid-boot -- the exact restart-loop
+# incident the grace exists to prevent. The cost is that this value can drift
+# from the cron line; the invariant check treats it as the source of truth, so
+# an operator slowing the crontab must update this knob too (documented in
+# crontab.example).
+DEFAULT_TICK_INTERVAL_SEC = 300
 DEFAULT_SENTINEL_FILENAME = "belfry-pinged-at"
 DEFAULT_FAILCHECK_FILENAME = "belfry-failcheck-at"
 DEFAULT_ENV_FILENAME = "angelus.env"
@@ -167,13 +183,21 @@ def main(argv: list[str] | None = None) -> int:
     # stale sqlite tells us nothing useful, and there is no live pid to
     # compare against systemd.  Otherwise gather every reason so a single
     # DOWN ping names all of them.
+    # Belfry's own config sanity, checked before anything grace-dependent runs:
+    # a startup grace >= belfry's tick interval would grace EVERY tick of a
+    # broken startup and mask a real wedge indefinitely. startup_grace_sec()
+    # already clamps the effective grace (fail safe); this is the loud half --
+    # an alert-only OTHER reason carried down the normal DOWN path, fired on
+    # every tick (dead daemon or not) until the operator fixes the config.
+    invariant_reason = grace_invariant_failure()
+
     dead_reason = pid_failure(state / "angelus.pid")
     if dead_reason:
         absence_reasons: list[str] = [dead_reason]
-        other_reasons: list[str] = []
+        other_reasons: list[str] = [invariant_reason] if invariant_reason else []
     else:
         absence_reasons = []
-        other_reasons = []
+        other_reasons = [invariant_reason] if invariant_reason else []
         # Pass the pid file so wedge_failure can apply the startup grace: a
         # young daemon still establishing its first watch_state heartbeat is
         # not wedged. pid_failure above already confirmed this pid is alive.
@@ -1253,8 +1277,8 @@ def wedge_threshold() -> timedelta:
     return timedelta(seconds=max(1, seconds))
 
 
-def startup_grace_sec() -> int:
-    """Startup grace window in seconds (see DEFAULT_STARTUP_GRACE_SEC).
+def _raw_startup_grace_sec() -> int:
+    """Configured startup grace in seconds, BEFORE the invariant clamp.
 
     ANGELUS_BELFRY_STARTUP_GRACE_SEC overrides the default, following the same
     env-override + invalid-falls-back-to-default convention as the other belfry
@@ -1273,6 +1297,75 @@ def startup_grace_sec() -> int:
         )
         return DEFAULT_STARTUP_GRACE_SEC
     return max(0, seconds)
+
+
+def startup_grace_sec() -> int:
+    """Effective startup grace window in seconds (see DEFAULT_STARTUP_GRACE_SEC).
+
+    This is the configured grace (_raw_startup_grace_sec) clamped to the safety
+    invariant grace < tick interval: a grace at or above belfry's own cadence
+    would land EVERY tick of a fully-broken startup inside the grace and mask a
+    real wedge indefinitely (the restart cap never engages). On violation the
+    grace is clamped to interval-1 -- fail safe: a possible too-early restart of
+    a slow-booting daemon is preferred over an indefinitely-masked wedge. The
+    clamp itself is silent because this is called several times per tick;
+    grace_invariant_failure() is the loud once-per-tick alert main() wires in.
+    Clamping here rather than in main() means every consumer of the grace
+    (within_startup_grace, the suppression log lines) sees the safe value, on
+    every call path.
+    """
+    grace = _raw_startup_grace_sec()
+    interval = tick_interval_sec()
+    if grace >= interval:
+        return max(0, interval - 1)
+    return grace
+
+
+def tick_interval_sec() -> int:
+    """belfry's own cron cadence in seconds (see DEFAULT_TICK_INTERVAL_SEC).
+
+    ANGELUS_BELFRY_TICK_INTERVAL_SEC overrides the default, same convention as
+    the other belfry thresholds. Floored at 1: an interval of 0 would make the
+    grace invariant unsatisfiable for any grace and divide the clamp into
+    nonsense.
+    """
+    raw = os.environ.get("ANGELUS_BELFRY_TICK_INTERVAL_SEC")
+    if raw is None:
+        return DEFAULT_TICK_INTERVAL_SEC
+    try:
+        seconds = int(raw)
+    except ValueError:
+        log_err(
+            "angelus belfry: invalid ANGELUS_BELFRY_TICK_INTERVAL_SEC; "
+            "using default"
+        )
+        return DEFAULT_TICK_INTERVAL_SEC
+    return max(1, seconds)
+
+
+def grace_invariant_failure() -> str | None:
+    """Check the grace < tick-interval safety invariant; reason on violation.
+
+    The loud half of the invariant enforcement (startup_grace_sec's clamp is
+    the fail-safe half): when the CONFIGURED grace is >= the configured tick
+    interval, return a config-invariant reason for main() to carry down the
+    same DOWN-ping/notify path as every other belfry failure. LEVEL-triggered
+    -- it re-fires every tick until the operator fixes the config, like the
+    open-internal-incident signal. Alert-only (an OTHER reason): the daemon
+    itself may be perfectly healthy; a restart is the wrong tool for a belfry
+    misconfiguration.
+    """
+    grace = _raw_startup_grace_sec()
+    interval = tick_interval_sec()
+    if grace < interval:
+        return None
+    return (
+        f"config-invariant: startup grace ({grace}s) >= belfry tick interval "
+        f"({interval}s); every tick of a broken startup would be graced, "
+        f"masking a real wedge indefinitely; grace clamped to "
+        f"{max(0, interval - 1)}s for this tick -- fix "
+        f"ANGELUS_BELFRY_STARTUP_GRACE_SEC / ANGELUS_BELFRY_TICK_INTERVAL_SEC"
+    )
 
 
 def latest_fire(db_path: Path) -> datetime | None:
