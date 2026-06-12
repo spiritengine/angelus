@@ -10,10 +10,14 @@ send stalled teardown for the full send timeout).
 
 These tests model the hangs with controllable awaitables (an Event-gated
 wedge that swallows cancellation, or an Event-gated send that honours it) --
-not real long sleeps -- and shrink the budget via ANGELUS_SHUTDOWN_BUDGET_SEC
-so the timing assertions are about the budget mechanism, not luck. Each
-test's discrimination against the pre-fix logic is noted in its docstring;
-the double-hang test is THE one the sequential-deadline bug fails.
+not real long sleeps -- and shrink the budget by monkeypatching
+angelus.daemon._shutdown_budget_seconds (the env override clamps anything at
+or below _REAP_TIMEOUT back to the default, 13w0 fell-r1, so a sub-reap test
+budget cannot come in through the env) so the timing assertions are about
+the budget mechanism, not luck. Each test's discrimination against the
+pre-fix logic is noted in its docstring; the double-hang test is THE one the
+sequential-deadline bug fails, and the subprocess entry test is THE one the
+bare asyncio.run() entry fails.
 """
 
 from __future__ import annotations
@@ -22,13 +26,18 @@ import asyncio
 import json
 import os
 import signal
+import subprocess
+import sys
+import textwrap
 import time
 from pathlib import Path
 
 import pytest
 
+import angelus.daemon
 from angelus.daemon import (
     DEFAULT_SHUTDOWN_BUDGET_SEC,
+    _EXIT_WAIT_FLOOR_SEC,
     AngelusDaemon,
     _shutdown_budget_seconds,
 )
@@ -91,8 +100,8 @@ def test_double_hang_drain_and_fixer_share_one_budget(
     budget, not the sum of per-stage deadlines.
 
     Discrimination (mutation-verified): under the pre-fix logic each stage
-    had its own _DRAIN_SHUTDOWN_TIMEOUT=6.0s bound (ANGELUS_SHUTDOWN_BUDGET_SEC
-    ignored), so this teardown took 6s in the drain stage alone -- and a
+    had its own _DRAIN_SHUTDOWN_TIMEOUT=6.0s bound (the budget knob ignored),
+    so this teardown took 6s in the drain stage alone -- and a
     cancel-swallowing task additionally wedged wait_for(gather(...)) forever,
     so run() never returned and the 15s wait_for here timed out -> red either
     way. Post-fix the drain stage consumes the whole 1.5s budget, the fixer
@@ -100,7 +109,7 @@ def test_double_hang_drain_and_fixer_share_one_budget(
     well under the 4s assertion."""
     _minimal_lodging(tmp_path)
     monkeypatch.setenv("ANGELUS_DRY_RUN", "1")
-    monkeypatch.setenv("ANGELUS_SHUTDOWN_BUDGET_SEC", "1.5")
+    monkeypatch.setattr(angelus.daemon, "_shutdown_budget_seconds", lambda: 1.5)
 
     async def driver() -> None:
         daemon = AngelusDaemon(tmp_path)
@@ -165,7 +174,7 @@ def test_hung_immediate_send_is_cancelled_not_waited_out(
     timeout)."""
     _minimal_lodging(tmp_path)
     monkeypatch.setenv("ANGELUS_DRY_RUN", "1")
-    monkeypatch.setenv("ANGELUS_SHUTDOWN_BUDGET_SEC", "2.0")
+    monkeypatch.setattr(angelus.daemon, "_shutdown_budget_seconds", lambda: 2.0)
 
     async def driver() -> None:
         daemon = AngelusDaemon(tmp_path)
@@ -218,7 +227,7 @@ def test_wedged_pending_task_is_bounded_by_remaining_budget(
     teardown never returned and the 15s wait_for tripped -> red."""
     _minimal_lodging(tmp_path)
     monkeypatch.setenv("ANGELUS_DRY_RUN", "1")
-    monkeypatch.setenv("ANGELUS_SHUTDOWN_BUDGET_SEC", "1.5")
+    monkeypatch.setattr(angelus.daemon, "_shutdown_budget_seconds", lambda: 1.5)
 
     async def driver() -> None:
         daemon = AngelusDaemon(tmp_path)
@@ -261,7 +270,7 @@ def test_second_sigterm_mid_shutdown_is_idempotent(
     run() must complete cleanly within the budget, no double-cancel error."""
     _minimal_lodging(tmp_path)
     monkeypatch.setenv("ANGELUS_DRY_RUN", "1")
-    monkeypatch.setenv("ANGELUS_SHUTDOWN_BUDGET_SEC", "1.5")
+    monkeypatch.setattr(angelus.daemon, "_shutdown_budget_seconds", lambda: 1.5)
 
     async def driver() -> None:
         daemon = AngelusDaemon(tmp_path)
@@ -391,26 +400,199 @@ def test_cancelled_drain_reap_arm_still_runs_within_budget(
         )
 
 
+def test_process_exit_is_bounded_despite_cancel_swallowing_straggler(
+    tmp_path,
+) -> None:
+    """THE process-exit test (13w0 fell-r1): the PROCESS must exit within
+    the budget, not just run() return within it. Drives the real entry path
+    -- daemon.main() in a subprocess, SIGTERM through the installed handler
+    -- with an untracked cancel-swallowing straggler task spliced into the
+    loop, the one shape run()'s bounded teardown never waits on.
+
+    Discrimination (mutation-verified): with the entry reverted to bare
+    asyncio.run(daemon.run()), run() still returns inside the budget (the
+    in-process tests above stay green), but asyncio's _cancel_all_tasks then
+    re-cancels the straggler and gathers it with NO timeout; the straggler
+    swallows the cancel, the gather never resolves, and the process hangs
+    until SIGKILL -- the communicate() timeout below trips -> red. The
+    bounded entry (_run_daemon_to_exit) cancels it once, waits out the
+    deadline leftover, abandons it, and exits 0."""
+    _minimal_lodging(tmp_path)
+    repo_root = Path(angelus.daemon.__file__).resolve().parents[1]
+    script = tmp_path / "entry_under_test.py"
+    script.write_text(
+        textwrap.dedent(
+            f"""\
+            import asyncio
+            from pathlib import Path
+
+            import angelus.daemon as d
+
+            root = Path({str(tmp_path)!r})
+
+            # The env clamp rejects sub-reap budgets, so shrink the resolved
+            # budget the same way the in-process tests do: patch the module
+            # function. Keeps the straggler window short.
+            d._shutdown_budget_seconds = lambda: 1.5
+
+
+            class WedgedDaemon(d.AngelusDaemon):
+                def _install_signal_handlers(self):
+                    super()._install_signal_handlers()
+
+                    async def straggler():
+                        while True:
+                            try:
+                                await asyncio.Event().wait()
+                            except asyncio.CancelledError:
+                                pass  # swallow every cancel: never dies
+
+                    asyncio.get_running_loop().create_task(
+                        straggler(), name="wedged-straggler"
+                    )
+                    # Touched only after the SIGTERM handler is live, so the
+                    # test's signal cannot race the default disposition.
+                    (root / "ready.marker").touch()
+
+
+            d.AngelusDaemon = WedgedDaemon
+            d.main(root)
+            print("EXITED-CLEANLY", flush=True)
+            """
+        ),
+        encoding="utf-8",
+    )
+    env = dict(
+        os.environ,
+        ANGELUS_DRY_RUN="1",
+        PYTHONPATH=os.pathsep.join(
+            p
+            for p in (str(repo_root), os.environ.get("PYTHONPATH"))
+            if p
+        ),
+    )
+    proc = subprocess.Popen(
+        [sys.executable, str(script)],
+        env=env,
+        cwd=str(tmp_path),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        ready = tmp_path / "ready.marker"
+        boot_deadline = time.monotonic() + 30
+        while not ready.exists():
+            if proc.poll() is not None:
+                raise AssertionError(
+                    "daemon under test died during startup:\n"
+                    + proc.communicate()[1]
+                )
+            if time.monotonic() > boot_deadline:
+                raise AssertionError("daemon under test never came up")
+            time.sleep(0.05)
+        started = time.monotonic()
+        proc.send_signal(signal.SIGTERM)
+        try:
+            out, err = proc.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            raise AssertionError(
+                "process never exited after SIGTERM -- the entry leans on "
+                "an unbounded wait over leftover tasks"
+            )
+        elapsed = time.monotonic() - started
+        assert proc.returncode == 0, err
+        assert "EXITED-CLEANLY" in out, err
+        assert elapsed < 8.0, (
+            f"process exit took {elapsed:.1f}s -- past the no-hang promise"
+        )
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+
+
+def test_cleanup_tail_runs_when_teardown_itself_is_cancelled(
+    tmp_path, monkeypatch
+) -> None:
+    """Defense-in-depth (13w0 fell-r1): if a CancelledError lands while the
+    teardown is parked in a reap stage, the pid-file/socket unlink tail must
+    still run -- otherwise a cancelled teardown leaves stale files for the
+    next boot to trip over. Not reachable from the production signal path
+    today (request_stop only sets stop_event); this pins the inner
+    try/finally that guards against any future caller cancelling run()."""
+    _minimal_lodging(tmp_path)
+    monkeypatch.setenv("ANGELUS_DRY_RUN", "1")
+    monkeypatch.setattr(angelus.daemon, "_shutdown_budget_seconds", lambda: 1.5)
+
+    async def driver() -> None:
+        daemon = AngelusDaemon(tmp_path)
+        run_task = asyncio.create_task(daemon.run())
+        wedge = _Wedge()
+        wedged: asyncio.Task | None = None
+        try:
+            await _wait_for_daemon_up(daemon)
+            assert daemon.pid_file.exists()
+            # A wedged drain holds the teardown open in its reap stage so
+            # the cancel below lands mid-finally, not pre-shutdown.
+            wedged = asyncio.create_task(wedge.run())
+            daemon._drain_tasks.add(wedged)
+            daemon.request_stop()
+            await asyncio.sleep(0.3)
+            assert not run_task.done(), "teardown over before the cancel"
+            run_task.cancel()
+            await asyncio.gather(run_task, return_exceptions=True)
+            assert not daemon.pid_file.exists(), (
+                "pid file survived a cancelled teardown"
+            )
+            assert not daemon.socket_path.exists(), (
+                "control socket survived a cancelled teardown"
+            )
+        finally:
+            wedge.release.set()
+            if wedged is not None:
+                await asyncio.gather(wedged, return_exceptions=True)
+            if not run_task.done():
+                run_task.cancel()
+                await asyncio.gather(run_task, return_exceptions=True)
+
+    asyncio.run(driver())
+
+
 def test_shutdown_budget_env_parsing(monkeypatch) -> None:
-    """ANGELUS_SHUTDOWN_BUDGET_SEC overrides; junk and non-positive values
-    fall back to the default so shutdown never crashes on a bad env."""
+    """ANGELUS_SHUTDOWN_BUDGET_SEC overrides; junk, non-positive, and
+    at-or-below-_REAP_TIMEOUT values all fall back to the default so shutdown
+    never crashes -- or violates the budget > _REAP_TIMEOUT invariant -- on a
+    bad env (13w0 fell-r1: pre-clamp, a sub-reap override was honoured with
+    only a warning, letting production config starve every reap arm)."""
+    from angelus.sources.runner import _REAP_TIMEOUT
+
     monkeypatch.delenv("ANGELUS_SHUTDOWN_BUDGET_SEC", raising=False)
     assert _shutdown_budget_seconds() == DEFAULT_SHUTDOWN_BUDGET_SEC
-    monkeypatch.setenv("ANGELUS_SHUTDOWN_BUDGET_SEC", "2.5")
-    assert _shutdown_budget_seconds() == 2.5
     monkeypatch.setenv("ANGELUS_SHUTDOWN_BUDGET_SEC", "banana")
     assert _shutdown_budget_seconds() == DEFAULT_SHUTDOWN_BUDGET_SEC
     monkeypatch.setenv("ANGELUS_SHUTDOWN_BUDGET_SEC", "0")
     assert _shutdown_budget_seconds() == DEFAULT_SHUTDOWN_BUDGET_SEC
     monkeypatch.setenv("ANGELUS_SHUTDOWN_BUDGET_SEC", "-3")
     assert _shutdown_budget_seconds() == DEFAULT_SHUTDOWN_BUDGET_SEC
+    # The clamp: sub-reap (and exactly-at-reap) overrides come back as the
+    # default, never as the configured value.
+    monkeypatch.setenv("ANGELUS_SHUTDOWN_BUDGET_SEC", "2.5")
+    assert _shutdown_budget_seconds() == DEFAULT_SHUTDOWN_BUDGET_SEC
+    monkeypatch.setenv("ANGELUS_SHUTDOWN_BUDGET_SEC", str(_REAP_TIMEOUT))
+    assert _shutdown_budget_seconds() == DEFAULT_SHUTDOWN_BUDGET_SEC
+    # An override above the reap timeout is honoured.
+    monkeypatch.setenv("ANGELUS_SHUTDOWN_BUDGET_SEC", str(_REAP_TIMEOUT + 0.5))
+    assert _shutdown_budget_seconds() == _REAP_TIMEOUT + 0.5
 
 
 def test_default_budget_leaves_room_for_a_reap_arm() -> None:
     """The constants' invariant, pinned: the default shared budget must
     exceed _kill_and_reap's _REAP_TIMEOUT (so one cancelled reap arm can
-    always finish) and stay under the integration fell's 8s no-hang bound."""
+    always finish) and -- together with the entry runner's post-run()
+    straggler-wait floor -- stay under the integration fell's 8s no-hang
+    bound, so PROCESS EXIT (not just run()'s return) keeps the promise."""
     from angelus.sources.runner import _REAP_TIMEOUT
 
     assert DEFAULT_SHUTDOWN_BUDGET_SEC > _REAP_TIMEOUT
-    assert DEFAULT_SHUTDOWN_BUDGET_SEC < 8.0
+    assert DEFAULT_SHUTDOWN_BUDGET_SEC + _EXIT_WAIT_FLOOR_SEC < 8.0
