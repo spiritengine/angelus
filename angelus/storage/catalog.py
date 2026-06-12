@@ -163,6 +163,14 @@ class Catalog:
         return observation_id
 
     def ready_observations_for(self, triager_name: str, source_ref: str) -> list[sqlite3.Row]:
+        """Ready observations this triager can pick up: no triage row yet, or
+        a 'failed' row whose scheduled retry is due. A 'failed' row with NULL
+        next_attempt_at is exhausted (mark_triage_failed clears the schedule
+        on its terminal branch and nothing else writes failed+NULL), so it is
+        terminal for this triager and excluded -- the observation no longer
+        flips to triage_failed the moment ONE triager exhausts, so this
+        per-triager exclusion is what stops an exhausted triager from
+        re-picking its own dead work while siblings finish theirs."""
         now = self._clock.now_iso()
         return list(
             self.connection.execute(
@@ -177,7 +185,8 @@ class Catalog:
                     ot.observation_id IS NULL
                     OR (
                         ot.status = 'failed'
-                        AND (ot.next_attempt_at IS NULL OR ot.next_attempt_at <= ?)
+                        AND ot.next_attempt_at IS NOT NULL
+                        AND ot.next_attempt_at <= ?
                     )
                   )
                 ORDER BY o.id
@@ -256,6 +265,15 @@ class Catalog:
     def mark_triage_failed(
         self, observation_id: int, triager_name: str, error: str
     ) -> bool:
+        """Record one triage failure; returns True when this triager's
+        retries are exhausted. Exhaustion is terminal for THIS triager only:
+        the row keeps status='failed' with next_attempt_at NULL (the
+        exhausted marker ready_observations_for excludes). The observation
+        row is NOT flipped here -- flipping on the first exhausted triager
+        used to drop the observation out of `ready` for every OTHER triager
+        on the same source; the whole-row transition now happens in
+        consume_observation_if_terminal once ALL expected triagers are
+        terminal."""
         row = self.connection.execute(
             """
             SELECT attempt FROM observation_triage
@@ -265,7 +283,6 @@ class Catalog:
         ).fetchone()
         attempt = int(row["attempt"]) if row is not None else 1
         if attempt >= MAX_RETRY_ATTEMPTS:
-            now = self._clock.now_iso()
             self.connection.execute(
                 """
                 UPDATE observation_triage
@@ -275,15 +292,7 @@ class Catalog:
                     updated_at = ?
                 WHERE observation_id = ? AND triager_name = ?
                 """,
-                (error, now, observation_id, triager_name),
-            )
-            self.connection.execute(
-                """
-                UPDATE observations
-                SET status = 'triage_failed', updated_at = ?
-                WHERE id = ?
-                """,
-                (now, observation_id),
+                (error, self._clock.now_iso(), observation_id, triager_name),
             )
             self.connection.commit()
             return True
@@ -306,6 +315,105 @@ class Catalog:
         )
         self.connection.commit()
         return False
+
+    def consume_observation_if_terminal(
+        self, observation_id: int, expected_triagers: set[str]
+    ) -> str | None:
+        """Flip a 'ready' observation to its terminal status once EVERY
+        expected triager has a terminal triage row. Returns the new status
+        ('consumed', or 'triage_failed' when at least one triager exhausted
+        its retries) or None when the observation is not yet settled.
+
+        Terminal per triager: 'success', or 'failed' with NULL
+        next_attempt_at (the exhausted marker mark_triage_failed leaves; a
+        retrying failure always carries a schedule). A missing row, a
+        'processing' row, or a scheduled retry all mean that triager still
+        owns work here, so nothing flips -- never lose an un-triaged or
+        still-retrying observation.
+
+        `expected_triagers` is the LODGED set matching this observation's
+        source; lodging lives in the daemon (self.lodging.triagers), not the
+        catalog, so the caller passes it in. Rows from triagers no longer in
+        that set (hot-removed) neither block nor satisfy the transition --
+        the lodged set is the authority on who must finish. An empty
+        expected set never flips here: a source with no live triager is the
+        grace-period sweep's job (consume_observations_without_triager), so
+        a momentary lodging gap cannot consume fresh work instantly.
+
+        The UPDATE is guarded on status='ready' so a repeat call, a
+        concurrent flip, or a non-ready row ('writing', 'failed', already
+        terminal) is a no-op returning None.
+        """
+        if not expected_triagers:
+            return None
+        placeholders = ", ".join("?" for _ in expected_triagers)
+        names = sorted(expected_triagers)
+        rows = self.connection.execute(
+            f"""
+            SELECT triager_name, status, next_attempt_at
+            FROM observation_triage
+            WHERE observation_id = ? AND triager_name IN ({placeholders})
+            """,
+            (observation_id, *names),
+        ).fetchall()
+        terminal: dict[str, str] = {}
+        for row in rows:
+            if row["status"] == "success":
+                terminal[row["triager_name"]] = "success"
+            elif row["status"] == "failed" and row["next_attempt_at"] is None:
+                terminal[row["triager_name"]] = "exhausted"
+        if set(terminal) != expected_triagers:
+            return None
+        new_status = (
+            "triage_failed"
+            if any(state == "exhausted" for state in terminal.values())
+            else "consumed"
+        )
+        cursor = self.connection.execute(
+            """
+            UPDATE observations
+            SET status = ?, updated_at = ?
+            WHERE id = ? AND status = 'ready'
+            """,
+            (new_status, self._clock.now_iso(), observation_id),
+        )
+        self.connection.commit()
+        return new_status if cursor.rowcount else None
+
+    def consume_observations_without_triager(
+        self, sources_with_triagers: set[str], grace_seconds: int
+    ) -> int:
+        """Flip 'ready' observations whose source has no live triager to
+        'consumed' once they are older than the grace period. Returns the
+        count flipped.
+
+        This is the real pile-up case: a source with zero triagers never
+        gets a triage row, so its observations would sit in `ready` forever.
+        The grace (age measured against created_at on the injected clock)
+        keeps a newly-lodged triager able to claim recent observations; past
+        it, the row is consumed and reachable again only via
+        reprocess_source. `sources_with_triagers` is the lodged truth the
+        daemon passes in; observations from those sources are never touched
+        here regardless of age -- their exit is consume_observation_if_terminal.
+        """
+        cutoff = _format_time(
+            self._clock.now() - timedelta(seconds=grace_seconds)
+        )
+        sources = sorted(sources_with_triagers)
+        placeholders = ", ".join("?" for _ in sources)
+        not_in = f"AND source NOT IN ({placeholders})" if sources else ""
+        cursor = self.connection.execute(
+            f"""
+            UPDATE observations
+            SET status = 'consumed', updated_at = ?
+            WHERE status = 'ready'
+              AND created_at <= ?
+              {not_in}
+            """,
+            (self._clock.now_iso(), cutoff, *sources),
+        )
+        self.connection.commit()
+        return cursor.rowcount
 
     def prior_state(self, triager_name: str, source_ref: str) -> dict[str, Any]:
         row = self.connection.execute(
@@ -775,7 +883,10 @@ class Catalog:
         'Pending' counts a ready observation until some triager has a
         'success' row for it. Observations still retrying ('failed' with a
         future next_attempt_at) or with no matching triager remain counted --
-        from an operator's view they are still waiting on triage.
+        from an operator's view they are still waiting on triage. Terminal
+        observations ('consumed', 'triage_failed') leave the count through
+        the status='ready' filter the moment they settle, so this is
+        O(genuinely-pending), not O(everything ever written).
         """
         row = self.connection.execute(
             """
@@ -1811,20 +1922,30 @@ class Catalog:
         """Delete observation_triage rows for observations from `source`
         so the triage loop re-picks those observations
         (ready_observations_for excludes observations that already have a
-        triage row). Returns the number of distinct observations that
-        will be re-triaged.
+        triage row), and flip the source's terminal observations
+        ('consumed', 'triage_failed') back to 'ready'. Returns the number
+        of distinct observations that will be re-triaged.
 
-        Idempotent: a second apply finds the rows already gone and
-        deletes nothing (0 observations). The DELETE is strictly bounded
-        to the given source via the observations subquery, the same
-        bounded-delete shape clear_triage_processing uses.
+        The flip is deliberate: ready_observations_for filters
+        status='ready', so without it a consumed observation would keep its
+        body on disk yet be unreachable forever -- reprocess is the one
+        documented way back from terminal. Both halves are bounded to the
+        given source and committed together. Idempotent: a second apply
+        finds the rows already 'ready' with no triage rows, so it flips
+        nothing, deletes nothing, and returns 0.
         """
         row = self.connection.execute(
             """
-            SELECT COUNT(DISTINCT ot.observation_id) AS n
-            FROM observation_triage ot
-            JOIN observations o ON o.id = ot.observation_id
+            SELECT COUNT(*) AS n
+            FROM observations o
             WHERE o.source = ?
+              AND (
+                o.status IN ('consumed', 'triage_failed')
+                OR EXISTS (
+                    SELECT 1 FROM observation_triage ot
+                    WHERE ot.observation_id = o.id
+                )
+              )
             """,
             (source,),
         ).fetchone()
@@ -1837,6 +1958,14 @@ class Catalog:
             )
             """,
             (source,),
+        )
+        self.connection.execute(
+            """
+            UPDATE observations
+            SET status = 'ready', updated_at = ?
+            WHERE source = ? AND status IN ('consumed', 'triage_failed')
+            """,
+            (self._clock.now_iso(), source),
         )
         self.connection.commit()
         return count

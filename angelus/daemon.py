@@ -130,6 +130,46 @@ _DRAIN_SHUTDOWN_TIMEOUT = 6.0
 _FIXER_POLL_INTERVAL_SEC = 15.0
 DEFAULT_FIXERS_LOG_FILENAME = "fixers.log"
 
+# How often the consume sweep re-checks for ready observations whose source
+# has no live triager (catalog.consume_observations_without_triager). The
+# grace period below -- not this interval -- decides when an observation is
+# old enough to consume, so the cadence only bounds how stale the `ready`
+# set can get after the grace expires. Tests drive the sweep directly via
+# _consume_sweep_once and do not depend on it.
+_CONSUME_SWEEP_INTERVAL_SEC = 60.0
+
+# Grace before a ready observation whose source has no live triager is
+# consumed. Long enough that lodging a triager for an already-firing source
+# picks up a day of history rather than finding it already consumed.
+DEFAULT_NO_TRIAGER_CONSUME_GRACE_SEC = 86_400
+
+
+def _no_triager_consume_grace_seconds() -> int:
+    """Grace before no-triager observations are consumed by the sweep.
+
+    ANGELUS_NO_TRIAGER_CONSUME_GRACE_SEC overrides; default is 86400s (24h).
+    Invalid or non-positive overrides fall back to the default so the sweep
+    never crashes on a misconfigured env -- same contract as
+    ANGELUS_BELFRY_STALE_AFTER_SEC below.
+    """
+    raw = os.environ.get("ANGELUS_NO_TRIAGER_CONSUME_GRACE_SEC")
+    if raw is None:
+        return DEFAULT_NO_TRIAGER_CONSUME_GRACE_SEC
+    try:
+        seconds = int(raw)
+    except ValueError:
+        LOGGER.warning(
+            "invalid ANGELUS_NO_TRIAGER_CONSUME_GRACE_SEC=%r; using default", raw
+        )
+        return DEFAULT_NO_TRIAGER_CONSUME_GRACE_SEC
+    if seconds <= 0:
+        LOGGER.warning(
+            "ANGELUS_NO_TRIAGER_CONSUME_GRACE_SEC=%d must be positive; using default",
+            seconds,
+        )
+        return DEFAULT_NO_TRIAGER_CONSUME_GRACE_SEC
+    return seconds
+
 
 class AngelusDaemon:
     def __init__(self, root: Path, *, clock: Clock | None = None) -> None:
@@ -164,6 +204,9 @@ class AngelusDaemon:
         # never persisted, cleared on restart by construction.
         self.faults = FaultRegistry.from_env()
         self.lodging: Lodging = load_lodging(root)
+        # Read once at construction (like FaultRegistry.from_env above): the
+        # knob is deployment config, not something to mutate on a live daemon.
+        self._no_triager_consume_grace_sec = _no_triager_consume_grace_seconds()
         self.scheduler = AsyncIOScheduler(timezone="UTC")
         self.scheduler_semaphore = asyncio.Semaphore(10)
         self.triage_semaphore = asyncio.Semaphore(10)
@@ -298,6 +341,11 @@ class AngelusDaemon:
             scheduler_started = True
             LOGGER.info("scheduler started with %d jobs", len(self.scheduler.get_jobs()))
             self.tasks.append(asyncio.create_task(self._triage_loop(), name="triage-loop"))
+            self.tasks.append(
+                asyncio.create_task(
+                    self._consume_sweep_loop(), name="consume-sweep-loop"
+                )
+            )
             self._fixer_loop_task = asyncio.create_task(
                 self._fixer_loop(), name="fixer-loop"
             )
@@ -1394,6 +1442,7 @@ class AngelusDaemon:
                 )
                 LOGGER.info("finding %s ready from observation %s", finding_id, observation_id)
             self.catalog.mark_triage_success(observation_id, triager.name)
+            self._maybe_consume_observation(observation_id, row["source"])
             # Recovery edge for the internal/triage incident: a triager whose
             # retries were exhausted (below) opened a triage_failed incident;
             # a later successful run clears it so the gate re-arms. Dropped to
@@ -1410,6 +1459,7 @@ class AngelusDaemon:
                 observation_id, triager.name, str(exc)
             )
             if exhausted:
+                self._maybe_consume_observation(observation_id, row["source"])
                 self.catalog.write_internal_finding(
                     "internal/triage",
                     "triage_failed",
@@ -1418,6 +1468,29 @@ class AngelusDaemon:
                     set(self.lodging.pipes),
                 )
 
+    def _maybe_consume_observation(self, observation_id: int, source_ref: str) -> None:
+        """Settle one observation after a triager reaches a terminal state
+        (success, or failed with retries exhausted). The expected-triager set
+        is the lodged truth -- only the daemon has it, which is why the
+        catalog takes it as an argument instead of deciding alone. An empty
+        set (triager hot-removed between the triage run and now) defers to
+        the grace-period sweep rather than consuming instantly."""
+        expected = {
+            triager.name
+            for triager in self.lodging.triagers.values()
+            if triager.source_ref == source_ref
+        }
+        new_status = self.catalog.consume_observation_if_terminal(
+            observation_id, expected
+        )
+        if new_status is not None:
+            LOGGER.info(
+                "observation %d settled to %s (all %d triager(s) terminal)",
+                observation_id,
+                new_status,
+                len(expected),
+            )
+
     async def _pipe_loop(self, pipe_name: str) -> None:
         while not self.stop_event.is_set():
             drain = self.pipe_drains.get(pipe_name)
@@ -1425,6 +1498,44 @@ class AngelusDaemon:
                 return
             await drain.drain_once()
             await asyncio.sleep(1)
+
+    def _consume_sweep_once(self) -> None:
+        """One pass of the no-triager consume sweep: observations whose
+        source has no lodged triager flip ready->consumed once past the
+        grace period. The per-observation exit for sources WITH triagers is
+        _maybe_consume_observation on the triage path; this sweep is only
+        for work nothing will ever pick up. Reads self.lodging.triagers
+        fresh each pass (the _fixer_loop pattern) so lodging a triager
+        immediately shields its source's observations from the sweep."""
+        sources_with_triagers = {
+            triager.source_ref for triager in self.lodging.triagers.values()
+        }
+        consumed = self.catalog.consume_observations_without_triager(
+            sources_with_triagers, self._no_triager_consume_grace_sec
+        )
+        if consumed:
+            LOGGER.info(
+                "consumed %d observation(s) with no live triager "
+                "(grace %ds elapsed)",
+                consumed,
+                self._no_triager_consume_grace_sec,
+            )
+
+    async def _consume_sweep_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                self._consume_sweep_once()
+            except Exception:
+                # A bug in one pass must not kill the loop; the condition
+                # stays live and is retried next pass (the _fixer_loop
+                # contract).
+                LOGGER.exception("consume sweep pass crashed")
+            try:
+                await asyncio.wait_for(
+                    self.stop_event.wait(), timeout=_CONSUME_SWEEP_INTERVAL_SEC
+                )
+            except TimeoutError:
+                continue
 
     # -- Fixers (B11) ------------------------------------------------------
     #
