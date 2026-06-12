@@ -3,6 +3,12 @@
 # so belfry and the daemon read the same values and can't diverge (B16).
 # Copy state/angelus.env.example to state/angelus.env and fill it in.
 #
+# Layout: the entries cd to the DEPLOYMENT (lodging) root -- where state/
+# and the lodging YAML live -- and run the scripts out of the ENGINE repo
+# (see README "Deployment layout: the lodging root"). If you deploy
+# single-root (lodging inside the engine repo checkout), the two paths are
+# the same directory and the entries below collapse to the old form.
+#
 # PATH must include wherever your notification command is installed. Set it
 # either here in the crontab or inside state/angelus.env. Precedence: a var
 # set in the crontab BELOW the sourcing wins; the file fills in the rest.
@@ -53,7 +59,7 @@
 # UTC timestamp (e.g. 2026-05-29T14:03:00Z), so the log below can be placed
 # on an incident timeline.
 
-*/5 * * * * cd /path/to/angelus && { set -a; [ -f state/angelus.env ] && . state/angelus.env; set +a; }; export XDG_RUNTIME_DIR="/run/user/$(id -u)"; /usr/bin/env python belfry/belfry.py >> state/belfry.log 2>&1
+*/5 * * * * cd /path/to/lodging-root && { set -a; [ -f state/angelus.env ] && . state/angelus.env; set +a; }; export XDG_RUNTIME_DIR="/run/user/$(id -u)"; /usr/bin/env python /path/to/angelus/belfry/belfry.py >> state/belfry.log 2>&1
 
 # SRE escalation runner — runs every minute; rate-limiting is done in-script
 # (MIN_SPAWN_INTERVAL=45m, MAX_SPAWNS=3 per 6h window) so cron frequency
@@ -77,4 +83,4 @@
 #   ANGELUS_SRE_LAST_SPAWN_PATH    default state/sre-last-spawn-at
 #   ANGELUS_SRE_SPAWN_LOG_PATH     default state/sre-spawn-log
 #   ANGELUS_SRE_REPORTS_DIR        default state/sre-reports
-* * * * * cd /path/to/angelus && { set -a; [ -f state/angelus.env ] && . state/angelus.env; set +a; }; export XDG_RUNTIME_DIR="/run/user/$(id -u)"; /usr/bin/env python deploy/sre_runner.py >> state/sre-runner.log 2>&1
+* * * * * cd /path/to/lodging-root && { set -a; [ -f state/angelus.env ] && . state/angelus.env; set +a; }; export XDG_RUNTIME_DIR="/run/user/$(id -u)"; /usr/bin/env python /path/to/angelus/deploy/sre_runner.py >> state/sre-runner.log 2>&1
