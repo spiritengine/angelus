@@ -131,11 +131,15 @@ _FIXER_POLL_INTERVAL_SEC = 15.0
 DEFAULT_FIXERS_LOG_FILENAME = "fixers.log"
 
 # How often the consume sweep re-checks for ready observations whose source
-# has no live triager (catalog.consume_observations_without_triager). The
-# grace period below -- not this interval -- decides when an observation is
-# old enough to consume, so the cadence only bounds how stale the `ready`
-# set can get after the grace expires. Tests drive the sweep directly via
-# _consume_sweep_once and do not depend on it.
+# has no live triager (catalog.consume_observations_without_triager), and
+# re-runs the all-lodged-terminal rule over ready observations of sources
+# WITH triagers (_settle_ready_observations) to heal a lodged set that
+# shrank without a triage event. The grace period below -- not this
+# interval -- decides when a no-triager observation is old enough to
+# consume, so the cadence only bounds how stale the `ready` set can get
+# after the grace expires (or after a shrink apply_lodging never saw).
+# Tests drive the sweep directly via _consume_sweep_once and do not depend
+# on it.
 _CONSUME_SWEEP_INTERVAL_SEC = 60.0
 
 # Grace before a ready observation whose source has no live triager is
@@ -1141,6 +1145,30 @@ class AngelusDaemon:
         # rest of the reload.
         self._sync_source_sla()
 
+        # A hot-removed triager can be the only non-terminal blocker keeping
+        # an observation in 'ready' (siblings already terminal). Nothing on
+        # the triage path will ever re-evaluate it, so reconcile here: for
+        # each source whose lodged triager set shrank but is still
+        # non-empty, re-run the all-lodged-terminal rule over its ready
+        # observations. Shrunk-to-zero sources are deliberately excluded --
+        # they keep the grace window via the no-triager sweep. Synchronous,
+        # self-committing catalog calls with no await, cancel-safe like the
+        # writes above; the periodic sweep backstops a reload cancelled
+        # mid-way. No grace needed (see _settle_ready_observations).
+        old_by_source: dict[str, set[str]] = {}
+        for triager in old.triagers.values():
+            old_by_source.setdefault(triager.source_ref, set()).add(triager.name)
+        new_by_source: dict[str, set[str]] = {}
+        for triager in new_lodging.triagers.values():
+            new_by_source.setdefault(triager.source_ref, set()).add(triager.name)
+        shrunk = {
+            ref
+            for ref, names in old_by_source.items()
+            if names - new_by_source.get(ref, set()) and new_by_source.get(ref)
+        }
+        if shrunk:
+            self._settle_ready_observations(shrunk)
+
         old_sources = old.sources
         new_sources = new_lodging.sources
         for ref in set(old_sources) - set(new_sources):
@@ -1469,12 +1497,15 @@ class AngelusDaemon:
                 )
 
     def _maybe_consume_observation(self, observation_id: int, source_ref: str) -> None:
-        """Settle one observation after a triager reaches a terminal state
-        (success, or failed with retries exhausted). The expected-triager set
-        is the lodged truth -- only the daemon has it, which is why the
-        catalog takes it as an argument instead of deciding alone. An empty
-        set (triager hot-removed between the triage run and now) defers to
-        the grace-period sweep rather than consuming instantly."""
+        """Settle one observation once every lodged triager for its source
+        is terminal (success, or failed with retries exhausted). Driven from
+        the triage path right after a triager turns terminal, and from
+        _settle_ready_observations when the lodged set itself may have
+        shrunk. The expected-triager set is the lodged truth -- only the
+        daemon has it, which is why the catalog takes it as an argument
+        instead of deciding alone. An empty set (triager hot-removed between
+        the triage run and now) defers to the grace-period sweep rather than
+        consuming instantly."""
         expected = {
             triager.name
             for triager in self.lodging.triagers.values()
@@ -1499,14 +1530,41 @@ class AngelusDaemon:
             await drain.drain_once()
             await asyncio.sleep(1)
 
+    def _settle_ready_observations(self, source_refs: set[str]) -> None:
+        """Re-run the all-lodged-terminal rule over every ready observation
+        of `source_refs`. The reconciliation for a SHRUNK lodged triager
+        set: when the last non-terminal blocker for an observation is
+        hot-removed (or a restart comes up with a smaller lodging), no
+        triage event will ever re-evaluate that observation -- the terminal
+        siblings never re-pick it (ready_observations_for excludes their
+        rows) and consume_observations_without_triager skips sources that
+        still have a lodged triager. Both apply_lodging (immediate, on the
+        observed shrink) and the periodic consume sweep (backstop, heals
+        shrinks reached by paths that never call apply_lodging) drive this.
+
+        Deliberately NO grace here, unlike the no-triager sweep: an
+        observation settles only when every REMAINING lodged triager is
+        already terminal, so there is no live work to wait for and nothing
+        a grace window would protect. A triager lodged later reaches
+        settled observations via reprocess_source only -- the same contract
+        as any other terminal transition. The underlying check
+        (consume_observation_if_terminal) never flips while any lodged
+        triager is non-terminal and never flips on an empty lodged set, so
+        un-triaged and still-retrying work is untouched."""
+        for row in self.catalog.ready_observations_for_sources(source_refs):
+            self._maybe_consume_observation(int(row["id"]), row["source"])
+
     def _consume_sweep_once(self) -> None:
-        """One pass of the no-triager consume sweep: observations whose
-        source has no lodged triager flip ready->consumed once past the
-        grace period. The per-observation exit for sources WITH triagers is
-        _maybe_consume_observation on the triage path; this sweep is only
-        for work nothing will ever pick up. Reads self.lodging.triagers
-        fresh each pass (the _fixer_loop pattern) so lodging a triager
-        immediately shields its source's observations from the sweep."""
+        """One pass of the consume sweep, two reconciliations: observations
+        whose source has no lodged triager flip ready->consumed once past
+        the grace period, and sources WITH triagers get their ready
+        observations re-checked against the all-lodged-terminal rule
+        (_settle_ready_observations) in case the lodged set shrank without
+        a triage event to notice it. The prompt per-observation exit for
+        sources with triagers remains _maybe_consume_observation on the
+        triage path. Reads self.lodging.triagers fresh each pass (the
+        _fixer_loop pattern) so lodging a triager immediately shields its
+        source's observations from the no-triager arm."""
         sources_with_triagers = {
             triager.source_ref for triager in self.lodging.triagers.values()
         }
@@ -1520,6 +1578,7 @@ class AngelusDaemon:
                 consumed,
                 self._no_triager_consume_grace_sec,
             )
+        self._settle_ready_observations(sources_with_triagers)
 
     async def _consume_sweep_loop(self) -> None:
         while not self.stop_event.is_set():

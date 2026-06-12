@@ -415,6 +415,35 @@ class Catalog:
         self.connection.commit()
         return cursor.rowcount
 
+    def ready_observations_for_sources(
+        self, source_refs: set[str]
+    ) -> list[sqlite3.Row]:
+        """All 'ready' observations (id + source) for `source_refs`, oldest
+        first. Feeds the daemon's shrunk-lodging reconciliation: when a
+        source's lodged triager set may have shrunk (triager hot-removed, or
+        a restart with a smaller lodging), each of these rows is re-run
+        through consume_observation_if_terminal -- a triager that was the
+        only non-terminal blocker can vanish from lodging, and without this
+        re-evaluation nothing ever settles the observation (the terminal
+        siblings never re-pick it, and consume_observations_without_triager
+        skips sources that still have a lodged triager). Distinct from
+        ready_observations_for, which answers what ONE triager can pick up;
+        this answers what is still unsettled for whole sources."""
+        if not source_refs:
+            return []
+        sources = sorted(source_refs)
+        placeholders = ", ".join("?" for _ in sources)
+        return list(
+            self.connection.execute(
+                f"""
+                SELECT id, source FROM observations
+                WHERE status = 'ready' AND source IN ({placeholders})
+                ORDER BY id
+                """,
+                sources,
+            )
+        )
+
     def prior_state(self, triager_name: str, source_ref: str) -> dict[str, Any]:
         row = self.connection.execute(
             """

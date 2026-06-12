@@ -9,7 +9,10 @@ These tests pin the invariants: no triager loses work because a sibling
 exhausted first, no-triager observations survive the grace window for a
 newly-lodged triager to claim, consumed rows leave the hot-set readers
 immediately but still render in the timeline, and reprocess_source is the
-documented road back from terminal.
+documented road back from terminal. The terminal rule is also re-driven
+whenever the lodged triager set shrinks (apply_lodging reconciliation +
+sweep backstop) so a hot-removed blocker cannot wedge an observation in
+'ready' forever.
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ from pathlib import Path
 import angelus.daemon as daemon_module
 from angelus.clock import FakeClock
 from angelus.daemon import AngelusDaemon
+from angelus.lodging.config import load_lodging
 from angelus.storage import Catalog, init_db
 
 PINNED = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
@@ -73,6 +77,15 @@ def _write_lodging(root: Path) -> None:
     (root / "channels").mkdir()
     (root / "channels" / "push.yaml").write_text(
         "kind: push\ncommand: notify-pat\n",
+        encoding="utf-8",
+    )
+
+
+def _write_extra_triager(root: Path, name: str) -> None:
+    """A second triager on scheduled/a, alongside _write_lodging's `ta`."""
+    (root / "triagers" / f"{name}.yaml").write_text(
+        "inputs:\n  source: scheduled/a\n"
+        "handler:\n  kind: python\n  path: triagers/handlers/noop.py\n",
         encoding="utf-8",
     )
 
@@ -331,6 +344,103 @@ def test_daemon_consume_sweep_uses_lodged_sources_and_clock(tmp_path) -> None:
         assert _observation_status(daemon.catalog, orphan) == "consumed"
         # scheduled/a has a lodged triager (ta): shielded from the sweep.
         assert _observation_status(daemon.catalog, covered) == "ready"
+    finally:
+        daemon.connection.close()
+
+
+# --- lodging-shrink reconciliation -------------------------------------------
+
+
+def test_hot_removed_blocking_triager_settles_observation_on_reload(tmp_path) -> None:
+    """The leak this reconciliation exists for: source with lodged {ta, tb};
+    ta settles an observation, which correctly stays 'ready' waiting on tb;
+    tb is then hot-removed before settling. No triage event will ever
+    re-evaluate the observation (ta's terminal row excludes it from
+    ready_observations_for, and the no-triager sweep skips sources with a
+    lodged triager), so apply_lodging's shrink reconciliation must settle
+    it at reload time -- no grace, every remaining lodged triager is
+    already terminal."""
+    _write_lodging(tmp_path)
+    _write_extra_triager(tmp_path, "tb")
+    clock = FakeClock(PINNED)
+    daemon = AngelusDaemon(tmp_path, clock=clock)
+    try:
+        assert set(daemon.lodging.triagers) == {"ta", "tb"}
+        oid = daemon.catalog.write_observation(
+            "scheduled/a", {"x": 1}, {"source": "scheduled/a"}
+        )
+        daemon.catalog.mark_triage_processing(oid, "ta")
+        daemon.catalog.mark_triage_success(oid, "ta")
+        # The live triage path runs this after ta's success; tb still owns
+        # work, so the observation rightly stays ready.
+        daemon._maybe_consume_observation(oid, "scheduled/a")
+        assert _observation_status(daemon.catalog, oid) == "ready"
+
+        (tmp_path / "triagers" / "tb.yaml").unlink()
+        asyncio.run(daemon.apply_lodging(load_lodging(tmp_path)))
+
+        assert _observation_status(daemon.catalog, oid) == "consumed"
+        assert daemon.catalog.ready_observations_for("ta", "scheduled/a") == []
+    finally:
+        daemon.connection.close()
+
+
+def test_sweep_settles_shrunk_lodging_without_grace(tmp_path) -> None:
+    """A restart with a smaller lodging never calls apply_lodging, so the
+    periodic sweep is the backstop: the daemon comes up lodging only ta
+    while the DB holds an observation ta already exhausted, plus a leftover
+    retrying row from the no-longer-lodged tb. tb's row must neither block
+    nor satisfy; the sweep settles to triage_failed with NO grace elapsed
+    (every lodged triager is terminal -- nothing live to wait for), which
+    also releases the stuck observations_pending_triage_count. A fresh
+    un-triaged observation of the same source is untouched."""
+    _write_lodging(tmp_path)  # lodges only ta
+    clock = FakeClock(PINNED)
+    daemon = AngelusDaemon(tmp_path, clock=clock)
+    try:
+        stuck = daemon.catalog.write_observation(
+            "scheduled/a", {"x": 1}, {"source": "scheduled/a"}
+        )
+        _exhaust(daemon.catalog, stuck, "ta")
+        # tb's row from the prior daemon generation: failed with a
+        # scheduled retry, i.e. non-terminal -- but tb is not lodged, so it
+        # must not block settlement.
+        daemon.catalog.mark_triage_processing(stuck, "tb")
+        assert not daemon.catalog.mark_triage_failed(stuck, "tb", "boom")
+        fresh = daemon.catalog.write_observation(
+            "scheduled/a", {"x": 2}, {"source": "scheduled/a"}
+        )
+        assert daemon.catalog.observations_pending_triage_count() == 2
+
+        daemon._consume_sweep_once()  # clock NOT advanced: no grace involved
+
+        assert _observation_status(daemon.catalog, stuck) == "triage_failed"
+        assert _observation_status(daemon.catalog, fresh) == "ready"
+        assert daemon.catalog.observations_pending_triage_count() == 1
+    finally:
+        daemon.connection.close()
+
+
+def test_removing_last_triager_defers_to_grace_sweep(tmp_path) -> None:
+    """Shrunk-to-zero is NOT the reconciliation's case: removing a source's
+    last triager must leave its ready observations to the no-triager sweep's
+    grace window (a newly-lodged triager can still claim recent work), never
+    consume them at reload time."""
+    _write_lodging(tmp_path)
+    clock = FakeClock(PINNED)
+    daemon = AngelusDaemon(tmp_path, clock=clock)
+    try:
+        oid = daemon.catalog.write_observation(
+            "scheduled/a", {"x": 1}, {"source": "scheduled/a"}
+        )
+        (tmp_path / "triagers" / "ta.yaml").unlink()
+        asyncio.run(daemon.apply_lodging(load_lodging(tmp_path)))
+        assert _observation_status(daemon.catalog, oid) == "ready"
+
+        # And the sweep's terminal-rule arm skips it too (empty lodged set
+        # never flips); only the grace expiry consumes it.
+        daemon._consume_sweep_once()
+        assert _observation_status(daemon.catalog, oid) == "ready"
     finally:
         daemon.connection.close()
 
