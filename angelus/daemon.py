@@ -82,6 +82,11 @@ def _change_signature(payload: dict[str, Any], outcome: str) -> str:
 DEFAULT_BELFRY_SENTINEL_FILENAME = "belfry-pinged-at"
 DEFAULT_BELFRY_STALE_AFTER_SEC = 1200
 
+# Consecutive check_failed fires on ONE source before the daemon opens the
+# internal/source alarm (see _note_source_fire_outcome). Overridable via
+# ANGELUS_SOURCE_FAIL_ALARM_AFTER (_source_fail_alarm_after).
+DEFAULT_SOURCE_FAIL_ALARM_AFTER = 3
+
 # Recent-window for the health surface's failed-dispatch count (B5). A nonzero
 # count over this window says "delivery is actively breaking now", distinct
 # from the open-internal-incident tally (which can persist across the window).
@@ -108,6 +113,14 @@ HEALTH_DEAD_LETTER_DISPLAY_LIMIT = 20
 # cleared (which would reintroduce the false-green render accepts). The one
 # residual: a one-shot / removed / very-long-cadence triager whose observation
 # went terminal can orphan like render; bounded by source cadence, left as-is.
+# internal/source (the per-source persistent-check-failure alarm) is likewise
+# excluded while its source stays lodged: it recovers off the source's next
+# successful fire, which a restart does not skip, and blind-clearing it would
+# go false-green for a source that is still failing. The in-memory failure
+# tally resetting at restart only delays a fresh alarm, never the clearance.
+# The one shape a restart DOES orphan -- the source was removed from lodging
+# while the daemon was down, so it never fires again -- is reconciled by a
+# dedicated branch in _reconcile_orphaned_internal_incidents.
 _RESTART_RECONCILED_INTERNAL_SOURCES = (
     "internal/lodging",
     "internal/dispatch",
@@ -168,6 +181,16 @@ class AngelusDaemon:
         self.scheduler_semaphore = asyncio.Semaphore(10)
         self.triage_semaphore = asyncio.Semaphore(10)
         self.triager_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        # Per-source consecutive check_failed tally for the fire-time failure
+        # alarm (_note_source_fire_outcome). Daemon-owned and in-memory BY
+        # DESIGN: observation collapse means repeat failures write no
+        # observation, so no triager/handler can ever count them -- the only
+        # seam that sees every fire is _fire_source. A restart resets the
+        # tally, which at worst delays a fresh alarm by the threshold while an
+        # already-open incident stays open (and still clears off the first
+        # successful fire, because the ok-path clearance is unconditional).
+        self._source_fail_counts: dict[str, int] = {}
+        self._source_fail_alarm_after = _source_fail_alarm_after()
         self.stop_event = asyncio.Event()
         self.tasks: list[asyncio.Task[None]] = []
         # Sole tracking site for per-pipe immediate-cadence loop tasks. Kept
@@ -414,6 +437,15 @@ class AngelusDaemon:
           false-green is preferred over a stale incident keeping belfry red and
           masking every OTHER signal until the once-daily digest runs.
 
+        One conditional case rides along: an internal/source incident whose
+        entity is no longer in lodging. internal/source normally recovers off
+        the entity's next fire (a live edge a restart does not skip while the
+        source stays lodged, so a lodged source's incident is left alone), but
+        a source REMOVED while the daemon was down never fires again -- its
+        incident has no remaining recovery edge and would keep belfry red
+        forever. The hot-reload path has the equivalent clearance in
+        apply_lodging.
+
         Each closes through write_internal_clearance -- the same path the live
         recovery edges use, so recent_closures stays correct and the gate
         re-arms. Gate-safe and idempotent: a no-op for any (source, entity)
@@ -424,12 +456,20 @@ class AngelusDaemon:
         reconciled: dict[str, int] = {}
         for incident in self.catalog.open_incidents():
             source = incident["source"]
-            if source not in _RESTART_RECONCILED_INTERNAL_SOURCES:
+            entity = incident["entity"]
+            if source in _RESTART_RECONCILED_INTERNAL_SOURCES:
+                body = f"{entity} reconciled at startup"
+            elif (
+                source == "internal/source"
+                and entity not in self.lodging.sources
+            ):
+                body = f"{entity} no longer lodged; reconciled at startup"
+            else:
                 continue
             self.catalog.write_internal_clearance(
                 source,
-                incident["entity"],
-                f"{incident['entity']} reconciled at startup",
+                entity,
+                body,
                 known_pipes,
             )
             reconciled[source] = reconciled.get(source, 0) + 1
@@ -1097,6 +1137,22 @@ class AngelusDaemon:
         new_sources = new_lodging.sources
         for ref in set(old_sources) - set(new_sources):
             self._remove_job(ref)
+            # A hot-removed source never fires again, so its consecutive-
+            # failure tally is dead state and an open internal/source incident
+            # has lost its only live recovery edge (the next successful fire)
+            # -- it would keep belfry red forever. Drop the tally (a re-added
+            # source starts fresh) and clear the incident; the clearance is a
+            # gate-dropped no-op when nothing is open. Synchronous and
+            # self-committing, cancel-safe like the other reload writes. The
+            # removed-while-down equivalent is reconciled at startup by
+            # _reconcile_orphaned_internal_incidents.
+            self._source_fail_counts.pop(ref, None)
+            self.catalog.write_internal_clearance(
+                "internal/source",
+                ref,
+                f"{ref} removed from lodging",
+                set(new_lodging.pipes),
+            )
             LOGGER.info("unregistered scheduled source %s", ref)
         for ref in set(new_sources) & set(old_sources):
             if old_sources[ref].cadence != new_sources[ref].cadence:
@@ -1258,7 +1314,77 @@ class AngelusDaemon:
             self.catalog.record_watch_check(
                 source.source_ref, signature, outcome, observation_id
             )
+            # Fire-time persistent-failure accounting: a collapsed repeat
+            # failure writes no observation (and the heartbeat above stays
+            # green), so this is the only seam that can count consecutive
+            # check_failed fires. See _note_source_fire_outcome.
+            self._note_source_fire_outcome(source.source_ref, outcome, payload)
             return observation_id, outcome
+
+    def _note_source_fire_outcome(
+        self, source_ref: str, outcome: str, payload: dict
+    ) -> None:
+        """Per-source persistent-failure alarm, evaluated on EVERY fire.
+
+        The repo-watch handlers deliberately skip check_failed observations
+        (no churn on a transient gh outage), and belfry catches only
+        daemon-wide breakage: a persistently failing check still bumps the
+        watch_state heartbeat on every fire, so the wedge and per-source SLA
+        checks stay green while the watch is blind (expired auth, a CLI
+        missing, an output-shape change). And observation collapse means a
+        repeat failure writes NO new observation -- same outcome, same folded
+        state token -- so the triage layer never even sees the repeats and
+        cannot count them. The consecutive-failure signal exists only here, at
+        fire time, in daemon-owned state.
+
+        After ANGELUS_SOURCE_FAIL_ALARM_AFTER consecutive check_failed fires
+        (default 3) this opens an internal/source incident, which rides the
+        existing internal/* machinery: it fans to every channel through the
+        now pipe (B7), keeps belfry red while open (the open-internal-incident
+        check), and surfaces in health. Blips of 1..N-1 failed fires stay
+        silent, preserving the handlers' no-churn intent. Past the threshold
+        the write repeats every fire and the B30 emission gate drops it while
+        the incident is open -- and deliberately RE-opens it if an operator
+        closes the incident while the check is still failing, because the
+        condition persists.
+
+        Recovery is edge-triggered: a successful fire resets the tally and
+        emits the paired clearance, gate-dropped to a no-op when nothing is
+        open. The clearance fires unconditionally on ok -- not only when the
+        in-memory tally is nonzero -- because the tally is process state: an
+        incident left open across a restart must still clear on the new
+        process's first healthy fire.
+
+        Domain-agnostic on purpose: nothing here names gh. ANY source whose
+        check persistently fails gets the same alarm.
+        """
+        known_pipes = set(self.lodging.pipes)
+        if outcome == "check_failed":
+            count = self._source_fail_counts.get(source_ref, 0) + 1
+            self._source_fail_counts[source_ref] = count
+            if count < self._source_fail_alarm_after:
+                return
+            # run_shell_source always sets "error" on a failed check; trim it
+            # so a pathological stderr cannot bloat the finding body.
+            error = str(payload.get("error") or "")[:500]
+            self.catalog.write_internal_finding(
+                "internal/source",
+                "source_check_failing",
+                source_ref,
+                f"{source_ref} check has failed {count} consecutive fires "
+                f"(alarm threshold {self._source_fail_alarm_after}); the "
+                f"watch is blind until it recovers; latest error: "
+                f"{error or 'unknown'}",
+                known_pipes,
+            )
+        else:
+            self._source_fail_counts.pop(source_ref, None)
+            self.catalog.write_internal_clearance(
+                "internal/source",
+                source_ref,
+                f"{source_ref} check succeeded",
+                known_pipes,
+            )
 
     def _discover_ready_triage(self) -> list[tuple]:
         """One discovery sweep across every lodged triager: the ready
@@ -1683,6 +1809,36 @@ def _belfry_stale_after_seconds() -> int:
         )
         return DEFAULT_BELFRY_STALE_AFTER_SEC
     return seconds
+
+
+def _source_fail_alarm_after() -> int:
+    """Consecutive check_failed fires on one source before the internal/source
+    alarm opens (_note_source_fire_outcome).
+
+    ANGELUS_SOURCE_FAIL_ALARM_AFTER overrides; default is 3 fires -- enough
+    that a transient blip (one flaky fire, a brief gh outage spanning a tick
+    or two) never pages, while a persistently broken check alarms within a
+    few cadences. Read once at daemon construction. Invalid or non-positive
+    overrides fall back to the default so a misconfigured env can never
+    disable the alarm (1 is the floor: alarm on every failed fire).
+    """
+    raw = os.environ.get("ANGELUS_SOURCE_FAIL_ALARM_AFTER")
+    if raw is None:
+        return DEFAULT_SOURCE_FAIL_ALARM_AFTER
+    try:
+        fires = int(raw)
+    except ValueError:
+        LOGGER.warning(
+            "invalid ANGELUS_SOURCE_FAIL_ALARM_AFTER=%r; using default", raw
+        )
+        return DEFAULT_SOURCE_FAIL_ALARM_AFTER
+    if fires <= 0:
+        LOGGER.warning(
+            "ANGELUS_SOURCE_FAIL_ALARM_AFTER=%d must be positive; using default",
+            fires,
+        )
+        return DEFAULT_SOURCE_FAIL_ALARM_AFTER
+    return fires
 
 
 def _belfry_status(root: Path, clock: Clock | None = None) -> dict:

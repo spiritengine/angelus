@@ -297,6 +297,20 @@ grace), and a malformed value fails the config load loudly rather than silently
 disabling the check. Immediate pipes (`now`) declare no interval and opt out —
 they deliver on demand with no cadence to lapse against.
 
+**Per-source check-failure alarm.** The layers above catch a daemon that is
+dead, wedged, or not delivering — but a source whose *check* persistently
+fails (expired `gh` auth, a CLI missing, an output-shape change) leaves that
+one watch blind while everything stays green: the heartbeat advances on every
+fire (failed or not), triagers deliberately skip `check_failed` observations
+to avoid churn, and observation collapse means repeat failures write no
+observation a triager could count anyway. So the daemon itself counts
+consecutive `check_failed` fires per source at fire time, and after
+`ANGELUS_SOURCE_FAIL_ALARM_AFTER` of them (default 3) opens an
+`internal/source` incident — which rides the standard internal machinery:
+fans to every channel through `now`, keeps belfry red while open, and shows
+in `angelus health`. Shorter blips stay silent. The first successful fire
+clears it. Domain-agnostic: any source, not just the gh watches.
+
 Setup:
 
 1. Register two healthchecks.io URLs as described in `belfry/healthchecks.example`.

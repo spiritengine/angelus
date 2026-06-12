@@ -61,7 +61,10 @@ def main() -> None:
     already_alerted = set(_coerce_pr_number_list(prior_state.get("alerted_prs")))
 
     # check_failed: skip, like gh_actions_status. The daily pipe doesn't
-    # need monitoring-broken noise; belfry catches daemon-wide outages.
+    # need monitoring-broken noise; the daemon's fire-time internal/source
+    # alarm covers a persistently failing check (collapse hides the
+    # repeats from this layer -- see _note_source_fire_outcome) and belfry
+    # catches daemon-wide outages.
     # Pass alerted_prs through untouched so a transient gh outage doesn't
     # collapse to an empty set and trigger a spurious clearance on the
     # next successful check. Spread prior_state so any future state keys
