@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import threading
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -61,12 +62,22 @@ DIGEST_HEARTBEAT_URL_ENV = "ANGELUS_DIGEST_HEARTBEAT_URL"
 
 # Per-operation socket timeout for the dead-man ping (passed to urlopen, which
 # applies it to each connect/recv -- NOT as a single total wall-clock bound).
-# Kept short because the ping is best-effort and runs inside the digest drain,
-# which the daemon awaits on shutdown: a fast endpoint (healthchecks.io) returns
-# well within this, so the drain (and shutdown's bounded await of it) is not
-# delayed in practice. A pathological trickle from the operator's own healthcheck
-# URL is the only residual -- bounded per-recv, capped read below, accepted.
+# Kept short because the ping is best-effort: a fast endpoint
+# (healthchecks.io) returns well within this.
 DIGEST_HEARTBEAT_TIMEOUT_SEC = 5.0
+
+# TOTAL wall-clock bound on the dead-man ping, enforced by the awaiting drain
+# (the per-operation socket timeout above cannot give one: a trickling
+# endpoint that feeds a byte per recv resets it indefinitely). Past this the
+# drain logs and moves on, ABANDONING the ping thread -- which is safe only
+# because that thread is an explicit daemon thread (see
+# _ping_digest_heartbeat), so an abandoned ping can never hold process exit
+# open. Bounds how long a misbehaving endpoint can delay the tail of a digest
+# drain; kept under the daemon's shutdown teardown budget
+# (DEFAULT_SHUTDOWN_BUDGET_SEC=7.0) by construction, though shutdown never
+# actually waits this long -- cancellation of the drain task lands at the
+# event-wait immediately (13w0 fell-r2).
+DIGEST_HEARTBEAT_TOTAL_DEADLINE_SEC = 5.0
 
 
 @dataclass(frozen=True)
@@ -989,31 +1000,69 @@ class PipeDrain:
     async def _ping_digest_heartbeat(self) -> None:
         """Best-effort dead-man ping after a successful digest drain.
 
-        Inert unless ``ANGELUS_DIGEST_HEARTBEAT_URL`` is set. Never raises:
-        the digest has already been delivered and recorded by the time this
-        runs, so a ping failure must not turn a delivered digest into an
-        error. Run in a thread so the blocking urlopen cannot stall the event
-        loop. The per-operation socket timeout (not a single total bound) plus
-        the capped read in ``_get_url`` keep a misbehaving endpoint from
-        meaningfully delaying the drain; a fast healthcheck endpoint returns
-        well under it.
+        Inert unless ``ANGELUS_DIGEST_HEARTBEAT_URL`` is set. Never raises
+        (other than propagating cancellation): the digest has already been
+        delivered and recorded by the time this runs, so a ping failure must
+        not turn a delivered digest into an error.
+
+        The blocking urlopen runs on an EXPLICIT DAEMON THREAD -- deliberately
+        not asyncio.to_thread, whose default-ThreadPoolExecutor workers are
+        non-daemon. A non-daemon worker stuck in a trickling endpoint (the
+        per-socket-operation timeout never gives a total bound) would be
+        joined by the interpreter's threading._shutdown atexit hook and hold
+        PROCESS EXIT open past the daemon's whole teardown budget; bounded
+        event-loop waits cannot help because that join happens outside the
+        loop (13w0 fell-r2). A daemon thread is abandonable by design, which
+        matches the ping's contract: it must never block or fail the digest.
+
+        Two bounds follow from the same design:
+          * Cancellation (shutdown reaping the drain task) lands at the
+            event-wait below immediately, abandoning the worker thread --
+            now harmless rather than exit-blocking.
+          * A total deadline (DIGEST_HEARTBEAT_TOTAL_DEADLINE_SEC) bounds how
+            long a misbehaving endpoint can delay the drain tail in normal
+            operation; past it the ping is logged as abandoned and the thread
+            left to finish (or not) on its own.
         """
         url = os.environ.get(DIGEST_HEARTBEAT_URL_ENV)
         if not url:
             return
+        loop = asyncio.get_running_loop()
+        finished = asyncio.Event()
+        outcome: dict[str, BaseException] = {}
+
+        def _ping() -> None:
+            try:
+                _get_url(url, DIGEST_HEARTBEAT_TIMEOUT_SEC)
+            except BaseException as exc:  # noqa: BLE001 -- reported below
+                outcome["exc"] = exc
+            finally:
+                try:
+                    loop.call_soon_threadsafe(finished.set)
+                except RuntimeError:
+                    # Loop already closed: the ping was abandoned at process
+                    # exit and nobody is waiting on the event any more.
+                    pass
+
+        threading.Thread(
+            target=_ping, name="digest-heartbeat", daemon=True
+        ).start()
         try:
-            await asyncio.to_thread(_get_url, url, DIGEST_HEARTBEAT_TIMEOUT_SEC)
+            await asyncio.wait_for(
+                finished.wait(), timeout=DIGEST_HEARTBEAT_TOTAL_DEADLINE_SEC
+            )
+        except TimeoutError:
+            LOGGER.warning(
+                "digest heartbeat ping to %s still running after %.1fs total; "
+                "abandoning it (daemon thread; cannot block exit)",
+                DIGEST_HEARTBEAT_URL_ENV,
+                DIGEST_HEARTBEAT_TOTAL_DEADLINE_SEC,
+            )
+            return
+        exc = outcome.get("exc")
+        if exc is None:
             LOGGER.info("digest heartbeat pinged %s", DIGEST_HEARTBEAT_URL_ENV)
-        except asyncio.CancelledError:
-            # Shutdown cancelled the drain task mid-ping. asyncio cannot cancel
-            # a running thread, so this await defers the cancellation until the
-            # urlopen thread returns (bounded per-operation by the socket
-            # timeout) and then raises CancelledError; re-raise so teardown
-            # sees it. Worst case it adds up to a few sequential socket-timeouts
-            # (connect + header recv + the capped read) to the daemon's
-            # already-bounded drain-shutdown wait.
-            raise
-        except Exception as exc:
+        else:
             LOGGER.warning(
                 "digest heartbeat ping to %s failed: %s",
                 DIGEST_HEARTBEAT_URL_ENV,

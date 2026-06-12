@@ -512,6 +512,165 @@ def test_process_exit_is_bounded_despite_cancel_swallowing_straggler(
             proc.communicate()
 
 
+def test_process_exit_bounded_with_every_post_run_finalization_wedged(
+    tmp_path,
+) -> None:
+    """THE fell-r2 test, covering both round-2 findings at the real entry:
+
+    Finding 1 (stuck default-executor worker): an asyncio.to_thread worker
+    parked in time.sleep(30) occupies a NON-DAEMON default-executor thread.
+    No event-loop wait can bound it -- cancelling its task abandons the
+    asyncio future, not the OS thread, and the interpreter's
+    threading._shutdown atexit hook then JOINS the worker, holding process
+    exit open after every Python-level cleanup has finished. The
+    lingering-thread backstop (_force_exit_if_nondaemon_threads_linger) must
+    force the exit instead.
+
+    Finding 2 (stacked post-run floors): with run()'s budget fully consumed
+    by a wedged drain, the straggler grace, the asyncgen finalization, and
+    the executor finalization must draw down ONE shared
+    max(leftover, _EXIT_WAIT_FLOOR_SEC) pool -- so this test wedges all
+    three at once (a cancel-swallowing straggler, an asyncgen whose finally
+    swallows cancellation forever, and the stuck executor worker above) and
+    asserts the total.
+
+    Timing (budget patched to 1.5s, floor patched to 1.0s for a wide
+    discrimination margin): post-fix exit is ~1.5 (teardown) + ~1.0 (one
+    shared post-run pool) ~= 2.5s < the 3.5s assertion.
+
+    Discrimination (mutation-verified against bc609b3): pre-fix the process
+    never exits at all -- the bounded waits expire, the loop closes, and
+    threading._shutdown blocks on the sleeping worker for the full 30s, so
+    communicate(timeout=15) trips -> red. With only the backstop grafted on
+    (Finding 1 fixed, floors still stacked), exit lands at
+    1.5 + 1.0*3 = ~4.5s -> the 3.5s assertion is red. Only the combination
+    passes."""
+    _minimal_lodging(tmp_path)
+    repo_root = Path(angelus.daemon.__file__).resolve().parents[1]
+    script = tmp_path / "entry_under_test.py"
+    script.write_text(
+        textwrap.dedent(
+            f"""\
+            import asyncio
+            import time
+            from pathlib import Path
+
+            import angelus.daemon as d
+
+            root = Path({str(tmp_path)!r})
+
+            d._shutdown_budget_seconds = lambda: 1.5
+            d._EXIT_WAIT_FLOOR_SEC = 1.0
+
+            HOLD = []
+
+
+            async def swallow_cancels_forever():
+                while True:
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        pass  # never dies
+
+
+            async def wedged_gen():
+                try:
+                    yield 1
+                finally:
+                    # aclose() throws GeneratorExit here; this await then
+                    # wedges the asyncgen-shutdown finalization forever.
+                    while True:
+                        try:
+                            await asyncio.Event().wait()
+                        except asyncio.CancelledError:
+                            pass
+
+
+            async def prime_asyncgen():
+                gen = wedged_gen()
+                await gen.__anext__()
+                HOLD.append(gen)  # keep it alive for shutdown_asyncgens
+
+
+            class WedgedDaemon(d.AngelusDaemon):
+                def _install_signal_handlers(self):
+                    super()._install_signal_handlers()
+                    loop = asyncio.get_running_loop()
+                    # Wedge 0: a drain that swallows cancellation, so run()'s
+                    # teardown consumes its ENTIRE budget and the post-run
+                    # stages start from leftover ~0 (the floor case).
+                    self._drain_tasks.add(
+                        loop.create_task(swallow_cancels_forever())
+                    )
+                    # Wedge 1: an untracked straggler for the post-run grace.
+                    loop.create_task(swallow_cancels_forever())
+                    # Wedge 2: an asyncgen whose finalization never finishes.
+                    loop.create_task(prime_asyncgen())
+                    # Wedge 3: a stuck NON-DAEMON default-executor worker --
+                    # the thread that holds process exit open pre-fix.
+                    loop.create_task(asyncio.to_thread(time.sleep, 30.0))
+                    (root / "ready.marker").touch()
+
+
+            d.AngelusDaemon = WedgedDaemon
+            d.main(root)
+            """
+        ),
+        encoding="utf-8",
+    )
+    env = dict(
+        os.environ,
+        ANGELUS_DRY_RUN="1",
+        PYTHONPATH=os.pathsep.join(
+            p
+            for p in (str(repo_root), os.environ.get("PYTHONPATH"))
+            if p
+        ),
+    )
+    proc = subprocess.Popen(
+        [sys.executable, str(script)],
+        env=env,
+        cwd=str(tmp_path),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        ready = tmp_path / "ready.marker"
+        boot_deadline = time.monotonic() + 30
+        while not ready.exists():
+            if proc.poll() is not None:
+                raise AssertionError(
+                    "daemon under test died during startup:\n"
+                    + proc.communicate()[1]
+                )
+            if time.monotonic() > boot_deadline:
+                raise AssertionError("daemon under test never came up")
+            time.sleep(0.05)
+        started = time.monotonic()
+        proc.send_signal(signal.SIGTERM)
+        try:
+            _, err = proc.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            raise AssertionError(
+                "process never exited after SIGTERM -- a stuck non-daemon "
+                "executor worker held exit open in threading._shutdown"
+            )
+        elapsed = time.monotonic() - started
+        assert proc.returncode == 0, err
+        assert elapsed < 3.5, (
+            f"process exit took {elapsed:.1f}s -- the post-run finalizations "
+            "drew stacked floors instead of one shared exit allowance"
+        )
+        # The backstop -- not luck -- ended the process: the loud force-exit
+        # line names the lingering executor worker (mirrored to stderr).
+        assert "forcing process exit" in err, err
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+
+
 def test_cleanup_tail_runs_when_teardown_itself_is_cancelled(
     tmp_path, monkeypatch
 ) -> None:
@@ -589,9 +748,19 @@ def test_shutdown_budget_env_parsing(monkeypatch) -> None:
 def test_default_budget_leaves_room_for_a_reap_arm() -> None:
     """The constants' invariant, pinned: the default shared budget must
     exceed _kill_and_reap's _REAP_TIMEOUT (so one cancelled reap arm can
-    always finish) and -- together with the entry runner's post-run()
-    straggler-wait floor -- stay under the integration fell's 8s no-hang
-    bound, so PROCESS EXIT (not just run()'s return) keeps the promise."""
+    always finish) and -- together with the entry runner's TOTAL worst-case
+    post-run() allowance -- stay under the integration fell's 8s no-hang
+    bound, so PROCESS EXIT (not just run()'s return) keeps the promise.
+
+    The post-run() allowance is ONE _EXIT_WAIT_FLOOR_SEC, total: the
+    straggler grace, the asyncgen finalization, and the default-executor
+    finalization all draw down a single shared max(leftover, floor) deadline
+    in _finish_loop_bounded. Before 13w0 fell-r2 each stage took a fresh
+    floor, so this assertion held (7.5 < 8) while the real worst case was
+    budget + 3 floors = 8.5s -- the expression below is the true bound only
+    as long as the post-run stages stay on one shared pool, which
+    test_process_exit_bounded_with_every_post_run_finalization_wedged pins
+    behaviorally."""
     from angelus.sources.runner import _REAP_TIMEOUT
 
     assert DEFAULT_SHUTDOWN_BUDGET_SEC > _REAP_TIMEOUT

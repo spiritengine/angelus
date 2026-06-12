@@ -8,6 +8,8 @@ import json
 import logging
 import os
 import signal
+import sys
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -131,9 +133,15 @@ _RESTART_RECONCILED_INTERNAL_SOURCES = (
 # fixer mid-handler, an immediate send mid-transport) gets to run its reap
 # arm to completion and its spawned process group is reaped, not orphaned --
 # while a genuinely wedged task still cannot hang shutdown past the bound.
-# Kept comfortably under the integration fell's 8.0s no-hang assertion (and
-# far under systemd's SIGTERM->SIGKILL stop grace), so the daemon's promise
-# of a sub-8s no-hang shutdown holds even with every stage wedged at once.
+# Kept under the integration fell's 8.0s no-hang assertion (and far under
+# systemd's SIGTERM->SIGKILL stop grace) TOGETHER with the entry runner's
+# post-run() allowance: everything after run() returns -- the straggler
+# grace, asyncgen finalization, and default-executor finalization -- draws
+# down ONE shared pool of max(leftover budget, _EXIT_WAIT_FLOOR_SEC), never a
+# fresh floor per stage (13w0 fell-r2: stacked floors put the worst case at
+# budget + 3 floors = 8.5s). Worst case with every stage wedged at once is
+# therefore budget + ONE floor = 7.5s < 8.0, pinned by
+# test_default_budget_leaves_room_for_a_reap_arm.
 DEFAULT_SHUTDOWN_BUDGET_SEC = 7.0
 
 
@@ -2127,13 +2135,17 @@ def main(root: Path | None = None) -> None:
     _run_daemon_to_exit(AngelusDaemon(root))
 
 
-# Floor for _run_daemon_to_exit's post-run() straggler wait. run()'s teardown
-# usually leaves most of the budget unspent, but when the budget expired
-# exactly (every stage wedged at once) the leftover is ~0 -- the floor
-# guarantees a just-force-cancelled task still gets a beat to finish
-# unwinding before the loop closes. Kept small enough that
-# DEFAULT_SHUTDOWN_BUDGET_SEC + this floor stays under the 8s no-hang promise
-# (pinned by test_default_budget_leaves_room_for_a_reap_arm).
+# Floor for the ONE post-run() pool every exit finalization shares. run()'s
+# teardown usually leaves most of the budget unspent, but when the budget
+# expired exactly (every stage wedged at once) the leftover is ~0 -- the
+# floor guarantees a just-force-cancelled task still gets a beat to finish
+# unwinding before the loop closes. The straggler grace, the asyncgen
+# finalization, and the default-executor finalization all draw down the SAME
+# max(leftover, floor) deadline -- never a fresh floor each (13w0 fell-r2:
+# three stacked floors made worst-case exit budget + 1.5s = 8.5s, past the
+# promise). Kept small enough that DEFAULT_SHUTDOWN_BUDGET_SEC + this ONE
+# floor stays under the 8s no-hang promise (pinned by
+# test_default_budget_leaves_room_for_a_reap_arm).
 _EXIT_WAIT_FLOOR_SEC = 0.5
 
 
@@ -2151,13 +2163,22 @@ def _run_daemon_to_exit(daemon: AngelusDaemon) -> None:
     cancellation-honouring stragglers serialize their reap tails there,
     stretching exit to budget + N*_REAP_TIMEOUT (13w0 fell-r1).
 
-    Instead, the stragglers get ONE bounded asyncio.wait drawn from whatever
-    is left of run()'s teardown deadline (floored at _EXIT_WAIT_FLOOR_SEC),
-    then the loop is closed deliberately. Abandoning a straggler at loop
-    close orphans no process group: _kill_and_reap issues its killpg
-    synchronously before its first await (sources/runner.py), so by the time
-    a reap tail can be abandoned the kill has already been delivered -- the
-    cost is a destroyed-pending-task log line, never a leaked subtree.
+    Instead, the stragglers, the asyncgen finalization, and the
+    default-executor finalization together get ONE bounded pool drawn from
+    whatever is left of run()'s teardown deadline (floored at
+    _EXIT_WAIT_FLOOR_SEC -- shared, so wedging all three still costs one
+    floor, not three), then the loop is closed deliberately. Abandoning a
+    straggler at loop close orphans no process group: _kill_and_reap issues
+    its killpg synchronously before its first await (sources/runner.py), so
+    by the time a reap tail can be abandoned the kill has already been
+    delivered -- the cost is a destroyed-pending-task log line, never a
+    leaked subtree.
+
+    Last, the lingering-thread backstop: a non-daemon thread the bounded
+    finalization had to abandon (a stuck default-executor worker is the
+    canonical case) would still hold exit open in threading._shutdown, OUTSIDE
+    anything an event-loop wait can bound -- so if one provably lingers after
+    loop close, the process force-exits (13w0 fell-r2).
     """
     loop = asyncio.new_event_loop()
     try:
@@ -2169,22 +2190,36 @@ def _run_daemon_to_exit(daemon: AngelusDaemon) -> None:
     finally:
         asyncio.set_event_loop(None)
         loop.close()
+        _force_exit_if_nondaemon_threads_linger()
 
 
 def _finish_loop_bounded(
     loop: asyncio.AbstractEventLoop, teardown_deadline: float | None
 ) -> None:
-    """Bounded stand-in for the unbounded half of asyncio.run()'s cleanup."""
+    """Bounded stand-in for the unbounded half of asyncio.run()'s cleanup.
+
+    Every wait below -- the straggler grace AND the two finalization stages
+    -- draws remaining time from ONE deadline of max(what is left of run()'s
+    teardown budget, _EXIT_WAIT_FLOOR_SEC). The stages must not each take a
+    fresh floor: with run()'s budget already exhausted, three sequential
+    floors put process exit at budget + 1.5s = 8.5s, past the 8s no-hang
+    promise (13w0 fell-r2). Shared, the worst case is budget + one floor.
+    """
     leftover = (
         0.0
         if teardown_deadline is None
         else teardown_deadline - time.monotonic()
     )
-    grace = max(_EXIT_WAIT_FLOOR_SEC, leftover)
+    deadline = time.monotonic() + max(_EXIT_WAIT_FLOOR_SEC, leftover)
+
+    def _remaining() -> float:
+        return max(0.0, deadline - time.monotonic())
+
     stragglers = [t for t in asyncio.all_tasks(loop) if not t.done()]
     if stragglers:
         for task in stragglers:
             task.cancel()
+        grace = _remaining()
         _, still_pending = loop.run_until_complete(
             asyncio.wait(stragglers, timeout=grace)
         )
@@ -2195,23 +2230,84 @@ def _finish_loop_bounded(
                 len(still_pending),
                 grace,
             )
+
     # The same asyncgen/default-executor finalization asyncio.run() performs,
-    # with its unbounded waits replaced by the floor: a wedged aclose() or a
-    # stuck default-executor thread (a to_thread heartbeat GET mid-flight)
-    # must not hold the exit open either. loop.close() shuts the executor
-    # down wait=False if the bounded join here gave up.
-    for label, coro in (
-        ("asyncgen shutdown", loop.shutdown_asyncgens()),
-        ("default-executor shutdown", loop.shutdown_default_executor()),
+    # with its unbounded waits bounded by the shared deadline: a wedged
+    # aclose() or a stuck default-executor thread must not hold the exit open
+    # either. loop.close() shuts the executor down wait=False if the bounded
+    # join here gave up. shutdown_default_executor gets the remaining time as
+    # its internal join timeout too (3.12+; its non-daemon join-helper thread
+    # is otherwise unbounded) -- but a worker stuck in a syscall is
+    # un-joinable no matter what, which is why the in-tree heartbeat GET runs
+    # on its own daemon thread (pipes/runner.py) and why
+    # _force_exit_if_nondaemon_threads_linger backstops the whole exit.
+    def _shutdown_asyncgens() -> Any:
+        return loop.shutdown_asyncgens()
+
+    def _shutdown_executor() -> Any:
+        try:
+            return loop.shutdown_default_executor(timeout=_remaining())
+        except TypeError:
+            # Python 3.11: no timeout parameter.
+            return loop.shutdown_default_executor()
+
+    for label, make_coro in (
+        ("asyncgen shutdown", _shutdown_asyncgens),
+        ("default-executor shutdown", _shutdown_executor),
     ):
-        task = loop.create_task(coro)
+        task = loop.create_task(make_coro())
+        granted = _remaining()
         done, _ = loop.run_until_complete(
-            asyncio.wait([task], timeout=_EXIT_WAIT_FLOOR_SEC)
+            asyncio.wait([task], timeout=granted)
         )
         if not done:
             task.cancel()
             LOGGER.warning(
-                "%s did not finish within %.1fs at exit; abandoning it",
+                "%s did not finish within its %.1fs slice of the shared "
+                "exit allowance; abandoning it",
                 label,
-                _EXIT_WAIT_FLOOR_SEC,
+                granted,
             )
+
+
+def _force_exit_if_nondaemon_threads_linger() -> None:
+    """Force process exit when an abandoned non-daemon thread would hang it.
+
+    The bounded teardown can abandon work inside the event loop, but a
+    NON-DAEMON thread it abandoned -- a default-executor worker stuck in a
+    trickling socket read, or shutdown_default_executor's join helper waiting
+    on that worker -- is joined by the interpreter's threading._shutdown
+    atexit hook, holding exit open for as long as the thread runs. That join
+    happens after every Python-level cleanup, so no event-loop bound can
+    reach it; the only remaining lever is os._exit (13w0 fell-r2).
+
+    Gated narrowly: fires only when a live non-daemon thread provably
+    lingers after the loop is closed, and logs each by name first. Skipping
+    interpreter finalization here is safe -- run()'s cleanup tail has already
+    removed the pid file and control socket and closed the sqlite connection,
+    every reap arm issues its killpg synchronously before its first await,
+    and the alternative is exactly the unbounded hang the shutdown budget
+    exists to kill. Exits 0 on a clean (signal-driven) shutdown so systemd's
+    Restart=on-failure does not respin the daemon; if an exception is
+    mid-propagation it is logged here (it would otherwise be silenced) and
+    the exit code is 1.
+    """
+    lingering = [
+        thread
+        for thread in threading.enumerate()
+        if thread.is_alive()
+        and not thread.daemon
+        and thread is not threading.main_thread()
+    ]
+    if not lingering:
+        return
+    in_flight = sys.exc_info()[1]
+    LOGGER.error(
+        "%d non-daemon thread(s) still running after the bounded teardown "
+        "(%s); forcing process exit so threading._shutdown cannot hang it",
+        len(lingering),
+        ", ".join(sorted(thread.name for thread in lingering)),
+        exc_info=in_flight,
+    )
+    logging.shutdown()
+    os._exit(0 if in_flight is None else 1)
