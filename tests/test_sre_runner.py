@@ -78,7 +78,7 @@ def test_no_sentinel_no_spawn(tmp_path):
 
     with patch.object(runner, "spindle_spin") as mock_spin, \
          patch.object(runner, "notify_pat") as mock_notify:
-        rc = runner._run(tmp_path, state)
+        rc = runner._run(state)
 
     assert rc == 0
     mock_spin.assert_not_called()
@@ -100,7 +100,7 @@ def test_fresh_incident_spawns_once(tmp_path):
          patch.object(runner, "spindle_wait", return_value="completed"), \
          patch.object(runner, "check_daemon_healthy", return_value=True), \
          patch.object(runner, "notify_pat") as mock_notify:
-        rc = runner._run(tmp_path, state)
+        rc = runner._run(state)
 
     assert rc == 0
     mock_spin.assert_called_once()
@@ -153,7 +153,7 @@ def test_spawn_invocation_shape(tmp_path):
          patch.object(runner, "spindle_wait", return_value="completed"), \
          patch.object(runner, "check_daemon_healthy", return_value=True), \
          patch.object(runner, "notify_pat"):
-        runner._run(tmp_path, state)
+        runner._run(state)
 
     prompt = captured_prompt["v"]
     working_dir = captured_working_dir["v"]
@@ -193,7 +193,7 @@ def test_min_interval_throttle(tmp_path):
     with patch.dict(os.environ, {"ANGELUS_SRE_MIN_INTERVAL_SEC": "2700"}), \
          patch.object(runner, "spindle_spin") as mock_spin, \
          patch.object(runner, "notify_pat") as mock_notify:
-        rc = runner._run(tmp_path, state)
+        rc = runner._run(state)
 
     assert rc == 0
     mock_spin.assert_not_called()
@@ -222,7 +222,7 @@ def test_max_spawns_cap_triggers_escalation(tmp_path):
     }), \
          patch.object(runner, "spindle_spin") as mock_spin, \
          patch.object(runner, "notify_pat") as mock_notify:
-        rc = runner._run(tmp_path, state)
+        rc = runner._run(state)
 
     assert rc == 0
     mock_spin.assert_not_called()
@@ -255,7 +255,7 @@ def test_fail_safe_unreadable_spawn_log(tmp_path):
     with patch.object(runner, "read_spawn_log", side_effect=OSError("EIO")), \
          patch.object(runner, "spindle_spin") as mock_spin, \
          patch.object(runner, "notify_pat"):
-        rc = runner._run(tmp_path, state)
+        rc = runner._run(state)
 
     assert rc == 0
     mock_spin.assert_not_called()
@@ -271,7 +271,7 @@ def test_fail_safe_unreadable_last_spawn(tmp_path):
     with patch.object(runner, "read_last_spawn_ts", side_effect=OSError("EPERM")), \
          patch.object(runner, "spindle_spin") as mock_spin, \
          patch.object(runner, "notify_pat"):
-        rc = runner._run(tmp_path, state)
+        rc = runner._run(state)
 
     assert rc == 0
     mock_spin.assert_not_called()
@@ -287,7 +287,7 @@ def test_fail_safe_unwritable_spawn_log(tmp_path):
     with patch.object(runner, "write_spawn_log", return_value=False), \
          patch.object(runner, "spindle_spin") as mock_spin, \
          patch.object(runner, "notify_pat"):
-        rc = runner._run(tmp_path, state)
+        rc = runner._run(state)
 
     assert rc == 0
     mock_spin.assert_not_called()
@@ -303,7 +303,7 @@ def test_fail_safe_write_last_spawn_ts_fails_no_spawn(tmp_path):
     with patch.object(runner, "write_last_spawn_ts", return_value=False), \
          patch.object(runner, "spindle_spin") as mock_spin, \
          patch.object(runner, "notify_pat"):
-        rc = runner._run(tmp_path, state)
+        rc = runner._run(state)
 
     assert rc == 0
     mock_spin.assert_not_called()
@@ -323,7 +323,7 @@ def test_failed_spawn_counts_toward_both_guards(tmp_path):
 
     with patch.object(runner, "spindle_spin", return_value=None) as mock_spin, \
          patch.object(runner, "notify_pat"):
-        rc = runner._run(tmp_path, state)
+        rc = runner._run(state)
 
     after = time.time()
 
@@ -360,7 +360,7 @@ def test_sentinel_cleared_when_daemon_healthy(tmp_path):
          patch.object(runner, "spindle_wait", return_value="completed"), \
          patch.object(runner, "check_daemon_healthy", return_value=True), \
          patch.object(runner, "notify_pat"):
-        runner._run(tmp_path, state)
+        runner._run(state)
 
     assert not (state / "belfry-needs-sre").exists()
     # spawn state also cleared
@@ -376,7 +376,7 @@ def test_sentinel_retained_when_daemon_still_down(tmp_path):
          patch.object(runner, "spindle_wait", return_value="completed"), \
          patch.object(runner, "check_daemon_healthy", return_value=False), \
          patch.object(runner, "notify_pat") as mock_notify:
-        runner._run(tmp_path, state)
+        runner._run(state)
 
     assert (state / "belfry-needs-sre").exists()
     mock_notify.assert_called_once()
@@ -424,7 +424,7 @@ def test_timeout_retains_sentinel(tmp_path):
          patch.object(runner, "spindle_wait", return_value="timeout"), \
          patch.object(runner, "check_daemon_healthy", return_value=False), \
          patch.object(runner, "notify_pat") as mock_notify:
-        runner._run(tmp_path, state)
+        runner._run(state)
 
     assert (state / "belfry-needs-sre").exists()
     mock_notify.assert_called_once()
@@ -445,7 +445,7 @@ def test_fixers_log_spawn_line(tmp_path):
          patch.object(runner, "spindle_wait", return_value="completed"), \
          patch.object(runner, "check_daemon_healthy", return_value=True), \
          patch.object(runner, "notify_pat"):
-        runner._run(tmp_path, state)
+        runner._run(state)
 
     log_lines = _read_fixers_log(state)
     spawn_lines = [l for l in log_lines if "action=spawn" in l]
@@ -477,7 +477,7 @@ def test_spawn_env_contains_writable_binds(tmp_path):
          patch.object(runner, "spindle_wait", return_value="completed"), \
          patch.object(runner, "check_daemon_healthy", return_value=True), \
          patch.object(runner, "notify_pat"):
-        runner._run(tmp_path, state)
+        runner._run(state)
 
     env = captured_env["v"]
     assert env is not None
@@ -502,7 +502,7 @@ def test_spawn_env_appends_existing_writable_binds(tmp_path):
          patch.object(runner, "spindle_wait", return_value="completed"), \
          patch.object(runner, "check_daemon_healthy", return_value=True), \
          patch.object(runner, "notify_pat"):
-        runner._run(tmp_path, state)
+        runner._run(state)
 
     env = captured_env["v"]
     assert env is not None
@@ -527,6 +527,6 @@ def test_reports_dir_created_before_spawn(tmp_path):
          patch.object(runner, "spindle_wait", return_value="completed"), \
          patch.object(runner, "check_daemon_healthy", return_value=True), \
          patch.object(runner, "notify_pat"):
-        runner._run(tmp_path, state)
+        runner._run(state)
 
     assert dir_existed_at_spin["v"] is True
