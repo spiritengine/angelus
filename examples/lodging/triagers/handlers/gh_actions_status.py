@@ -47,10 +47,13 @@ def main() -> None:
     # green or red. Emitting `down` would be noisy on transient gh
     # outages; emitting nothing leaves a real visibility hole. The
     # compromise: skip entirely so per-repo monitoring failures don't
-    # churn alerts, but rely on the belfry layer (out-of-process,
-    # see angelus README) to catch daemon-wide breakage. If we want
-    # per-watch monitoring alarms later, add a separate watch routing
-    # check_failed to the daily pipe with severity=low.
+    # churn alerts. The skip is safe because the blind-watch hole is
+    # covered one level down: the daemon counts consecutive check_failed
+    # fires per source at fire time (collapse means we'd never see the
+    # repeats here) and opens an internal/source alarm when a check is
+    # persistently failing -- see AngelusDaemon._note_source_fire_outcome.
+    # Belfry separately catches daemon-wide breakage (out-of-process,
+    # see angelus README).
     if observation.get("type") == "check_failed":
         json.dump({"findings": [], "new_state": prior_state}, sys.stdout)
         sys.stdout.write("\n")
