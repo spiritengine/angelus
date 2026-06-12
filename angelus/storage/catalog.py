@@ -1040,7 +1040,13 @@ class Catalog:
         return events
 
     def record_pipe_finding_undelivered(
-        self, pipe: str, finding_id: int, error: str, max_attempts: int | None = None
+        self,
+        pipe: str,
+        finding_id: int,
+        error: str,
+        max_attempts: int | None = None,
+        *,
+        page_known_pipes: set[str] | None = None,
     ) -> bool:
         """Advance the per-finding redelivery ladder for the immediate path.
 
@@ -1094,6 +1100,34 @@ class Catalog:
         state so health/belfry can surface it and `angelus replay` can re-arm
         it. The state transition is the only change here -- the ladder
         arithmetic, the per-finding grain, and the rung-3 hook are unchanged.
+
+        ``page_known_pipes`` moves the rung-3 emission itself INSIDE this
+        method (B14 durability fix, brief-20260604-f324). When it is not None
+        and this call crosses the threshold, the internal/delivery
+        `delivery_exhausted` incident is written here -- BEFORE the row flips
+        to 'dead_letter' -- instead of by the caller after the flip. The
+        ordering is load-bearing: the two writes cannot share one transaction
+        (write_finding commits in stages around its body-file write, by the
+        cancel-safety conventions this class documents), so a hard crash
+        (SIGKILL/host loss) can always land between them. Incident-first makes
+        the two possible half-states self-healing where flip-first was not:
+
+        - crash AFTER the incident commit, BEFORE the flip: the row is still
+          retryable, so the next drain re-walks this edge -- redelivery closes
+          the incident via the runner's clearance, or re-exhaustion re-enters
+          here, where the B30 gate inside write_internal_finding drops the
+          duplicate and the flip completes. Either way the state converges.
+        - the flip-first order (the pre-fix runner layering) instead leaves a
+          TERMINAL 'dead_letter' row with NO incident: pending_pipe_items
+          excludes it, the edge never re-fires, and belfry -- which pages
+          off-box on open internal/* incidents -- stays green over abandoned
+          content. That orphan state is unreachable through this path; the
+          daemon's startup re-pair sweep heals any already on disk.
+
+        None (the default) preserves the bare row-flip for callers that page
+        on their own terms or not at all -- the runner passes None for
+        internal/* findings, whose exhaustion deliberately does not spawn a
+        rung-3 incident (see PipeDrain._drain_immediate).
         """
         row = self.connection.execute(
             """
@@ -1106,6 +1140,17 @@ class Catalog:
         next_attempt = attempts + 1
         threshold = MAX_RETRY_ATTEMPTS if max_attempts is None else max_attempts
         if next_attempt >= threshold:
+            if page_known_pipes is not None:
+                # Incident BEFORE flip -- see the docstring; a crash between
+                # the two commits must leave the retryable half-state, never
+                # the terminal-row-without-incident one.
+                self.write_internal_finding(
+                    "internal/delivery",
+                    "delivery_exhausted",
+                    str(finding_id),
+                    f"pipe={pipe} last_error={error}",
+                    page_known_pipes,
+                )
             now = self._clock.now_iso()
             self.connection.execute(
                 """

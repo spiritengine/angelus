@@ -566,7 +566,13 @@ class PipeDrain:
                 #             ever reaching ANY transport (primary or any backup),
                 #             page OUT-OF-BAND (below).
                 exhausted = self.catalog.record_pipe_finding_undelivered(
-                    pipe.name, finding_id, last_error, pipe.max_delivery_attempts
+                    pipe.name,
+                    finding_id,
+                    last_error,
+                    pipe.max_delivery_attempts,
+                    page_known_pipes=(
+                        None if _is_internal(row["source"]) else known_pipes
+                    ),
                 )
                 if exhausted and not _is_internal(row["source"]):
                     # RUNG 3 (B14). This finding has walked the whole ladder --
@@ -630,11 +636,22 @@ class PipeDrain:
                     # row for redelivery -- `angelus replay <fid>`
                     # (catalog.replay_finding via the daemon _op_replay control
                     # op) -- exists and is wired today. So the clear edge is built:
-                    # any successful redelivery closes this incident. The same
-                    # exhaustion edge below that opens this incident also sets the
-                    # pipe_queues row to 'dead_letter' (B15), so the row and the
-                    # incident are the two faces of one give-up: the row is the
-                    # replayable record, the incident is the off-box page.
+                    # any successful redelivery closes this incident. The row and
+                    # the incident are the two faces of one give-up: the row is
+                    # the replayable record, the incident is the off-box page.
+                    #
+                    # The EMISSION itself happens inside
+                    # record_pipe_finding_undelivered (page_known_pipes above),
+                    # which writes the incident BEFORE committing the row's flip
+                    # to 'dead_letter' (B14 durability fix, brief-20260604-f324).
+                    # This runner used to write the incident here, AFTER the
+                    # flip's commit -- a daemon crash in that window left a
+                    # terminal dead_letter row with NO incident, which the
+                    # pending reads exclude, so the edge never re-fired and
+                    # belfry stayed green over abandoned content. The catalog
+                    # owns the ordering now; the daemon's startup sweep
+                    # (_reconcile_dead_letter_incidents) re-pairs any orphan
+                    # already on disk. This branch only narrates the page.
                     LOGGER.error(
                         "pipe %s: finding %s exhausted its delivery ladder "
                         "undelivered over every transport; paging out-of-band "
@@ -642,13 +659,6 @@ class PipeDrain:
                         pipe.name,
                         finding_id,
                         last_error,
-                    )
-                    self.catalog.write_internal_finding(
-                        "internal/delivery",
-                        "delivery_exhausted",
-                        str(finding_id),
-                        f"pipe={pipe.name} last_error={last_error}",
-                        known_pipes,
                     )
         return DrainSummary(dispatched=dispatched, failed=failed)
 

@@ -33,6 +33,7 @@ from angelus.lodging import (
 )
 from angelus.lodging.reloader import LodgingReloader
 from angelus.pipes import DrainSummary, PipeDrain
+from angelus.pipes.runner import _is_internal
 from angelus.sources import run_shell_source
 from angelus.storage import Catalog, init_db
 from angelus.triage import run_python_triager
@@ -290,6 +291,7 @@ class AngelusDaemon:
             # first post-restart failure.
             self.catalog.clear_immediate_channel_attempts()
             self._reconcile_orphaned_internal_incidents()
+            self._reconcile_dead_letter_incidents()
             self._validate_channel_config()
             self._sync_pipe_sla()
             self._sync_source_sla()
@@ -437,6 +439,84 @@ class AngelusDaemon:
             LOGGER.info(
                 "startup recovery: reconciled orphaned internal incidents (%s)",
                 ", ".join(f"{s}={n}" for s, n in sorted(reconciled.items())),
+            )
+
+    def _reconcile_dead_letter_incidents(self) -> None:
+        """Re-pair orphaned dead_letter rows with their rung-3 incident (B14
+        durability fix, brief-20260604-f324).
+
+        The exhaustion edge gives up on a finding in two durable writes: the
+        pipe_queues row flips to the terminal 'dead_letter' (B15, the
+        replayable record) and an internal/delivery `delivery_exhausted`
+        incident opens (the off-box page belfry carries). The catalog now
+        commits the incident BEFORE the flip (record_pipe_finding_undelivered,
+        page_known_pipes), so a crash between the two commits leaves only the
+        self-healing half-state -- but state written before that ordering fix
+        can already hold the bad half on disk, and no in-process ordering
+        survives every failure mode a host can produce. The bad half is the
+        silent one: a dead_letter row is excluded from pending_pipe_items /
+        findings_pending_dispatch_by_pipe, so the edge never re-fires for it,
+        the incident is never emitted, and belfry -- which pages off-box on
+        open internal/* incidents -- stays green while the content sits
+        abandoned. The exact silent-failure class angelus exists to prevent.
+
+        So: for every dead_letter row whose finding has no open
+        internal/delivery incident, re-emit the incident. Emission goes
+        through write_internal_finding -- the same call as the live edge --
+        so the B30 gate semantics hold (the open-incident pre-filter here is
+        a skip, the gate is the authority) and the re-paired incident clears
+        through the existing recovery edge (replay -> redelivery -> the
+        runner's write_internal_clearance) exactly like a live one.
+        internal/* findings are skipped, mirroring the live edge's
+        `not _is_internal` guard: their dead_letter rows are intentionally
+        unpaired (see the rung-3 comment in PipeDrain._drain_immediate).
+
+        This is the OPPOSITE direction from
+        _reconcile_orphaned_internal_incidents above: that sweep CLOSES
+        restart-scoped incidents whose recovery edge a restart skipped; this
+        one RE-OPENS the one incident whose emission a crash skipped.
+        internal/delivery is deliberately absent from the close sweep (a
+        restart does not redeliver content), and present here only on the
+        missing-incident edge -- an already-paired row is untouched, so the
+        two sweeps cannot fight.
+        """
+        known_pipes = set(self.lodging.pipes)
+        open_delivery_entities = {
+            incident["entity"]
+            for incident in self.catalog.open_incidents()
+            if incident["source"] == "internal/delivery"
+        }
+        repaired = 0
+        for item in self.catalog.dead_letter_items():
+            if _is_internal(item["source"]):
+                continue
+            entity = str(item["finding_id"])
+            if entity in open_delivery_entities:
+                continue
+            # ERROR, matching the live rung-3 page this replaces: content was
+            # abandoned and the off-box page for it was lost until now.
+            LOGGER.error(
+                "startup recovery: dead_letter finding %s (pipe %s) had no "
+                "open internal/delivery incident -- a crash split the "
+                "exhaustion edge; re-paging out-of-band; last error: %s",
+                item["finding_id"],
+                item["pipe"],
+                item["last_error"],
+            )
+            self.catalog.write_internal_finding(
+                "internal/delivery",
+                "delivery_exhausted",
+                entity,
+                f"pipe={item['pipe']} last_error={item['last_error']} "
+                "(re-paired at startup)",
+                known_pipes,
+            )
+            repaired += 1
+        if repaired:
+            LOGGER.info(
+                "startup recovery: re-paired %d orphaned dead_letter row(s) "
+                "with internal/delivery incidents",
+                repaired,
             )
 
     def _validate_channel_config(self) -> None:
