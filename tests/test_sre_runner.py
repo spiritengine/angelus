@@ -204,6 +204,45 @@ def test_min_interval_throttle(tmp_path):
 # Test: MAX_SPAWNS cap -> NO spawn, escalation page fires, sentinel retained.
 # ---------------------------------------------------------------------------
 
+def test_relative_reports_dir_reaches_prompt_and_bind_absolute(
+    tmp_path, monkeypatch
+):
+    """A relative ANGELUS_SRE_REPORTS_DIR must be resolved once at
+    construction: the report path in the agent prompt and the sandbox bind
+    must be the same ABSOLUTE directory. Unresolved, the prompt carried the
+    relative path while the bind resolved against the runner's cwd -- the
+    agent (sitting in a shard of the engine repo, not that cwd) would write
+    the 3am incident report outside the bound directory and it would be
+    silently lost. Pins the resolve at _run's construction site; every other
+    test passes an absolute state path, where resolve is identity."""
+    runner = _load_runner()
+    state = tmp_path / "state"
+    _write_sentinel(state, "loop reason")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ANGELUS_SRE_REPORTS_DIR", "rel-reports")
+    monkeypatch.delenv("SPINDLE_SHARD_WRITABLE_BINDS", raising=False)
+
+    captured = {}
+
+    def fake_spin(prompt, working_dir, tags, env=None):
+        captured["prompt"] = prompt
+        captured["env"] = env
+        return "spool99"
+
+    with patch.object(runner, "spindle_spin", side_effect=fake_spin), \
+         patch.object(runner, "spindle_wait", return_value="completed"), \
+         patch.object(runner, "check_daemon_healthy", return_value=True), \
+         patch.object(runner, "notify_pat"):
+        runner._run(state)
+
+    expected_dir = (tmp_path / "rel-reports").resolve()
+    bind = captured["env"]["SPINDLE_SHARD_WRITABLE_BINDS"]
+    assert Path(bind).is_absolute()
+    assert bind == str(expected_dir)
+    assert str(expected_dir) in captured["prompt"]
+    assert " rel-reports/" not in captured["prompt"]
+
+
 def test_max_spawns_cap_triggers_escalation(tmp_path):
     runner = _load_runner()
     state = tmp_path / "state"
