@@ -219,7 +219,8 @@ it does not by itself prove inbox receipt (that residual is covered for push by
 telegram's delivery ack, and is a known, accepted gap for the email leg).
 
 The belfry is the external reliability layer. It runs outside the daemon from
-raw cron, checks `state/angelus.pid`, reads `source_fires` from
+raw cron, checks `state/angelus.pid`, reads the per-source `watch_state`
+heartbeats (`source_fires` was dropped by migration 0012) from
 `state/angelus.sqlite3` in read-only mode, pings healthchecks.io, and calls
 `notify-pat` directly when the daemon is dead or wedged. Belfry must never
 alert over email — email is the transport it exists to detect as broken.
@@ -513,7 +514,7 @@ SQLite is the authoritative lifecycle store. Migrations live in `migrations/` as
 
 The initial migration creates the v3.1 tables:
 
-- `source_fires`
+- `source_fires` (dropped by migration 0012 in favor of `watch_state`)
 - `observations`
 - `findings`
 - `incidents`
@@ -536,6 +537,9 @@ Subsequent migrations add:
 - `digest_channel_attempts` — per-(pipe, channel) digest send-attempt counter so the digest path can consume the same channel_health threshold ladder the immediate path uses without inflating it by the per-cycle batch size. Daemon-restart-scoped (cleared at startup) to match `channel_health`. Migration 0007.
 - `immediate_channel_attempts` — per-(pipe, channel) immediate-path send-attempt counter (B7 fell-r1 Finding 3). After B7 fans internal/* findings to every channel, the per-(finding, pipe) `pipe_queues.attempts` row can no longer carry per-channel escalation (it inflates +N per drain and goes terminal on the first co-fanned success). This table tracks each channel's consecutive failures across findings and drives channel_health independently, while `pipe_queues.attempts` stays as the per-finding redelivery ladder. Daemon-restart-scoped (cleared at startup) to match `channel_health` and `digest_channel_attempts`. Migration 0010.
 - `pipe_queues.status` gains `dead_letter` and drops `failed` (B15). A finding whose per-finding redelivery ladder exhausts undelivered lands in the terminal `dead_letter` state — its own name, no longer colliding with the `dispatches` table's transient per-channel `failed`. Surfaced on `angelus health` (the dead-letter section: what was abandoned + a count) and replayable via `angelus replay <fid>`; belfry pages off-box via the paired `internal/delivery` incident (B14), not a direct read. Migration 0011 is a table-rebuild that renames every existing `failed` row to `dead_letter` and tightens the CHECK so `failed` can never be written to `pipe_queues` again.
+- `watch_state` — fixed-size per-source change-detection state (last state signature plus a `last_checked_at` heartbeat overwritten on every fire); observations are written only on a state change. Replaces the append-only `source_fires` ledger, which is dropped — belfry's wedge check reads `watch_state` heartbeats instead. Migration 0012.
+- `idx_observation_triage_observation_id_status` and `idx_observations_source_status_id` — the covering indexes behind the triage-pending count and ready-observation scans (the 2026-06-07 health-stall fix, 6.8s → 6.7ms). Migration 0013.
+- `source_sla` — per-source expected max fire interval, registered by the daemon at startup so belfry (pure-stdlib, can't parse source YAML) can alarm when any single source stops firing while others stay fresh. Migration 0014.
 
 ## Service template
 
