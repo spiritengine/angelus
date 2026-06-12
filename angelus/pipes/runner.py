@@ -1367,9 +1367,9 @@ async def _recover_cancelled_spawn(
     running and always finishes; the loop terminates.
 
     create_subprocess_exec returns in milliseconds in practice, so this does
-    not meaningfully delay shutdown; the daemon's bounded shutdown gather
-    (_DRAIN_SHUTDOWN_TIMEOUT) is the outer ceiling if a spawn ever genuinely
-    wedges.
+    not meaningfully delay shutdown; the daemon's shared teardown budget
+    (DEFAULT_SHUTDOWN_BUDGET_SEC / ANGELUS_SHUTDOWN_BUDGET_SEC, daemon.py)
+    is the outer ceiling if a spawn ever genuinely wedges.
 
     Returns None if the spawn itself failed (e.g. OSError) -- nothing was
     started, so there is nothing to reap.
