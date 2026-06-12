@@ -280,7 +280,7 @@ def test_digest_partial_channel_failure_does_not_resend_success_channel(
             "email": Channel(
                 name="email",
                 kind="email",
-                command="/home/user/projects/patbot-email/patbot-email",
+                command="/path/to/your-email-cli",
                 to="person@example.com",
             ),
         },
@@ -503,7 +503,7 @@ def test_empty_day_channel_failure_records_dispatch_and_emits_internal(
             "email": Channel(
                 name="email",
                 kind="email",
-                command="/home/user/projects/patbot-email/patbot-email",
+                command="/path/to/your-email-cli",
                 to="person@example.com",
             )
         },
@@ -565,7 +565,7 @@ def _digest_email_drain(catalog: Catalog, workdir: Path) -> PipeDrain:
             "email": Channel(
                 name="email",
                 kind="email",
-                command="/home/user/projects/patbot-email/patbot-email",
+                command="/path/to/your-email-cli",
                 to="person@example.com",
             )
         },

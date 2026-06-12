@@ -228,7 +228,7 @@ def expand(
     Source naming: `scheduled/<watch>__<entity>`. The double underscore
     keeps the watch and entity names round-trippable when reading source
     refs in logs or angelus health output, even when entity names contain
-    dots or dashes (e.g. dhrift.example.com).
+    dots or dashes (e.g. sub.domain.example.com).
     """
     sources: dict[str, ScheduledSource] = {}
     triagers: dict[str, Triager] = {}
