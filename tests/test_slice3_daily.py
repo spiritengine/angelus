@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -2043,6 +2045,144 @@ def test_digest_heartbeat_failure_does_not_break_delivery(tmp_path, monkeypatch)
 
     assert push_sent, "digest must still be delivered despite a failed heartbeat ping"
     assert drained is not None and drained["last_drain_at"]
+
+
+def _heartbeat_drain(tmp_path) -> tuple[PipeDrain, object]:
+    """Minimal drain for driving _ping_digest_heartbeat directly."""
+    connection = init_db(tmp_path / "angelus.sqlite3")
+    catalog = Catalog(connection, tmp_path)
+    drain = PipeDrain(
+        catalog,
+        _daily_pipe(channels=["push"]),
+        {"push": Channel(name="push", kind="push", command="notify-pat")},
+        tmp_path,
+        {"now", "daily"},
+    )
+    return drain, connection
+
+
+def test_digest_heartbeat_runs_on_daemon_thread(tmp_path, monkeypatch) -> None:
+    """The ping's blocking urlopen must run on an explicit DAEMON thread --
+    deliberately not asyncio.to_thread, whose default-ThreadPoolExecutor
+    workers are non-daemon. A non-daemon worker stuck in a trickling endpoint
+    is joined by the interpreter's threading._shutdown atexit hook, holding
+    PROCESS EXIT open past the daemon's whole teardown budget; a daemon
+    thread is abandonable by design (13w0 fell-r2).
+
+    Discrimination: under the old to_thread implementation the worker
+    reports daemon=False -> red."""
+    drain, connection = _heartbeat_drain(tmp_path)
+    monkeypatch.setenv("ANGELUS_DIGEST_HEARTBEAT_URL", "http://hc.example/ping")
+    seen: dict[str, bool] = {}
+
+    def fake_get(_url: str, _timeout: float) -> None:
+        seen["daemon"] = threading.current_thread().daemon
+
+    monkeypatch.setattr(pipe_runner, "_get_url", fake_get)
+    try:
+        asyncio.run(drain._ping_digest_heartbeat())
+    finally:
+        connection.close()
+
+    assert seen, "_get_url never ran"
+    assert seen["daemon"] is True, (
+        "heartbeat GET ran on a non-daemon thread -- a stuck ping would "
+        "hold process exit open in threading._shutdown"
+    )
+
+
+def test_digest_heartbeat_cancellation_lands_immediately(
+    tmp_path, monkeypatch
+) -> None:
+    """Shutdown cancelling the drain task mid-ping must land IMMEDIATELY,
+    abandoning the worker thread -- never wait for the urlopen thread to
+    return (urlopen's per-socket-operation timeout gives that no total
+    bound).
+
+    A pin, not a discriminator: the old to_thread shape also delivered the
+    cancel immediately (its real defect was the NON-DAEMON worker left
+    behind, covered by the daemon-thread test above and the entry-level
+    wedge test in test_shutdown_budget). This pins that the explicit-thread
+    implementation keeps the property -- the naive variant that joins its
+    worker before returning would lose it."""
+    drain, connection = _heartbeat_drain(tmp_path)
+    monkeypatch.setenv("ANGELUS_DIGEST_HEARTBEAT_URL", "http://hc.example/ping")
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+
+    def stuck_get(_url: str, _timeout: float) -> None:
+        worker_started.set()
+        release_worker.wait()
+
+    monkeypatch.setattr(pipe_runner, "_get_url", stuck_get)
+
+    async def driver() -> None:
+        task = asyncio.create_task(drain._ping_digest_heartbeat())
+        try:
+            for _ in range(200):
+                if worker_started.is_set():
+                    break
+                await asyncio.sleep(0.02)
+            else:
+                raise AssertionError("heartbeat worker thread never started")
+            task.cancel()
+            done, _ = await asyncio.wait([task], timeout=1.0)
+            assert done, (
+                "cancellation deferred until the stuck worker thread "
+                "returned instead of abandoning it"
+            )
+            assert task.cancelled()
+        finally:
+            # Release the worker so neither implementation leaks a blocked
+            # thread (or, pre-fix, hangs asyncio.run's executor shutdown).
+            release_worker.set()
+            await asyncio.gather(task, return_exceptions=True)
+
+    try:
+        asyncio.run(driver())
+    finally:
+        connection.close()
+
+
+def test_digest_heartbeat_total_deadline_bounds_a_trickling_endpoint(
+    tmp_path, monkeypatch
+) -> None:
+    """urlopen's timeout is per-socket-operation, not total: an endpoint that
+    trickles a byte per recv can hold the worker for minutes. The awaiting
+    drain must enforce a TOTAL deadline and abandon the ping past it, so a
+    misbehaving endpoint cannot stall the digest drain's tail.
+
+    Discrimination: the old implementation awaited the worker with no total
+    bound, so the ping never returns within the wait here -> red."""
+    drain, connection = _heartbeat_drain(tmp_path)
+    monkeypatch.setenv("ANGELUS_DIGEST_HEARTBEAT_URL", "http://hc.example/ping")
+    monkeypatch.setattr(
+        pipe_runner, "DIGEST_HEARTBEAT_TOTAL_DEADLINE_SEC", 0.2
+    )
+    release_worker = threading.Event()
+
+    def trickling_get(_url: str, _timeout: float) -> None:
+        release_worker.wait()
+
+    monkeypatch.setattr(pipe_runner, "_get_url", trickling_get)
+
+    async def driver() -> None:
+        task = asyncio.create_task(drain._ping_digest_heartbeat())
+        try:
+            started = time.monotonic()
+            done, _ = await asyncio.wait([task], timeout=2.0)
+            assert done, "ping ignored its total deadline"
+            elapsed = time.monotonic() - started
+            assert elapsed < 1.5, f"ping abandoned only after {elapsed:.1f}s"
+            task.result()  # abandoned ping returns cleanly, never raises
+        finally:
+            release_worker.set()
+            await asyncio.gather(task, return_exceptions=True)
+
+    try:
+        asyncio.run(driver())
+    finally:
+        connection.close()
 
 
 def test_get_url_rejects_non_http_scheme() -> None:

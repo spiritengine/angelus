@@ -8,6 +8,9 @@ import json
 import logging
 import os
 import signal
+import sys
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -35,6 +38,7 @@ from angelus.lodging.reloader import LodgingReloader
 from angelus.pipes import DrainSummary, PipeDrain
 from angelus.pipes.runner import _is_internal
 from angelus.sources import run_shell_source
+from angelus.sources.runner import _REAP_TIMEOUT
 from angelus.storage import Catalog, init_db
 from angelus.triage import run_python_triager
 
@@ -128,12 +132,74 @@ _RESTART_RECONCILED_INTERNAL_SOURCES = (
     "internal/render",
 )
 
-# Hard ceiling on awaiting cancelled digest-drain tasks during shutdown.
-# Set above _kill_and_reap's own _REAP_TIMEOUT (5.0s) so a drain cancelled
-# mid-render gets to run its reap arm to completion, while a genuinely
-# wedged drain still cannot hang shutdown past this bound. Kept comfortably
-# under the integration fell's 8.0s no-hang assertion.
-_DRAIN_SHUTDOWN_TIMEOUT = 6.0
+# Hard wall-clock budget for run()'s ENTIRE shutdown teardown. One monotonic
+# deadline is armed at the top of the finally and every awaiting stage -- the
+# cancelled digest-drain reap, the fixer-loop reap, and the final wait on the
+# long-lived loops (triage + immediate-pipe drains) -- draws
+# remaining = deadline - now from it, never a fresh per-stage allowance. The
+# stages therefore cannot stack: before this was shared, the drain reap and
+# the fixer reap each had an independent 6s bound and the final gather was
+# unbounded, so two simultaneous hangs took ~12s and a wedged pending task
+# hung shutdown forever (brief-20260608-13w0).
+#
+# Set ABOVE _kill_and_reap's _REAP_TIMEOUT (5.0s, imported from
+# sources/runner) so a task cancelled mid-subprocess (a drain mid-render, a
+# fixer mid-handler, an immediate send mid-transport) gets to run its reap
+# arm to completion and its spawned process group is reaped, not orphaned --
+# while a genuinely wedged task still cannot hang shutdown past the bound.
+# Kept under the integration fell's 8.0s no-hang assertion (and far under
+# systemd's SIGTERM->SIGKILL stop grace) TOGETHER with the entry runner's
+# post-run() allowance: everything after run() returns -- the straggler
+# grace, asyncgen finalization, and default-executor finalization -- draws
+# down ONE shared pool of max(leftover budget, _EXIT_WAIT_FLOOR_SEC), never a
+# fresh floor per stage (13w0 fell-r2: stacked floors put the worst case at
+# budget + 3 floors = 8.5s). Worst case with every stage wedged at once is
+# therefore budget + ONE floor = 7.5s < 8.0, pinned by
+# test_default_budget_leaves_room_for_a_reap_arm.
+DEFAULT_SHUTDOWN_BUDGET_SEC = 7.0
+
+
+def _shutdown_budget_seconds() -> float:
+    """Resolve the shared teardown budget for run()'s shutdown finally.
+
+    ANGELUS_SHUTDOWN_BUDGET_SEC overrides (the same env-override pattern as
+    the other daemon thresholds); invalid, non-positive, OR at-or-below
+    _REAP_TIMEOUT values all fall back to the default so shutdown never
+    crashes -- or violates the budget > _REAP_TIMEOUT invariant -- on a
+    misconfigured env. Under a sub-reap budget a single cancelled reap arm
+    may not get to finish, so a drain/fixer/send cancelled mid-subprocess
+    could orphan its process group; production config must not be able to
+    encode that. Tests that want a fast wedge window monkeypatch this
+    function (or DEFAULT_SHUTDOWN_BUDGET_SEC) instead of the env var.
+    """
+    raw = os.environ.get("ANGELUS_SHUTDOWN_BUDGET_SEC")
+    if raw is None:
+        return DEFAULT_SHUTDOWN_BUDGET_SEC
+    try:
+        seconds = float(raw)
+    except ValueError:
+        LOGGER.warning(
+            "invalid ANGELUS_SHUTDOWN_BUDGET_SEC=%r; using default", raw
+        )
+        return DEFAULT_SHUTDOWN_BUDGET_SEC
+    if seconds <= 0:
+        LOGGER.warning(
+            "ANGELUS_SHUTDOWN_BUDGET_SEC=%r must be positive; using default",
+            raw,
+        )
+        return DEFAULT_SHUTDOWN_BUDGET_SEC
+    if seconds <= _REAP_TIMEOUT:
+        LOGGER.warning(
+            "ANGELUS_SHUTDOWN_BUDGET_SEC=%.1f is at or below the %.1fs "
+            "subprocess reap timeout; using the %.1fs default (under it a "
+            "cancelled reap arm may not finish and could orphan its "
+            "process group)",
+            seconds,
+            _REAP_TIMEOUT,
+            DEFAULT_SHUTDOWN_BUDGET_SEC,
+        )
+        return DEFAULT_SHUTDOWN_BUDGET_SEC
+    return seconds
 
 # How often the fixer-evaluation loop (B11) re-checks live conditions. The
 # guardrails (max_attempts/window/backoff) -- not this interval -- bound how
@@ -265,6 +331,10 @@ class AngelusDaemon:
         # slow handler hangs teardown. Cancellation propagates into
         # run_python_fixer's reap arm. None until run() starts it.
         self._fixer_loop_task: asyncio.Task[None] | None = None
+        # Armed at the top of run()'s shutdown finally; _run_daemon_to_exit
+        # draws its bounded post-run() straggler wait from whatever is left
+        # of it, so process exit shares the same budget as the teardown.
+        self._teardown_deadline: float | None = None
         self.pipe_drains: dict[str, PipeDrain] = {
             name: PipeDrain(
                 self.catalog,
@@ -387,78 +457,147 @@ class AngelusDaemon:
             await self.stop_event.wait()
             LOGGER.info("shutdown requested")
         finally:
-            if control_started:
-                try:
-                    await self.control.stop()
-                except OSError:
+            # One monotonic deadline for the WHOLE teardown: every awaiting
+            # stage below draws remaining = deadline - now from this shared
+            # budget, never a fresh per-stage allowance, so simultaneous
+            # hangs cannot stack past it (brief-20260608-13w0). The bounded
+            # waiting is asyncio.wait, never wait_for(gather(...)): a task
+            # that swallows cancellation leaves wait_for's cancelled inner
+            # future unresolved and hangs wait_for itself forever, while
+            # wait simply returns the stragglers at the timeout and the
+            # stage abandons them (cancel and move on). The budget is
+            # resolved ONCE here so every stage and every log line sees the
+            # same number, and the deadline is published on the instance so
+            # _run_daemon_to_exit can draw its bounded post-run() straggler
+            # wait from whatever is left of it.
+            budget = _shutdown_budget_seconds()
+            deadline = time.monotonic() + budget
+            self._teardown_deadline = deadline
+
+            def _remaining() -> float:
+                return max(0.0, deadline - time.monotonic())
+
+            async def _reap_stage(
+                tasks: list[asyncio.Task[Any]], stage: str
+            ) -> None:
+                if not tasks:
+                    return
+                granted = _remaining()
+                _, still_pending = await asyncio.wait(tasks, timeout=granted)
+                if still_pending:
                     LOGGER.warning(
-                        "failed to stop control server", exc_info=True
+                        "shutdown stage %r exhausted its %.1fs slice of the "
+                        "%.1fs teardown budget; abandoning %d task(s)",
+                        stage,
+                        granted,
+                        budget,
+                        len(still_pending),
                     )
-            if reloader_started:
-                await self.reloader.stop()
-            if scheduler_started:
-                self.scheduler.shutdown(wait=True)
-            # AsyncIOExecutor.shutdown() above cancels in-flight digest-drain
-            # job tasks but does not await them, and they are not in `pending`.
-            # Cancel (idempotent) and await them here so each cancelled drain's
-            # reap arm (_render_llm_body -> _kill_and_reap) runs before the loop
-            # closes -- otherwise the horizon cast subtree is orphaned. Same
-            # cancel-then-gather shape _triage_loop uses for its in-flight
-            # tasks; bounded by wait_for so a wedged drain cannot hang shutdown
-            # forever (the reap itself is already bounded at _REAP_TIMEOUT).
-            if self._drain_tasks:
+                    for task in still_pending:
+                        task.cancel()
+
+            try:
+                # Cancel every subprocess-owning task FIRST, before the
+                # ancillary stops below get a chance to consume budget:
+                # requesting cancellation is cheap, and it starts each
+                # task's CancelledError unwind (the reap arms that
+                # _kill_and_reap a digest render's horizon subtree, a fixer
+                # handler's process group, an immediate send's transport
+                # subprocess) CONCURRENTLY with the stops -- so even when
+                # the stops eat a chunk of the budget, the reaps have been
+                # running the whole time instead of starting from a starved
+                # remainder. self.tasks (the triage loop) is the deliberate
+                # exception: it exits via stop_event and its own finally
+                # cancels-and-reaps its in-flight triagers, so a premature
+                # cancel here could interrupt that reap -- the shared
+                # deadline force-cancels it only as the last resort.
+                for task in list(self._drain_tasks):
+                    task.cancel()
+                if self._fixer_loop_task is not None:
+                    self._fixer_loop_task.cancel()
+                # _pipe_loop only checks stop_event between drains, so a
+                # channel send hung inside drain_once (e.g. a 30s SMTP send)
+                # would otherwise stall the final wait for the full send
+                # timeout; the cancel lands in the channel runner's
+                # CancelledError arm, which _kill_and_reaps the transport
+                # subprocess (the same cancel-then-await shape _triage_loop
+                # uses).
+                for task in self._pipe_loop_tasks.values():
+                    task.cancel()
+                # The ancillary stops draw down the SAME deadline as the
+                # bounded stages even though they take no explicit timeout:
+                # each is internally bounded (control.stop waits at most
+                # WAIT_CLOSED_TIMEOUT=5s and only on the accept race,
+                # reloader.stop joins its observer thread for at most 2s,
+                # scheduler.shutdown is synchronous bookkeeping) and fast in
+                # practice -- but whatever they do consume is gone from the
+                # reap stages below. The early cancels above are what keep
+                # that safe: the unwinds run while the stops drain.
+                if control_started:
+                    try:
+                        await self.control.stop()
+                    except OSError:
+                        LOGGER.warning(
+                            "failed to stop control server", exc_info=True
+                        )
+                if reloader_started:
+                    await self.reloader.stop()
+                if scheduler_started:
+                    self.scheduler.shutdown(wait=True)
+                # AsyncIOExecutor.shutdown() above cancels in-flight digest-
+                # drain job tasks but does not await them, and they are not
+                # in `pending`. Re-snapshot and re-cancel here (idempotent):
+                # a job that fired during the ancillary stops registered a
+                # NEW drain task the top-of-teardown sweep never saw.
+                # Awaiting them runs each cancelled drain's reap arm
+                # (_render_llm_body -> _kill_and_reap) before the loop
+                # closes -- otherwise the horizon cast subtree is orphaned.
+                # Bounded by the shared deadline so a wedged drain cannot
+                # hang shutdown (the reap itself is already bounded at
+                # _REAP_TIMEOUT, which the default budget exceeds).
                 in_flight = list(self._drain_tasks)
                 for task in in_flight:
                     task.cancel()
+                await _reap_stage(in_flight, "digest-drain reap")
+                # The fixer loop blocks inline on a handler subprocess
+                # (run_python_fixer.communicate), which setting stop_event
+                # does not interrupt; its cancel (issued above) lands in
+                # that runner's `except CancelledError: await
+                # _kill_and_reap`, so the handler's process group is reaped
+                # instead of hanging teardown until its timeout. Draws on
+                # the same shared deadline as the drain reap above -- NOT a
+                # fresh allowance -- so a wedged drain and a wedged handler
+                # together still cannot exceed the one budget.
+                if self._fixer_loop_task is not None:
+                    await _reap_stage(
+                        [self._fixer_loop_task], "fixer-loop reap"
+                    )
+                pending = [*self.tasks, *self._pipe_loop_tasks.values()]
+                await _reap_stage(pending, "final wait")
+            finally:
+                # Defense-in-depth (13w0 fell-r1): this tail must run even
+                # if a CancelledError lands while a stage above is parked in
+                # asyncio.wait -- otherwise a cancelled teardown leaves a
+                # stale pid file and socket for the next boot to trip over.
+                # Everything here is synchronous (no cancellation points),
+                # so a pending cancellation cannot interrupt it partway.
                 try:
-                    await asyncio.wait_for(
-                        asyncio.gather(*in_flight, return_exceptions=True),
-                        timeout=_DRAIN_SHUTDOWN_TIMEOUT,
-                    )
-                except TimeoutError:
+                    self.pid_file.unlink(missing_ok=True)
+                except OSError:
                     LOGGER.warning(
-                        "drain task shutdown exceeded %.1fs; %d still in-flight",
-                        _DRAIN_SHUTDOWN_TIMEOUT,
-                        len(self._drain_tasks),
+                        "failed to remove PID file %s",
+                        self.pid_file,
+                        exc_info=True,
                     )
-            # Cancel the fixer loop before the final gather. Its body blocks
-            # inline on a handler subprocess (run_python_fixer.communicate),
-            # which setting stop_event does not interrupt; cancelling lands in
-            # that runner's `except CancelledError: await _kill_and_reap`, so
-            # the handler's process group is reaped instead of hanging
-            # teardown until its timeout. Bounded by the same budget as the
-            # drain reap so a wedged handler still can't hang shutdown past it
-            # (and under the integration fell's 8.0s no-hang assertion).
-            if self._fixer_loop_task is not None:
-                self._fixer_loop_task.cancel()
                 try:
-                    await asyncio.wait_for(
-                        asyncio.gather(
-                            self._fixer_loop_task, return_exceptions=True
-                        ),
-                        timeout=_DRAIN_SHUTDOWN_TIMEOUT,
-                    )
-                except TimeoutError:
+                    self.socket_path.unlink(missing_ok=True)
+                except OSError:
                     LOGGER.warning(
-                        "fixer loop shutdown exceeded %.1fs",
-                        _DRAIN_SHUTDOWN_TIMEOUT,
+                        "failed to remove control socket %s",
+                        self.socket_path,
+                        exc_info=True,
                     )
-            pending = [*self.tasks, *self._pipe_loop_tasks.values()]
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
-            try:
-                self.pid_file.unlink(missing_ok=True)
-            except OSError:
-                LOGGER.warning("failed to remove PID file %s", self.pid_file, exc_info=True)
-            try:
-                self.socket_path.unlink(missing_ok=True)
-            except OSError:
-                LOGGER.warning(
-                    "failed to remove control socket %s",
-                    self.socket_path,
-                    exc_info=True,
-                )
-            self.connection.close()
+                self.connection.close()
 
     def _reconcile_orphaned_internal_incidents(self) -> None:
         """Clear internal incidents left open across a restart.
@@ -2396,4 +2535,185 @@ def main(root: Path | None = None) -> None:
             len(resolved),
             ", ".join(sorted(resolved)),
         )
-    asyncio.run(AngelusDaemon(root).run())
+    # NOT asyncio.run(): its _cancel_all_tasks would gather the stragglers
+    # run()'s bounded teardown abandoned with NO timeout, un-bounding the
+    # bounded shutdown one stack frame up. See _run_daemon_to_exit.
+    _run_daemon_to_exit(AngelusDaemon(root))
+
+
+# Floor for the ONE post-run() pool every exit finalization shares. run()'s
+# teardown usually leaves most of the budget unspent, but when the budget
+# expired exactly (every stage wedged at once) the leftover is ~0 -- the
+# floor guarantees a just-force-cancelled task still gets a beat to finish
+# unwinding before the loop closes. The straggler grace, the asyncgen
+# finalization, and the default-executor finalization all draw down the SAME
+# max(leftover, floor) deadline -- never a fresh floor each (13w0 fell-r2:
+# three stacked floors made worst-case exit budget + 1.5s = 8.5s, past the
+# promise). Kept small enough that DEFAULT_SHUTDOWN_BUDGET_SEC + this ONE
+# floor stays under the 8s no-hang promise (pinned by
+# test_default_budget_leaves_room_for_a_reap_arm).
+_EXIT_WAIT_FLOOR_SEC = 0.5
+
+
+def _run_daemon_to_exit(daemon: AngelusDaemon) -> None:
+    """Run the daemon on a managed loop and guarantee a BOUNDED process exit.
+
+    asyncio.run() must not be the entry: after run() returns, its
+    _cancel_all_tasks re-cancels every task still pending -- including the
+    stragglers the bounded teardown deliberately abandoned -- and gathers
+    them with NO timeout. That is the exact unbounded wait the shared
+    teardown budget exists to kill, relocated one stack frame up: a single
+    cancel-swallowing straggler hangs the process until systemd's SIGKILL
+    (deploy/angelus.service sets no TimeoutStopSec, so that is the 90s
+    default -- the grace the budget exists to never reach), and even
+    cancellation-honouring stragglers serialize their reap tails there,
+    stretching exit to budget + N*_REAP_TIMEOUT (13w0 fell-r1).
+
+    Instead, the stragglers, the asyncgen finalization, and the
+    default-executor finalization together get ONE bounded pool drawn from
+    whatever is left of run()'s teardown deadline (floored at
+    _EXIT_WAIT_FLOOR_SEC -- shared, so wedging all three still costs one
+    floor, not three), then the loop is closed deliberately. Abandoning a
+    straggler at loop close orphans no process group: _kill_and_reap issues
+    its killpg synchronously before its first await (sources/runner.py), so
+    by the time a reap tail can be abandoned the kill has already been
+    delivered -- the cost is a destroyed-pending-task log line, never a
+    leaked subtree.
+
+    Last, the lingering-thread backstop: a non-daemon thread the bounded
+    finalization had to abandon (a stuck default-executor worker is the
+    canonical case) would still hold exit open in threading._shutdown, OUTSIDE
+    anything an event-loop wait can bound -- so if one provably lingers after
+    loop close, the process force-exits (13w0 fell-r2).
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(daemon.run())
+        finally:
+            _finish_loop_bounded(loop, daemon._teardown_deadline)
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
+        _force_exit_if_nondaemon_threads_linger()
+
+
+def _finish_loop_bounded(
+    loop: asyncio.AbstractEventLoop, teardown_deadline: float | None
+) -> None:
+    """Bounded stand-in for the unbounded half of asyncio.run()'s cleanup.
+
+    Every wait below -- the straggler grace AND the two finalization stages
+    -- draws remaining time from ONE deadline of max(what is left of run()'s
+    teardown budget, _EXIT_WAIT_FLOOR_SEC). The stages must not each take a
+    fresh floor: with run()'s budget already exhausted, three sequential
+    floors put process exit at budget + 1.5s = 8.5s, past the 8s no-hang
+    promise (13w0 fell-r2). Shared, the worst case is budget + one floor.
+    """
+    leftover = (
+        0.0
+        if teardown_deadline is None
+        else teardown_deadline - time.monotonic()
+    )
+    deadline = time.monotonic() + max(_EXIT_WAIT_FLOOR_SEC, leftover)
+
+    def _remaining() -> float:
+        return max(0.0, deadline - time.monotonic())
+
+    stragglers = [t for t in asyncio.all_tasks(loop) if not t.done()]
+    if stragglers:
+        for task in stragglers:
+            task.cancel()
+        grace = _remaining()
+        _, still_pending = loop.run_until_complete(
+            asyncio.wait(stragglers, timeout=grace)
+        )
+        if still_pending:
+            LOGGER.warning(
+                "%d task(s) still pending %.1fs after run() returned; "
+                "closing the event loop over them",
+                len(still_pending),
+                grace,
+            )
+
+    # The same asyncgen/default-executor finalization asyncio.run() performs,
+    # with its unbounded waits bounded by the shared deadline: a wedged
+    # aclose() or a stuck default-executor thread must not hold the exit open
+    # either. loop.close() shuts the executor down wait=False if the bounded
+    # join here gave up. shutdown_default_executor gets the remaining time as
+    # its internal join timeout too (3.12+; its non-daemon join-helper thread
+    # is otherwise unbounded) -- but a worker stuck in a syscall is
+    # un-joinable no matter what, which is why the in-tree heartbeat GET runs
+    # on its own daemon thread (pipes/runner.py) and why
+    # _force_exit_if_nondaemon_threads_linger backstops the whole exit.
+    def _shutdown_asyncgens() -> Any:
+        return loop.shutdown_asyncgens()
+
+    def _shutdown_executor() -> Any:
+        try:
+            return loop.shutdown_default_executor(timeout=_remaining())
+        except TypeError:
+            # Python 3.11: no timeout parameter.
+            return loop.shutdown_default_executor()
+
+    for label, make_coro in (
+        ("asyncgen shutdown", _shutdown_asyncgens),
+        ("default-executor shutdown", _shutdown_executor),
+    ):
+        task = loop.create_task(make_coro())
+        granted = _remaining()
+        done, _ = loop.run_until_complete(
+            asyncio.wait([task], timeout=granted)
+        )
+        if not done:
+            task.cancel()
+            LOGGER.warning(
+                "%s did not finish within its %.1fs slice of the shared "
+                "exit allowance; abandoning it",
+                label,
+                granted,
+            )
+
+
+def _force_exit_if_nondaemon_threads_linger() -> None:
+    """Force process exit when an abandoned non-daemon thread would hang it.
+
+    The bounded teardown can abandon work inside the event loop, but a
+    NON-DAEMON thread it abandoned -- a default-executor worker stuck in a
+    trickling socket read, or shutdown_default_executor's join helper waiting
+    on that worker -- is joined by the interpreter's threading._shutdown
+    atexit hook, holding exit open for as long as the thread runs. That join
+    happens after every Python-level cleanup, so no event-loop bound can
+    reach it; the only remaining lever is os._exit (13w0 fell-r2).
+
+    Gated narrowly: fires only when a live non-daemon thread provably
+    lingers after the loop is closed, and logs each by name first. Skipping
+    interpreter finalization here is safe -- run()'s cleanup tail has already
+    removed the pid file and control socket and closed the sqlite connection,
+    every reap arm issues its killpg synchronously before its first await,
+    and the alternative is exactly the unbounded hang the shutdown budget
+    exists to kill. Exits 0 on a clean (signal-driven) shutdown so systemd's
+    Restart=on-failure does not respin the daemon; if an exception is
+    mid-propagation it is logged here (it would otherwise be silenced) and
+    the exit code is 1.
+    """
+    lingering = [
+        thread
+        for thread in threading.enumerate()
+        if thread.is_alive()
+        and not thread.daemon
+        and thread is not threading.main_thread()
+    ]
+    if not lingering:
+        return
+    in_flight = sys.exc_info()[1]
+    LOGGER.error(
+        "%d non-daemon thread(s) still running after the bounded teardown "
+        "(%s); forcing process exit so threading._shutdown cannot hang it",
+        len(lingering),
+        ", ".join(sorted(thread.name for thread in lingering)),
+        exc_info=in_flight,
+    )
+    logging.shutdown()
+    os._exit(0 if in_flight is None else 1)
