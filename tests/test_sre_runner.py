@@ -158,8 +158,12 @@ def test_spawn_invocation_shape(tmp_path):
     prompt = captured_prompt["v"]
     working_dir = captured_working_dir["v"]
 
-    # working-dir should be the canonical repo root (tmp_path)
-    assert working_dir == str(tmp_path)
+    # The fixer agent must land in the ENGINE repo (CODE_ROOT), never the
+    # deployment root the runner was invoked against -- in a split deployment
+    # that root is a YAML-only lodging repo with no code or tests (the same
+    # deployment-root/code-root conflation belfry's stale-deploy check had).
+    assert working_dir == str(runner.CODE_ROOT)
+    assert working_dir != str(tmp_path)
 
     # prompt must contain the absolute report path under state/sre-reports/
     assert str(state / "sre-reports") in prompt

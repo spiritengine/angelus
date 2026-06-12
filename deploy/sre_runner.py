@@ -35,6 +35,15 @@ DEFAULT_FIXERS_LOG_FILENAME = "fixers.log"
 DEFAULT_ENV_FILENAME = "angelus.env"
 DEFAULT_SYSTEMD_UNIT = "angelus"
 
+# The engine repo, derived from this file's own location (deploy/sre_runner.py
+# lives one level under it). In a split deployment the runner's cwd is the
+# lodging root (state/ and the sentinel live there), but the SRE fixer agent
+# must land in the repo the daemon's CODE comes from -- spawning it against
+# the lodging root hands it a YAML-only repo with no code, no tests, and
+# nothing to merge. Same deployment-root/code-root distinction as belfry's
+# CODE_ROOT.
+CODE_ROOT = Path(__file__).resolve().parent.parent
+
 DEFAULT_MIN_SPAWN_INTERVAL_SEC = 2700    # 45 min between retries on same incident
 DEFAULT_MAX_SPAWNS = 3                   # hard cap in rolling window
 DEFAULT_SPAWN_WINDOW_SEC = 21600         # 6 h rolling window
@@ -593,7 +602,9 @@ def _run(root: Path, state: Path) -> int:
 
     prompt = build_sre_prompt(sentinel_reason, state, report_path)
     log_out(f"sre-runner: spawning SRE agent; expected report path: {report_path}")
-    spool_id = spindle_spin(prompt, str(root), tags="angelus-sre", env=child_env)
+    spool_id = spindle_spin(
+        prompt, str(CODE_ROOT), tags="angelus-sre", env=child_env
+    )
 
     if spool_id is None:
         log_err("sre-runner: spindle spin failed; spawn counted toward guards")
