@@ -649,6 +649,11 @@ def failure_surface(db_path: Path, state_path: Path) -> str | None:
     pages here anyway. So the incident IS the off-box signal; the dead_letter
     ROW detail (what to replay) belongs on the on-box health surface (B5), not
     on belfry. See B15 report / the runner's rung-3 comment for the full call.
+    The row<->incident pairing this read rides on is crash-durable: the
+    catalog commits the incident before the row flips to dead_letter, and the
+    daemon re-pairs any orphaned dead_letter row at startup (B14 durability
+    fix, brief-20260604-f324) -- so a product dead-letter cannot silently
+    outlive its incident across a daemon crash.
     """
     last_seen = read_failcheck_watermark(state_path)
     quoted = urllib.parse.quote(str(db_path), safe="/:")
