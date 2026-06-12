@@ -42,6 +42,14 @@ FAILURE_DETAIL_LIMIT = 3
 DEFAULT_SYSTEMD_UNIT = "angelus"
 SYSTEMCTL_TIMEOUT_SEC = 10
 
+# The engine repo, derived from this file's own location (belfry/belfry.py
+# lives one level under it). The deployment root (`root` in main, where
+# state/ and the lodging live) and the engine repo are different directories
+# in a split deployment, and the stale-deploy check must interrogate the
+# repo the daemon's *code* comes from -- `git -C <deployment-root> log --
+# angelus` matches nothing there and the check silently goes inert.
+CODE_ROOT = Path(__file__).resolve().parent.parent
+
 # B12 restart-fixer defaults.  All overridable via env vars.
 DEFAULT_RESTART_LOG_FILENAME = "belfry-restart-log"
 DEFAULT_NEEDS_SRE_FILENAME = "belfry-needs-sre"
@@ -180,7 +188,7 @@ def main(argv: list[str] | None = None) -> int:
         drift_reason = drift_failure(state / "angelus.pid")
         if drift_reason:
             other_reasons.append(drift_reason)
-        stale_reason = stale_deployment(state / "angelus.pid", root)
+        stale_reason = stale_deployment(state / "angelus.pid", CODE_ROOT)
         if stale_reason:
             other_reasons.append(stale_reason)
         # Delivery SLA: a pipe alive-but-not-delivering. Alert-only (OTHER),

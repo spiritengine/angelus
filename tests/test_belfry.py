@@ -1205,6 +1205,31 @@ def test_stale_deployment_pings_down_alert_only(tmp_path, monkeypatch) -> None:
     assert "stale-deploy" in " ".join(calls[-1])
 
 
+def test_stale_deployment_interrogates_code_root_not_deployment_root(
+    tmp_path, monkeypatch
+) -> None:
+    """main() must hand the stale check CODE_ROOT (the engine repo), never the
+    deployment root it was invoked with. This is the call-site half of the
+    2026-06-12 lodging-split regression: with the lodging root passed instead,
+    `git -C <lodging> log -- angelus` matches nothing and the check goes
+    inert. The constant-derivation half is pinned separately; this pins the
+    wiring, so a revert to `stale_deployment(..., root)` fails here even
+    though every other stale test monkeypatches last_code_commit_epoch with a
+    root-blind lambda."""
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    _alive_for_drift(tmp_path)
+    _record_mocks(belfry, monkeypatch)
+    roots: list = []
+    monkeypatch.setattr(
+        belfry, "last_code_commit_epoch", lambda root: roots.append(root) or None
+    )
+
+    belfry.main([str(tmp_path)])
+    assert roots == [belfry.CODE_ROOT]
+    assert roots[0] != tmp_path.resolve()
+
+
 def test_stale_deployment_does_not_fire_when_fresh(tmp_path, monkeypatch) -> None:
     """A live daemon started after the last commit pings SUCCESS -- no stale
     reason, no restart."""
@@ -1260,6 +1285,24 @@ def test_last_code_commit_epoch_no_angelus_commit_fails_open(tmp_path) -> None:
     run("add", "README.md")
     run("commit", "-qm", "docs only")
     assert belfry.last_code_commit_epoch(tmp_path) is None
+
+
+def test_code_root_is_the_engine_repo_not_the_deployment_root(tmp_path) -> None:
+    """CODE_ROOT must derive from belfry.py's own location (the engine repo),
+    never the deployment root. In a split deployment the daemon runs with its
+    cwd at a lodging root that contains no angelus/ package and no engine
+    history -- `git -C <lodging> log -- angelus` matches nothing there, and
+    the stale-deploy check silently went inert exactly that way when the
+    lodging was first split out (2026-06-12). The engine repo is one level
+    above belfry/."""
+    belfry = _load_belfry()
+    assert belfry.CODE_ROOT == Path(belfry.__file__).resolve().parent.parent
+    assert (belfry.CODE_ROOT / "belfry").is_dir()
+    # And the engine repo actually yields a code-commit epoch (this test runs
+    # from a git checkout; a non-repo install would fail open to None, which
+    # is the documented degraded mode, not a wiring bug).
+    epoch = belfry.last_code_commit_epoch(belfry.CODE_ROOT)
+    assert epoch is None or epoch > 1_500_000_000.0
 
 
 def test_starttime_ticks_parse_survives_comm_with_spaces_and_parens() -> None:
