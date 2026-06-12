@@ -1,0 +1,14 @@
+# Urgent/immediate findings ride push (notify-pat), never email. Email is the
+# routine digest transport (see daily.yaml); routing urgent alerts off it means a
+# dead SMTP route can't silently swallow the alerts that matter most. See the
+# "Transport separation" note in README's Reliability section.
+cadence: immediate
+channels:
+  - push
+render:
+  kind: dumb-alert
+  template: "[angelus] {severity} {type}: {entity} {body}"
+rate_limit:
+  per_channel: 6/hr
+  per_source: 4/hr
+  overflow: daily

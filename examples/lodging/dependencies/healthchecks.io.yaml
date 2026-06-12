@@ -1,0 +1,10 @@
+# healthchecks.io: external tripwire/cron-monitoring service.
+# Tripwire-URL simplification: there is ONE check mechanism (a shell
+# command), so a "tripwire URL" dependency is just a check that curls the
+# URL. A plain GET of the public site is non-side-effecting (it does NOT
+# ping/complete any check, which a hc-ping.com/<uuid> hit would). Point
+# this at a specific status/ping URL for a deployment; the URL and the
+# 10s timeout are adjustable.
+name: healthchecks.io
+check: curl -fsS --max-time 10 -o /dev/null https://healthchecks.io/
+timeout_seconds: 15

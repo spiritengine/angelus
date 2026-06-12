@@ -1,0 +1,30 @@
+selector:
+  kind: web
+  labels: [archive]
+check:
+  kind: shell
+  # See watch/web-important.yaml for the rationale on --max-time, the
+  # `|| true` guard, and the quoted %{http_code} (avoids leading-zero
+  # invalid-JSON when curl emits 000 on connection failure).
+  #
+  # `-L` follows redirects so a canonical 308/301 (e.g. /docket -> /docket/)
+  # reports the final 200 instead of false-alarming as down. TLS validation
+  # is strict (no -k) -- a wrong/expired cert should surface as down.
+  #
+  # `state` is the change-detection token (observation collapse): set it to the
+  # status code so an identical 200 collapses (no observation) while 200->503
+  # writes one. It duplicates status_code on purpose -- the daemon's signature
+  # reads `state` and stays decoupled from the rest of the payload shape.
+  command: >
+    curl -sS -L -o /dev/null --max-time 25
+    -w '{{"entity":"{entity}","url":"{url}","status_code":"%{{http_code}}","state":"%{{http_code}}"}}'
+    {url} || true
+  # See watch/web-important.yaml for the timeout rationale.
+  timeout_seconds: 40
+handler:
+  kind: python
+  path: triagers/handlers/http_status.py
+cadence: 4h
+severity: medium
+target_pipe: now
+clearance_pipe: daily

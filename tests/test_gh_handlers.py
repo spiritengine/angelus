@@ -23,8 +23,8 @@ from angelus.triage import run_python_triager
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-CI_HANDLER = REPO_ROOT / "triagers" / "handlers" / "gh_actions_status.py"
-STALE_HANDLER = REPO_ROOT / "triagers" / "handlers" / "gh_stale_pr.py"
+CI_HANDLER = REPO_ROOT / "examples" / "lodging" / "triagers" / "handlers" / "gh_actions_status.py"
+STALE_HANDLER = REPO_ROOT / "examples" / "lodging" / "triagers" / "handlers" / "gh_stale_pr.py"
 
 
 def _invoke(handler: Path, observation: dict, prior_state: dict, metadata: dict) -> dict:
@@ -434,7 +434,7 @@ def test_load_lodging_fans_out_per_repo_active() -> None:
     per (watch, active repo). Catches the regression where a future
     entity-loader change loses the repo-kind fan-out -- the brief's whole
     point of "drop-a-file, get-discovered" rides on this property."""
-    lodging = load_lodging(REPO_ROOT)
+    lodging = load_lodging(REPO_ROOT / "examples" / "lodging")
     repo_sources = sorted(
         ref for ref in lodging.sources
         if ref.startswith("scheduled/ci-failing-on-main__")
@@ -443,21 +443,21 @@ def test_load_lodging_fans_out_per_repo_active() -> None:
     # One ci-failing watch + one stale-pr watch per active repo entity.
     assert len(repo_sources) >= 2, "expected at least one repo fan-out pair"
     assert any(
-        "ci-failing-on-main__skein" in ref for ref in repo_sources
-    ), "skein entity must be picked up by ci-failing-on-main watch"
+        "ci-failing-on-main__example-repo" in ref for ref in repo_sources
+    ), "example-repo entity must be picked up by ci-failing-on-main watch"
     assert any(
-        "stale-pr__skein" in ref for ref in repo_sources
-    ), "skein entity must be picked up by stale-pr watch"
+        "stale-pr__example-repo" in ref for ref in repo_sources
+    ), "example-repo entity must be picked up by stale-pr watch"
 
 
 def test_load_lodging_substitutes_repo_attrs_into_command() -> None:
     """github + default_branch from the entity YAML must land in the
     rendered command. If substitution breaks for repo kind, the daemon
     fires `gh run list --repo {github}` literally and gh errors."""
-    lodging = load_lodging(REPO_ROOT)
-    source = lodging.sources["scheduled/ci-failing-on-main__skein"]
-    assert "--repo spiritengine/skein" in source.command
-    assert "--branch master" in source.command
+    lodging = load_lodging(REPO_ROOT / "examples" / "lodging")
+    source = lodging.sources["scheduled/ci-failing-on-main__example-repo"]
+    assert "--repo your-org/your-repo" in source.command
+    assert "--branch main" in source.command
     # No leftover format-brace artifacts in the rendered command.
     assert "{github}" not in source.command
     assert "{default_branch}" not in source.command
@@ -469,9 +469,9 @@ def test_load_lodging_repo_triager_metadata_has_entity_and_pipes() -> None:
     target_pipe at `now` without an explicit operator decision (i.e. a
     real action lives behind the urgent path), this test forces the
     decision to surface in the diff."""
-    lodging = load_lodging(REPO_ROOT)
-    triager = lodging.triagers["ci-failing-on-main__skein"]
-    assert triager.metadata["entity"] == "skein"
+    lodging = load_lodging(REPO_ROOT / "examples" / "lodging")
+    triager = lodging.triagers["ci-failing-on-main__example-repo"]
+    assert triager.metadata["entity"] == "example-repo"
     assert triager.metadata["entity_kind"] == "repo"
     assert triager.metadata["target_pipe"] == "daily"
     assert triager.metadata["clearance_pipe"] == "daily"
@@ -481,13 +481,13 @@ def test_repo_handler_through_runner(tmp_path: Path) -> None:
     """End-to-end: drive a synthesized repo triager through the actual
     runner with a constructed observation. Catches contract drift
     between expand's metadata shape and the gh_actions_status handler."""
-    lodging = load_lodging(REPO_ROOT)
-    triager = lodging.triagers["ci-failing-on-main__skein"]
+    lodging = load_lodging(REPO_ROOT / "examples" / "lodging")
+    triager = lodging.triagers["ci-failing-on-main__example-repo"]
     findings, state = asyncio.run(
         run_python_triager(
             triager,
             {
-                "entity": "skein",
+                "entity": "example-repo",
                 "conclusion": "failure",
                 "status": "completed",
                 "sha": "deadbeef" * 5,
@@ -498,7 +498,7 @@ def test_repo_handler_through_runner(tmp_path: Path) -> None:
     )
     assert state == {"last_conclusion": "failing"}
     assert len(findings) == 1
-    assert findings[0]["entity"] == "skein"
+    assert findings[0]["entity"] == "example-repo"
     assert findings[0]["type"] == "down"
     assert findings[0]["target_pipes"] == ["daily"]
 
@@ -513,7 +513,7 @@ def test_every_synthesized_source_has_a_parseable_cadence() -> None:
     fast targeted test."""
     from angelus.daemon import _make_trigger
 
-    lodging = load_lodging(REPO_ROOT)
+    lodging = load_lodging(REPO_ROOT / "examples" / "lodging")
     for ref, source in lodging.sources.items():
         try:
             _make_trigger(source.cadence)
@@ -544,8 +544,8 @@ def test_ci_watch_command_round_trips_through_jq_on_empty_runs() -> None:
 
     Uses a local jq invocation rather than a live gh call so the test
     doesn't depend on network or auth state."""
-    lodging = load_lodging(REPO_ROOT)
-    source = lodging.sources["scheduled/ci-failing-on-main__skein"]
+    lodging = load_lodging(REPO_ROOT / "examples" / "lodging")
+    source = lodging.sources["scheduled/ci-failing-on-main__example-repo"]
     jq_filter = _extract_jq_filter(source.command)
     result = subprocess.run(
         ["jq", "-c", jq_filter],
@@ -555,7 +555,7 @@ def test_ci_watch_command_round_trips_through_jq_on_empty_runs() -> None:
     )
     payload = json.loads(result.stdout)
     assert payload == {
-        "entity": "skein",
+        "entity": "example-repo",
         "conclusion": None,
         "status": None,
         "run_started": None,
@@ -574,8 +574,8 @@ def test_stale_pr_watch_command_round_trips_through_jq() -> None:
     missing -- and jq would parse `entity: ..., prs: .` as a syntax
     error. Feed both empty and populated arrays so the wrapping
     behavior is verified end-to-end."""
-    lodging = load_lodging(REPO_ROOT)
-    source = lodging.sources["scheduled/stale-pr__skein"]
+    lodging = load_lodging(REPO_ROOT / "examples" / "lodging")
+    source = lodging.sources["scheduled/stale-pr__example-repo"]
     jq_filter = _extract_jq_filter(source.command)
 
     empty = subprocess.run(
@@ -587,7 +587,7 @@ def test_stale_pr_watch_command_round_trips_through_jq() -> None:
     # `state` is the observation-collapse token: a canonical representation of
     # the STALE set (PRs older than the threshold). Empty PR list -> "clear".
     assert json.loads(empty.stdout) == {
-        "entity": "skein",
+        "entity": "example-repo",
         "prs": [],
         "state": "clear",
     }
@@ -607,7 +607,7 @@ def test_stale_pr_watch_command_round_trips_through_jq() -> None:
         check=True,
     )
     payload = json.loads(populated.stdout)
-    assert payload["entity"] == "skein"
+    assert payload["entity"] == "example-repo"
     assert payload["prs"][0]["number"] == 7
     assert payload["state"] == "7"
 
@@ -728,6 +728,6 @@ def test_repo_watch_yaml_loads_without_error(watch_name: str) -> None:
     handler -- only load_lodging exercises parse_watch. Pin both files
     as parseable so a future syntax mistake fails one targeted test
     rather than every integration test."""
-    lodging = load_lodging(REPO_ROOT)
+    lodging = load_lodging(REPO_ROOT / "examples" / "lodging")
     matches = [name for name in lodging.triagers if name.startswith(f"{watch_name}__")]
     assert matches, f"watch {watch_name} produced no triagers"

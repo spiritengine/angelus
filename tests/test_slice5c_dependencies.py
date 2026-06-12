@@ -495,7 +495,7 @@ def test_run_shell_source_kills_hung_command_on_timeout(tmp_path) -> None:
 
 
 def test_lodged_notify_and_email_checks_are_non_sending() -> None:
-    deps = REPO_ROOT / "dependencies"
+    deps = REPO_ROOT / "examples" / "lodging" / "dependencies"
     notify = parse_dependency(deps / "notify-pat.yaml")
     email = parse_dependency(deps / "patbot-email.yaml")
 
@@ -509,7 +509,7 @@ def test_lodged_notify_and_email_checks_are_non_sending() -> None:
 
 
 def test_all_six_dependencies_are_lodged() -> None:
-    loaded = _load_dependencies(REPO_ROOT)
+    loaded = _load_dependencies(REPO_ROOT / "examples" / "lodging")
     assert set(loaded) == {
         "mill-wheel",
         "spindle",

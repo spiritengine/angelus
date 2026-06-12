@@ -86,7 +86,7 @@ def _write_lodging(root: Path, status_code: int = 503) -> Path:
 
     (root / "triagers" / "handlers").mkdir(parents=True)
     shutil.copy(
-        PROJECT_ROOT / "triagers" / "handlers" / "canary_watch.py",
+        PROJECT_ROOT / "examples" / "lodging" / "triagers" / "handlers" / "canary_watch.py",
         root / "triagers" / "handlers" / "canary_watch.py",
     )
     (root / "triagers" / "watch.yaml").write_text(

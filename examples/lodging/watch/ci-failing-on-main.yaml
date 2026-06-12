@@ -1,0 +1,42 @@
+selector:
+  kind: repo
+  labels: [active]
+check:
+  kind: shell
+  # `gh run list --limit 1` on the default branch gives the latest
+  # terminal run. The --jq filter wraps the result array in an object
+  # (the source-runner rejects bare arrays). `.[0]` returns null fields
+  # when the array is empty, which the handler classifies as "unknown"
+  # (no findings, no state change) -- repos without CI runs go quiet
+  # rather than failing loud. Outer `{{...}}` are escaped braces for
+  # python .format(); inner `{entity}`, `{github}`, `{default_branch}`
+  # are entity-field substitutions.
+  #
+  # `state` is the observation-collapse token: the run CONCLUSION (not the
+  # whole payload). This is the case where a whole-payload diff would be wrong
+  # -- a new GREEN run has a fresh sha/run_started every push but the same
+  # conclusion="success", so keying on conclusion collapses those to no
+  # observation, while success->failure (or recovery) always writes one. A
+  # null conclusion (run in progress / no runs) collapses with the prior null,
+  # matching the handler's "skip on null" behavior.
+  command: >
+    gh run list --repo {github} --branch {default_branch} --limit 1
+    --json conclusion,status,createdAt,headSha,name
+    --jq '{{entity: "{entity}", conclusion: .[0].conclusion, status: .[0].status, run_started: .[0].createdAt, sha: .[0].headSha, workflow: .[0].name, state: .[0].conclusion}}'
+  timeout_seconds: 30
+handler:
+  kind: python
+  path: triagers/handlers/gh_actions_status.py
+# 3:30 AM local time. AsyncIOScheduler is configured timezone="UTC",
+# but CronTrigger.from_crontab() defaults the trigger timezone to LOCAL
+# (apscheduler.util.astimezone()), not the scheduler's. So this cron
+# fires at 03:30 in whatever the box's local timezone is. End-to-end
+# review fell-r4 (2026-05-26) initially claimed this would fire at
+# 03:30 UTC and I trusted it; verified empirically afterward that the
+# trigger's timezone is in fact America/New_York on this box.
+# Broken CI is "review with morning coffee", not "drop everything" --
+# severity low + target_pipe daily keeps it off the urgent push channel.
+cadence: "30 3 * * *"
+severity: low
+target_pipe: daily
+clearance_pipe: daily

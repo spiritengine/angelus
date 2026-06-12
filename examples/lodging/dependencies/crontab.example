@@ -1,0 +1,24 @@
+# Dependency health probes (slice 5c).
+#
+# Each line runs one dependency's check and reports it to the daemon over
+# the control socket via `angelus dep-record`. The probe NEVER writes
+# sqlite -- the daemon (the single writer) performs the upsert. Dep checks
+# run from cron, NOT the daemon's APScheduler, deliberately: dep health
+# must not couple to the daemon's own liveness.
+#
+# PATH: under cron the `angelus` CLI must be on PATH (the same catch
+# belfry/crontab.example documents for notify-pat). Set it explicitly --
+# cron's default PATH is minimal and will not find a pip/pyenv install.
+# Adjust the path for your machine.
+# PATH=/home/you/.local/bin:/home/you/.pyenv/shims:/usr/local/bin:/usr/bin:/bin
+#
+# Cadence: every 10 minutes below. Adjustable -- 5-15 min is sane; pick
+# per how fast you need to learn a dependency is down. `cd` to the
+# angelus root so --root resolves state/ and dependencies/.
+
+*/10 * * * * cd /path/to/angelus && angelus dep-check mill-wheel      >> state/dep-check.log 2>&1
+*/10 * * * * cd /path/to/angelus && angelus dep-check spindle         >> state/dep-check.log 2>&1
+*/10 * * * * cd /path/to/angelus && angelus dep-check skein           >> state/dep-check.log 2>&1
+*/10 * * * * cd /path/to/angelus && angelus dep-check notify-pat      >> state/dep-check.log 2>&1
+*/10 * * * * cd /path/to/angelus && angelus dep-check patbot-email    >> state/dep-check.log 2>&1
+*/10 * * * * cd /path/to/angelus && angelus dep-check healthchecks.io >> state/dep-check.log 2>&1

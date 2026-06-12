@@ -1,0 +1,7 @@
+# A second web entity carrying the [archive] label, so the shipped
+# watch/web-archive.yaml has something to expand against out of the box
+# (web-important selects [important]; web-archive selects [archive] --
+# lower-stakes sites checked on a slower cadence at lower severity).
+kind: web
+url: https://archive.example.com
+labels: [archive, web]

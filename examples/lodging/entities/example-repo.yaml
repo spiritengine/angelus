@@ -1,0 +1,10 @@
+# A repo entity: a git repository watched for CI failures on the default
+# branch (watch/ci-failing-on-main.yaml) and stale PRs (watch/stale-pr.yaml),
+# both of which select on the [active] label. `github` is the owner/name the
+# gh CLI is pointed at; `local_path` is where the checkout lives on the box
+# running angelus.
+kind: repo
+github: your-org/your-repo
+local_path: /path/to/your-repo
+default_branch: main
+labels: [active, repo]

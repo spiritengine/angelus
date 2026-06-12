@@ -1,0 +1,54 @@
+selector:
+  kind: repo
+  labels: [active]
+check:
+  kind: shell
+  # `gh pr list` produces a bare array; we wrap it in a {entity, prs}
+  # object so the source-runner accepts it as JSON. --limit 100 bounds
+  # the listing (default is 30, which silently truncates on busy repos);
+  # for spiritengine-scale projects 100 is far above the watermark. If
+  # a repo ever exceeds this the handler simply misses the older PRs,
+  # which doesn't surface a false-alert -- the existing alerts persist
+  # and the watch is still useful for the visible PRs.
+  #
+  # `state` is the observation-collapse token. Staleness is TIME-dependent: a
+  # PR with a fixed updatedAt flips fresh->stale purely as the clock advances,
+  # with NO change to the payload. So the token canNOT be the open-PR set (that
+  # would be byte-identical day over day and would COLLAPSE away the very tick
+  # where the PR crosses the threshold -- a missed transition, the one thing we
+  # must never do). Instead the jq computes the ACTUAL stale set here -- the
+  # sorted numbers of PRs whose updatedAt is older than the threshold, or
+  # "clear" when none -- so the observation fires exactly when the stale set
+  # changes (a PR crossing in, or recovering/merging out), not every nightly
+  # tick. `// "1970-..."` makes a null/absent updatedAt sort as ancient (gh
+  # always populates it; this is belt-and-suspenders and errs toward writing).
+  #
+  # SINGLE SOURCE OF TRUTH: the staleness threshold is `metadata.stale_days`
+  # below. The jq derives its cutoff as `{stale_days} * 86400` seconds via the
+  # command-template substitution (_substitute threads watch metadata into the
+  # render context), so the detection token and the handler (gh_stale_pr.py,
+  # which reads the same metadata.stale_days) can never diverge. Editing
+  # stale_days moves BOTH the token-flip tick and the handler's alerting in
+  # lockstep -- the prior duplicated 2592000 literal made a missed transition
+  # possible if one copy was edited without the other.
+  command: >
+    gh pr list --repo {github} --state open --limit 100
+    --json number,title,updatedAt
+    --jq '{{entity: "{entity}", prs: ., state: (([.[] | select(((.updatedAt // "1970-01-01T00:00:00Z") | fromdateiso8601) < (now - ({stale_days} * 86400))) | .number] | sort | map(tostring) | join(",")) as $s | if $s == "" then "clear" else $s end)}}'
+  timeout_seconds: 30
+handler:
+  kind: python
+  path: triagers/handlers/gh_stale_pr.py
+# 3:00 AM local time. CronTrigger.from_crontab() defaults to LOCAL
+# timezone (NOT the scheduler's "UTC"), so this fires at 03:00 in
+# Patrick's TZ. Fires 30 min before ci-failing-on-main and ~5h before
+# the daily digest drain. Interval cadences (`1d`) are NOT supported by
+# _cadence_seconds (only s/m/h units) -- using cron is the load-bearing
+# fix that lets this watch's source schedule successfully at daemon
+# startup.
+cadence: "0 3 * * *"
+severity: low
+target_pipe: daily
+clearance_pipe: daily
+metadata:
+  stale_days: 30

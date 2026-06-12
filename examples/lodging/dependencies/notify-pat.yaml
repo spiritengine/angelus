@@ -1,0 +1,6 @@
+# notify-pat: the push channel CLI (channels/push.yaml runs `notify-pat`).
+# NON-SENDING probe: `notify-pat --help` prints argparse help and exits 0
+# without sending anything. A naive `notify-pat ping` would spam Patrick's
+# phone every cron tick -- the check MUST stay a help/version probe.
+name: notify-pat
+check: notify-pat --help

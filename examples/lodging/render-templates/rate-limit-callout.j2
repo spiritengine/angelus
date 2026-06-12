@@ -1,0 +1,10 @@
+{# Inline `{{ }}` expressions only, no end-of-line `{% endif %}`. See incident-status.j2
+   for the trim_blocks footgun explanation. e2e review 2026-05-27 BLOCK #1. #}
+{% if suppressed_findings %}
+Rate-limit overflow since last digest ({{ suppressed_findings|length }}):
+{% for finding in suppressed_findings -%}
+- {{ finding.severity|default("unknown", true) }} {{ finding.type }}: {{ finding.entity }}{{ " (" ~ finding.body_text ~ ")" if finding.body_text else "" }}
+{% endfor -%}
+{% else %}
+Rate-limit overflow: none
+{% endif %}

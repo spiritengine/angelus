@@ -1,0 +1,5 @@
+inputs:
+  source: scheduled/canary-loose-a
+handler:
+  kind: python
+  path: triagers/handlers/canary_watch.py

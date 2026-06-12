@@ -1,0 +1,9 @@
+# A web entity: something with a URL whose up/down state you care about.
+# The `labels` are free-form selectors -- watch/*.yaml definitions match
+# entities by label (e.g. watch/web-important.yaml selects [important],
+# watch/web-archive.yaml selects [archive]). Add labels for your own
+# grouping (which host a site lives on, which stack serves it) as you like;
+# unmatched labels are inert.
+kind: web
+url: https://example.com
+labels: [important, web]

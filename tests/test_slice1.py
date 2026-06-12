@@ -15,34 +15,34 @@ from angelus.triage import run_python_triager
 
 
 def test_lodging_loads_cross_references() -> None:
-    lodging = load_lodging(Path.cwd())
+    lodging = load_lodging(Path.cwd() / "examples" / "lodging")
 
-    # iotaschool now arrives via the entities + watch expansion path:
-    # entities/iotaschool.com.yaml (kind: web, labels: [archive, ...]) is
+    # The archive site arrives via the entities + watch expansion path:
+    # entities/example-archive.yaml (kind: web, labels: [archive, ...]) is
     # picked up by watch/web-archive.yaml's selector and synthesized as
     # the source ref below.
-    assert "scheduled/web-archive__iotaschool.com" in lodging.sources
-    triager = lodging.triagers["web-archive__iotaschool.com"]
-    assert triager.source_ref == "scheduled/web-archive__iotaschool.com"
-    assert triager.metadata.get("entity") == "iotaschool.com"
+    assert "scheduled/web-archive__example-archive" in lodging.sources
+    triager = lodging.triagers["web-archive__example-archive"]
+    assert triager.source_ref == "scheduled/web-archive__example-archive"
+    assert triager.metadata.get("entity") == "example-archive"
     assert triager.metadata.get("severity") == "medium"
-    # The urgent `now` pipe rides push (notify-pat), not email -- urgent alerts
-    # must not share fate with the routine email digest. See B6 / README's
+    # The urgent `now` pipe rides push, not email -- urgent alerts must not
+    # share fate with the routine email digest. See B6 / README's
     # "Transport separation" note.
     assert lodging.pipes["now"].channels == ["push"]
-    assert lodging.channels["email"].command.endswith("patbot-email")
+    assert lodging.channels["email"].command == "your-email-cli"
 
 
 def test_http_status_handler_emits_down_finding() -> None:
-    lodging = load_lodging(Path.cwd())
-    triager = lodging.triagers["web-archive__iotaschool.com"]
+    lodging = load_lodging(Path.cwd() / "examples" / "lodging")
+    triager = lodging.triagers["web-archive__example-archive"]
 
     findings, state = asyncio.run(
         run_python_triager(
             triager,
             {
-                "entity": "iotaschool.com",
-                "url": "https://iotaschool.com",
+                "entity": "example-archive",
+                "url": "https://archive.example.com",
                 "status_code": 503,
             },
             {"last_status": 200},
@@ -51,7 +51,7 @@ def test_http_status_handler_emits_down_finding() -> None:
 
     assert state == {"last_status": 503}
     assert findings[0]["type"] == "down"
-    assert findings[0]["entity"] == "iotaschool.com"
+    assert findings[0]["entity"] == "example-archive"
     assert findings[0]["severity"] == "medium"
     assert findings[0]["target_pipes"] == ["now"]
 

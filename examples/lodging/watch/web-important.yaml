@@ -1,0 +1,50 @@
+selector:
+  kind: web
+  labels: [important]
+check:
+  kind: shell
+  # Two pieces of trickery wrap the curl call:
+  #
+  # - `--max-time 25` keeps curl inside the source's 30s subprocess
+  #   timeout so a server that accepts TCP but never sends an HTTP
+  #   response still gets its -w output written (with http_code=000)
+  #   before the runner kills the process. Without it the observation
+  #   ends up check_failed and no down finding is emitted.
+  # - `|| true` swallows curl's non-zero exit on DNS/TCP/TLS failure so
+  #   the status_code flows through; without it source-runner records a
+  #   check_failed observation and the handler never sees the failure.
+  #
+  # `%{http_code}` is QUOTED in the format string -- curl prints it
+  # zero-padded ("000" on connection failure), which is invalid JSON as
+  # a bare number (RFC 8259 forbids leading zeros). _coerce_status in
+  # the handler does int(value) and accepts the string. See opus +
+  # sonnet fell-r2 finding #1.
+  #
+  # `-L` follows redirects so a canonical 308/301 reports the final 200
+  # rather than false-alarming as down. No `-k` here: important sites keep
+  # strict TLS validation, so an expired/wrong cert still surfaces as down.
+  #
+  # `state` is the observation-collapse token: the status code, so an identical
+  # 200 every 5 min collapses to one "last checked" bump and writes NO new
+  # observation, while a 200->503 (or 503->200 recovery) always writes one. It
+  # mirrors status_code deliberately -- the daemon's change signature reads
+  # `state` and so is insulated from any future payload-shape change.
+  command: >
+    curl -sS -L -o /dev/null --max-time 25
+    -w '{{"entity":"{entity}","url":"{url}","status_code":"%{{http_code}}","state":"%{{http_code}}"}}'
+    {url} || true
+  # Outer subprocess timeout: curl's --max-time is 25s; the gap to 40s
+  # leaves 15s for fork latency, slow DNS, or asyncio scheduling under
+  # load so the outer asyncio.wait_for doesn't SIGKILL curl before its
+  # -w buffer is flushed (opus fell-r3 #2). If it does, the observation
+  # ends up check_failed -- the handler now treats that as down too,
+  # so the alert still fires, but losing the http_code distinction
+  # degrades the body text.
+  timeout_seconds: 40
+handler:
+  kind: python
+  path: triagers/handlers/http_status.py
+cadence: 5m
+severity: high
+target_pipe: now
+clearance_pipe: daily

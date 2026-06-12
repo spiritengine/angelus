@@ -1,0 +1,27 @@
+{# Inline `{{ ... if ... }}` expressions on the body lines, NOT `{% if %}...{% endif %}`. The
+   Environment uses trim_blocks=True which consumes the newline AFTER a block tag like {% endif %};
+   if the {% endif %} is the last thing on a line, the per-iteration newline is eaten and bullets
+   collapse onto one line. Inline {{ }} expressions don't consume the trailing newline.
+   end-to-end review 2026-05-27 BLOCK #1. #}
+{% if open_incidents %}
+Open incidents ({{ open_incidents|length }}):
+{% for incident in open_incidents -%}
+- {{ incident.severity|default("unknown", true) }} {{ incident.type }}: {{ incident.entity }}{{ " (since " ~ incident.opened_at_local ~ ")" if incident.opened_at_local else "" }}
+{% endfor -%}
+{% else %}
+Open incidents: none
+{% endif %}
+{% if recent_closures %}
+
+Closed since last digest ({{ recent_closures|length }}):
+{% for closure in recent_closures -%}
+- {{ closure.entity }}{{ ": " ~ closure.body_text if closure.body_text else "" }}
+{% endfor -%}
+{% endif %}
+{% if findings_since_last_drain %}
+
+New findings since last digest ({{ findings_since_last_drain|length }}):
+{% for f in findings_since_last_drain -%}
+- {{ f.severity|default("unknown", true) }} {{ f.type }} on {{ f.entity }}{{ ": " ~ f.body_text if f.body_text else "" }}
+{% endfor -%}
+{% endif %}

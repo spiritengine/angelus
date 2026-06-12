@@ -47,6 +47,39 @@ pipe, and the `push` channel.
 pip install -e .
 ```
 
+## Deployment layout: the lodging root
+
+This repo is the **engine**. A deployment lives in its own directory — the
+**lodging root** — holding the YAML that describes *your* watches plus the
+runtime state:
+
+    my-angelus/
+    ├── entities/        # what you watch (sites, repos)
+    ├── watch/           # selector-based watch definitions
+    ├── channels/        # how alerts go out (push, email)
+    ├── pipes/           # aggregation tiers (now, daily)
+    ├── sources/         # fixed scheduled sources (canaries)
+    ├── triagers/        # classification stage + handler scripts
+    ├── fixers/          # autoremediation (optional)
+    ├── dependencies/    # dep health checks (optional)
+    └── state/           # sqlite, logs, sockets, angelus.env (never commit)
+
+Everything resolves off the process working directory (or `--root`): run
+`angelus daemon` and `angelus health` from the lodging root. Under systemd
+that means `WorkingDirectory=` points at the lodging root while the package
+itself is pip-installed from this repo.
+
+`examples/lodging/` is a complete, working starting point — copy it and edit:
+
+```sh
+cp -r examples/lodging my-angelus && cd my-angelus
+cp /path/to/angelus/state/angelus.env.example state/angelus.env
+angelus daemon
+```
+
+Keeping the lodging root in its own (private) git repo is the intended
+pattern: the engine stays public, your monitoring topology stays yours.
+
 ## Run
 
 ```sh
@@ -59,15 +92,15 @@ calling `notify-pat`.
 
 ## Configuration
 
-Non-secret runtime config lives in one place: `state/angelus.env`. This is the
-single source of truth so the daemon and the belfry can't drift apart — the
-2026-05-29 incident was exactly that drift, when the daemon was relaunched
-outside systemd and silently lost `ANGELUS_EMAIL_TO`.
+Non-secret runtime config lives in one place: `state/angelus.env` under the
+lodging root. This is the single source of truth so the daemon and the belfry
+can't drift apart — the 2026-05-29 incident was exactly that drift, when the
+daemon was relaunched outside systemd and silently lost `ANGELUS_EMAIL_TO`.
 
-Copy the checked-in template and fill it in:
+Copy the template from this repo into your lodging root and fill it in:
 
 ```sh
-cp state/angelus.env.example state/angelus.env
+cp state/angelus.env.example /path/to/lodging-root/state/angelus.env
 ```
 
 `state/angelus.env` is gitignored; `state/angelus.env.example` is the tracked
@@ -397,9 +430,9 @@ the same file belfry's restart-fixer writes — so fixer actions flow into the
 daily digest's `fixer_actions` section and any postmortem with no extra
 plumbing.
 
-`fixers/observe-internal-incident.yaml.disabled` ships as a documented, inert
-template (and the `observe.py` handler it points at is the copy-me starting
-point for a real fixer).
+`examples/lodging/fixers/observe-internal-incident.yaml.disabled` ships as a
+documented, inert template (and the `observe.py` handler it points at is the
+copy-me starting point for a real fixer).
 
 ### Forcing scheduled work on demand (drain / fire-source)
 

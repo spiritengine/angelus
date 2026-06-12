@@ -1,0 +1,10 @@
+# patbot-email: the email channel CLI (channels/email.yaml runs
+# an email-sending CLI on PATH). Lodged as
+# "patbot-email" to match the actual binary and email channel (the spec
+# draft called it "patbot_mail").
+# NON-SENDING probe: `--help` prints argparse usage and exits 0; sending
+# requires the explicit `send` subcommand, which this never invokes. A
+# check that actually sent mail would email out every cron tick -- the
+# check MUST stay a help/version probe.
+name: patbot-email
+check: your-email-cli --help

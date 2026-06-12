@@ -122,7 +122,7 @@ def _write_canary_lodging(root: Path) -> Path:
     (root / "triagers" / "handlers").mkdir()
     for handler_name in ("canary_watch.py", "http_status.py"):
         shutil.copy(
-            PROJECT_ROOT / "triagers" / "handlers" / handler_name,
+            PROJECT_ROOT / "examples" / "lodging" / "triagers" / "handlers" / handler_name,
             root / "triagers" / "handlers" / handler_name,
         )
     # Synthesize an iotaschool dead-link triager YAML the same way a watch
@@ -146,7 +146,7 @@ def _write_canary_lodging(root: Path) -> Path:
         "canary-loose-b-watch.yaml",
     ):
         shutil.copy(
-            PROJECT_ROOT / "triagers" / triager_yaml,
+            PROJECT_ROOT / "examples" / "lodging" / "triagers" / triager_yaml,
             root / "triagers" / triager_yaml,
         )
 

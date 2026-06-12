@@ -1,0 +1,8 @@
+# mill-wheel: the mill scheduling engine. There is no standalone
+# `mill-wheel` binary -- it ships inside mill -- so the most innocuous
+# available probe is `mill --help` (exits 0, runs no chain, schedules
+# nothing). This is a proxy: mill being importable/runnable implies the
+# mill-wheel scheduler is available. Adjust to a real mill-wheel status
+# command if one is later exposed.
+name: mill-wheel
+check: mill --help

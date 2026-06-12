@@ -1,0 +1,30 @@
+# Trivial wiring-proof fixer (B11). Shipped DISABLED (the `.disabled` suffix
+# keeps _enabled_yaml_files from loading it) so it documents the fixer shape
+# and proves the registry wiring in tests without firing in production -- an
+# always-on observe-only fixer would just add noise to fixers.log and the
+# daily digest. Drop the `.disabled` suffix (or copy this file) to activate a
+# real binding.
+#
+# A fixer binds a CONDITION (matched against live catalog state each pass) to a
+# python HANDLER (run as a subprocess, like a triager) under GUARDRAILS that
+# cap how often it may fire.
+condition:
+  # open_internal_incident: fires while an open incident matches. `source` is
+  # required and matched exactly; `incident_type` and `entity` are optional and
+  # narrow the match further. (The other kind is channel_unhealthy, which takes
+  # an optional `channel`.)
+  kind: open_internal_incident
+  source: internal/dep
+
+handler:
+  kind: python
+  path: fixers/handlers/observe.py
+  timeout_seconds: 30
+
+guardrails:
+  # At most max_attempts within window_seconds for a given condition instance,
+  # and at least backoff_seconds between attempts. Required: a fixer with no
+  # ceiling is the restart-a-misconfig-forever failure the project forbids.
+  max_attempts: 3
+  window_seconds: 3600
+  backoff_seconds: 300

@@ -68,7 +68,7 @@ def test_fixer_actions_validates_in_pipe_config(tmp_path):
 
 def test_repo_daily_yaml_loads_with_fixer_actions():
     """The shipped pipes/daily.yaml with fixer_actions must load cleanly."""
-    lodging = load_lodging(Path.cwd())
+    lodging = load_lodging(Path.cwd() / "examples" / "lodging")
     assert "fixer_actions" in lodging.pipes["daily"].render["body"]["inputs"]
 
 

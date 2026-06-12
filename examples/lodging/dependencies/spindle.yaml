@@ -1,0 +1,5 @@
+# spindle: headless-harness delegation MCP server. `spindle --version` is
+# not recognized (exits 2); `spindle --help` is the non-side-effecting
+# liveness probe (exits 0, spawns no work).
+name: spindle
+check: spindle --help

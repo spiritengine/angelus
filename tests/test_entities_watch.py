@@ -26,7 +26,7 @@ from angelus.triage import run_python_triager
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-HTTP_STATUS_HANDLER = REPO_ROOT / "triagers" / "handlers" / "http_status.py"
+HTTP_STATUS_HANDLER = REPO_ROOT / "examples" / "lodging" / "triagers" / "handlers" / "http_status.py"
 
 
 def _entity(
@@ -329,7 +329,7 @@ def test_stale_pr_jq_threshold_tracks_stale_days() -> None:
     stale under BOTH thresholds and the stale_days=60 assertion would break.
     Goes through the real watch YAML and the real expand path so it also
     proves expand threads watch metadata into the command render."""
-    watch = parse_watch(REPO_ROOT, REPO_ROOT / "watch" / "stale-pr.yaml")
+    watch = parse_watch(REPO_ROOT / "examples" / "lodging", REPO_ROOT / "examples" / "lodging" / "watch" / "stale-pr.yaml")
     entity = _entity(
         "skein", kind="repo", labels=("active",), github="spiritengine/skein"
     )
@@ -558,10 +558,10 @@ def test_watch_curl_output_on_connection_failure_is_valid_json() -> None:
     Port 1 is privileged and almost never bound; TCP returns RST
     immediately. Curl exits non-zero, `|| true` masks, `-w` is written.
     """
-    lodging = load_lodging(REPO_ROOT)
-    source = lodging.sources["scheduled/web-important__nehimpact.org"]
+    lodging = load_lodging(REPO_ROOT / "examples" / "lodging")
+    source = lodging.sources["scheduled/web-important__example-site"]
     command = source.command.replace(
-        "https://nehimpact.org", "http://127.0.0.1:1"
+        "https://example.com", "http://127.0.0.1:1"
     )
     result = subprocess.run(
         ["bash", "-c", command],
@@ -574,7 +574,7 @@ def test_watch_curl_output_on_connection_failure_is_valid_json() -> None:
         f"stderr={result.stderr!r}"
     )
     payload = json.loads(result.stdout)  # would raise if 000 were unquoted
-    assert payload["entity"] == "nehimpact.org"
+    assert payload["entity"] == "example-site"
     # status_code arrives as the string "000"; handler coerces to int 0.
     out = _invoke_http_status(
         payload,
@@ -612,14 +612,14 @@ def test_handler_through_runner_with_real_triager(tmp_path: Path) -> None:
     """End-to-end: load a real lodging that exercises the expand path, then
     run the synthesized triager via the runner. Catches contract mismatches
     between expand's metadata shape and the handler's expectations."""
-    lodging = load_lodging(REPO_ROOT)
-    triager = lodging.triagers["web-important__nehimpact.org"]
+    lodging = load_lodging(REPO_ROOT / "examples" / "lodging")
+    triager = lodging.triagers["web-important__example-site"]
     findings, state = asyncio.run(
         run_python_triager(
             triager,
             {
-                "entity": "nehimpact.org",
-                "url": "https://nehimpact.org",
+                "entity": "example-site",
+                "url": "https://example.com",
                 "status_code": 502,
             },
             {"last_status": 200},
@@ -627,6 +627,6 @@ def test_handler_through_runner_with_real_triager(tmp_path: Path) -> None:
     )
     assert state == {"last_status": 502}
     assert len(findings) == 1
-    assert findings[0]["entity"] == "nehimpact.org"
+    assert findings[0]["entity"] == "example-site"
     assert findings[0]["severity"] == "high"
     assert findings[0]["type"] == "down"

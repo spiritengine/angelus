@@ -1,0 +1,5 @@
+# skein: knowledge/task system angelus agents use. `skein --version` is
+# not a recognized option (exits 2); `skein --help` is the non-side-
+# effecting liveness probe (exits 0, no writes).
+name: skein
+check: skein --help

@@ -287,16 +287,16 @@ def test_shipped_template_parses_when_enabled(tmp_path) -> None:
     # The repo ships fixers/observe-internal-incident.yaml.disabled as a
     # template; copying it enabled (against the repo root, where its handler
     # lives) must parse, so the documented shape never silently rots.
-    src = REPO_ROOT / "fixers" / "observe-internal-incident.yaml.disabled"
+    src = REPO_ROOT / "examples" / "lodging" / "fixers" / "observe-internal-incident.yaml.disabled"
     assert src.exists(), "shipped template missing"
-    enabled = REPO_ROOT / "fixers" / "observe-internal-incident.yaml"
+    enabled = REPO_ROOT / "examples" / "lodging" / "fixers" / "observe-internal-incident.yaml"
     shutil.copyfile(src, enabled)
     try:
-        fixer = parse_fixer(REPO_ROOT, enabled)
+        fixer = parse_fixer(REPO_ROOT / "examples" / "lodging", enabled)
     finally:
         enabled.unlink()
     assert fixer.condition.kind == "open_internal_incident"
-    assert fixer.handler_path == REPO_ROOT / "fixers" / "handlers" / "observe.py"
+    assert fixer.handler_path == REPO_ROOT / "examples" / "lodging" / "fixers" / "handlers" / "observe.py"
 
 
 # --- cross-ref ---------------------------------------------------------------

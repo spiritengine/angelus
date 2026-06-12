@@ -1,0 +1,9 @@
+cadence: 4h
+check:
+  kind: shell
+  # `state` is the observation-collapse token (the status code), so this fixed
+  # canary collapses to one "last checked" bump per tick and writes no repeat
+  # observation -- the daemon's change signature reads `state`.
+  command: >
+    echo
+    '{"source_ref":"scheduled/canary-loose-a","entity":"canary-pipeline","url":"file:///dev/null","status_code":200,"state":200}'

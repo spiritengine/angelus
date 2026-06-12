@@ -1,0 +1,38 @@
+# 7:00 AM local time. CronTrigger.from_crontab() defaults the trigger's
+# timezone to LOCAL (apscheduler.util.astimezone), independent of the
+# scheduler's configured tz. End-to-end review fell-r4 (2026-05-26)
+# initially insisted the (then 08:00) digest was firing at 04:00 EDT
+# because the scheduler is timezone=UTC; that's wrong, the trigger
+# overrides. Verified empirically with CronTrigger.from_crontab +
+# get_next_fire_time. So this fires at 07:00 in the box's local TZ.
+cadence: "0 7 * * *"
+# Delivery SLA (B2): belfry pings DOWN if this pipe goes longer than this
+# between SUCCESSFUL deliveries. 27h = the 24h cadence plus a 3h grace,
+# matching the off-box digest dead-man's healthchecks.io grace, so a single
+# late/skipped run doesn't false-alarm but a genuine stall (the 2026-05-29
+# incident: ~24h of silent non-delivery) is caught on the next belfry tick.
+max_interval: 27h
+# Additive transports (2026-06-02): email carries the full long-form digest;
+# push carries a compact summary rendered separately (see PipeDrain._render_
+# compact). Telegram acks delivery where SMTP only hands off, so the push leg
+# is the reliable receipt and email is the nice-to-have full prose -- if email
+# keeps flaking it can be dropped without losing the daily report. The runner
+# routes the full message to non-push channels and the compact one to push.
+channels:
+  - email
+  - push
+render:
+  preamble:
+    - kind: structured
+      template: rate-limit-callout
+    - kind: structured
+      template: incident-status
+  body:
+    kind: llm
+    mantle: chronicler
+    inputs:
+      - findings_since_last_drain
+      - open_incidents
+      - recent_closures
+      - suppressed_findings
+      - fixer_actions

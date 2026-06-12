@@ -978,7 +978,7 @@ def test_email_channel_kills_subprocess_on_timeout(tmp_path) -> None:
 
 
 def test_email_channel_loaded_from_repo_lodging() -> None:
-    lodging = load_lodging(Path.cwd())
+    lodging = load_lodging(Path.cwd() / "examples" / "lodging")
 
     assert lodging.channels["email"].kind == "email"
     assert lodging.channels["email"].to == "$env:ANGELUS_EMAIL_TO"
@@ -1789,7 +1789,7 @@ def test_shipped_jinja_templates_render_one_bullet_per_line() -> None:
 
     repo_root = Path(__file__).resolve().parent.parent
     env = Environment(
-        loader=FileSystemLoader(repo_root / "render-templates"),
+        loader=FileSystemLoader(repo_root / "examples" / "lodging" / "render-templates"),
         autoescape=select_autoescape(enabled_extensions=()),
         trim_blocks=True,
         lstrip_blocks=True,

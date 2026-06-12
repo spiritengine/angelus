@@ -1,0 +1,11 @@
+kind: email
+to: $env:ANGELUS_EMAIL_TO
+command: your-email-cli  # any CLI that accepts the rendered message; see README
+# B13 transport failover: if an IMMEDIATE finding routed to email finds the
+# channel degraded (already unhealthy, or it crosses its failure threshold on
+# the drain), the runner delivers that finding over push instead so the content
+# still gets out, then alarms about email separately (the existing
+# internal/dispatch escalation). This is the immediate path ONLY: the daily
+# digest already routes to email AND push additively (see daily.yaml), so it
+# needs no failover and deliberately ignores this field.
+backup: push
