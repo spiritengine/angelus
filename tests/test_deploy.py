@@ -330,6 +330,37 @@ def dev_repo_0015(tmp_path_factory) -> tuple[Path, str]:
     return dest, sha
 
 
+# A migration that orphans an FK reference: under the FK-deferred runner (czir,
+# migration 0015 was made to apply cleanly on a live findings-bearing DB) this
+# DELETE succeeds with foreign_keys OFF, but the runner's pre-commit
+# `PRAGMA foreign_key_check` then catches the dangling finding and raises the
+# same sqlite3.IntegrityError class the 2026-06-12 outage raised. It is the
+# stand-in for "a migration that would corrupt the live DB", which preflight
+# must catch before touching prod -- 0015 itself no longer qualifies now that
+# the runner is FK-safe.
+_BREAKING_MIGRATION_NAME = "9999_test_orphan_finding_fk.sql"
+_BREAKING_MIGRATION_SQL = "DELETE FROM observations;\n"
+
+
+@pytest.fixture(scope="session")
+def dev_repo_breaking(tmp_path_factory) -> tuple[Path, str]:
+    """Dev repo at 0015 plus a migration that fails the FK-safe runner's
+    foreign_key_check on a findings-bearing DB -- the preflight failure shape
+    post-czir."""
+    dest = tmp_path_factory.mktemp("devbreak") / "repo"
+    build_dev_repo(dest, M0015)
+    (dest / "migrations" / _BREAKING_MIGRATION_NAME).write_text(
+        _BREAKING_MIGRATION_SQL, encoding="utf-8"
+    )
+    _git(dest, "add", "-A")
+    _git(dest, "commit", "-q", "-m", "add FK-orphaning migration")
+    out = subprocess.run(
+        ["git", "-C", str(dest), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True, env=_GIT_ENV,
+    )
+    return dest, out.stdout.strip()
+
+
 def _digest(path: Path) -> str | None:
     if not path.exists():
         return None
@@ -490,14 +521,17 @@ def test_verify_passes_recovery_from_crash_loop(
 
 
 # ===========================================================================
-# Preflight failure: the real 0015-on-0014-with-findings FK outage.
+# Preflight failure: a migration that would corrupt the live DB.
+# Post-czir the runner is FK-safe, so 0015 itself no longer fails; the target
+# here carries an extra migration that orphans an FK reference, which the
+# runner's foreign_key_check rejects with the same IntegrityError class.
 # ===========================================================================
 
 
 def test_preflight_failure_leaves_prod_byte_identical(
-    fake_prod, dev_repo_0015, monkeypatch
+    fake_prod, dev_repo_breaking, monkeypatch
 ):
-    repo, sha = dev_repo_0015  # target carries 0015
+    repo, sha = dev_repo_breaking  # target carries an FK-orphaning migration
     _set_repo(monkeypatch, repo)
     _build_db(fake_prod.live_db, M0014, with_findings=True)  # live at 0014 + FK
     pre = _db_digests(fake_prod.state)
@@ -523,11 +557,12 @@ def test_preflight_failure_leaves_prod_byte_identical(
 
 
 def test_preflight_failure_is_the_production_integrity_error(
-    fake_prod, dev_repo_0015, monkeypatch, capsys
+    fake_prod, dev_repo_breaking, monkeypatch, capsys
 ):
-    """The preflight failure carries the genuine IntegrityError, not some
-    incidental error -- ties the byte-identical test to the real 0015 FK."""
-    repo, sha = dev_repo_0015
+    """The preflight failure carries the genuine IntegrityError (the FK-safe
+    runner's foreign_key_check raising on the orphaned finding), not some
+    incidental error -- ties the byte-identical test to a real FK violation."""
+    repo, sha = dev_repo_breaking
     _set_repo(monkeypatch, repo)
     _build_db(fake_prod.live_db, M0014, with_findings=True)
 
@@ -539,18 +574,19 @@ def test_preflight_failure_is_the_production_integrity_error(
 
 
 def test_mutation_skipping_dryrun_hits_integrity_error(
-    fake_prod, dev_repo_0015, monkeypatch
+    fake_prod, dev_repo_breaking, monkeypatch
 ):
     """Mutation verification: without the dry-run guard, the target migrations
-    applied to the LIVE db raise the production IntegrityError. This is the red
-    the preflight test would go if its guard were removed -- proving the test
-    isn't vacuously green."""
-    repo, _sha = dev_repo_0015
+    applied to the LIVE db raise the IntegrityError. This is the red the
+    preflight test would go if its guard were removed -- proving the test isn't
+    vacuously green."""
+    repo, _sha = dev_repo_breaking
     _build_db(fake_prod.live_db, M0014, with_findings=True)
 
     # Apply the TARGET ref's migrations directly to the live db (what a restart
-    # would do with no preflight). The 0015 DROP TABLE observations fails the
-    # implicit FK delete of the referencing finding.
+    # would do with no preflight). The FK-orphaning migration deletes the
+    # observation the finding references; the runner's pre-commit
+    # foreign_key_check catches the dangling finding and raises.
     sys.path.insert(0, str(REPO_ROOT))
     from angelus.storage.migrations import init_db
     with pytest.raises(sqlite3.IntegrityError):
