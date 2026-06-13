@@ -78,6 +78,19 @@ DEFAULT_RESTART_WINDOW_SEC = 1800
 # startup sequence.
 DEFAULT_RECOVER_WAIT_SEC = 3
 
+# Deploy hold latch (release-path spec v3, brief-20260613-3spy).  While
+# state/belfry-hold exists and is younger than the max age, belfry suppresses
+# its RESTART action only: a `make deploy` stops/replaces/restarts the daemon
+# itself, and belfry must not race that by spawning its own restart into the
+# window (the 2026-06-12 shape: belfry restarted schlock's deliberately-stopped
+# daemon back into the 0015 crash loop).  DOWN pings and logging are
+# unchanged -- the hold gags only the autoremediation hand, never the alarm.
+# Past the max age the hold is treated as abandoned (a deploy that died without
+# releasing it): belfry overrides it loudly (its own DOWN reason) and resumes
+# restarting, so a forgotten hold cannot wedge autoremediation forever.
+DEFAULT_HOLD_FILENAME = "belfry-hold"
+DEFAULT_HOLD_MAX_AGE_SEC = 1800
+
 
 def _now_iso() -> str:
     """ISO8601 UTC timestamp for log-line prefixes.
@@ -239,16 +252,42 @@ def main(argv: list[str] | None = None) -> int:
         if source_overdue_reason:
             other_reasons.append(source_overdue_reason)
 
+    # Deploy hold latch (brief-20260613-3spy).  Read the sentinel once: an
+    # 'active' hold suppresses the restart ACTION below (a deploy is restarting
+    # the daemon itself); a 'stale' hold is an abandoned lock from a deploy that
+    # died -- it does NOT suppress (restarts resume) and is surfaced as its own
+    # alert-only DOWN reason so the forgotten lock is loud.  Either way the
+    # alarm path (DOWN ping, notify, logging) is untouched: the hold gags only
+    # autoremediation, never alerting.
+    hold_kind, hold_age = hold_status(state)
+    if hold_kind == "stale":
+        stale_note = (
+            f"deploy-hold-stale: belfry-hold present but "
+            f"{int(hold_age)}s old (>= max {hold_max_age_sec()}s); treating as "
+            f"abandoned and resuming restarts -- a deploy may have died without "
+            f"releasing it (remove {hold_path(state)} if not)"
+        )
+        other_reasons.append(stale_note)
+        log_err(f"angelus belfry: {stale_note}")
+
     all_reasons = absence_reasons + other_reasons
     if all_reasons:
         if absence_reasons:
-            # Daemon is absent: attempt a loop-guarded restart unless a drift
-            # reason is also present.  Drift means the daemon is alive but
-            # launched outside its systemd unit — `systemctl restart` would
-            # spawn a second instance alongside the mis-launched one, violating
-            # the single-writer invariant.  Drift is always alert-only.
+            # Daemon is absent: attempt a loop-guarded restart unless something
+            # says the restart is the wrong tool this tick.  An ACTIVE deploy
+            # hold is the first such guard -- a `make deploy` is replacing and
+            # restarting the daemon itself, so belfry must not race it with its
+            # own systemctl restart.  Alerting still fires (the DOWN ping below);
+            # only the action is withheld, and the hold self-expires.
             has_drift = any(r.startswith("drift:") for r in other_reasons)
-            if has_drift:
+            if hold_kind == "active":
+                action_note = (
+                    f"restart withheld: deploy hold active "
+                    f"({int(hold_age)}s old, max {hold_max_age_sec()}s) -- a "
+                    f"deploy is in flight; alerting only"
+                )
+                log_out(f"angelus belfry: {action_note}")
+            elif has_drift:
                 action_note = (
                     "wedged but drifted — restart withheld, drift is a human/SRE fix"
                 )
@@ -405,6 +444,68 @@ def recover_wait_sec() -> int:
         )
         return DEFAULT_RECOVER_WAIT_SEC
     return max(0, secs)
+
+
+def hold_path(state_dir: Path) -> Path:
+    """Path for the deploy hold sentinel (see DEFAULT_HOLD_FILENAME).
+
+    ANGELUS_BELFRY_HOLD_PATH overrides; default is <state_dir>/belfry-hold.
+    Same single-file, belfry-owned convention as the liveness sentinel; the
+    file is written by deploy/deploy.py (a `touch`) and is consulted, never
+    written, here.  belfry owns reading it for the restart-suppression decision.
+    """
+    override = os.environ.get("ANGELUS_BELFRY_HOLD_PATH")
+    if override:
+        return Path(override)
+    return state_dir / DEFAULT_HOLD_FILENAME
+
+
+def hold_max_age_sec() -> int:
+    """Max age (seconds) a deploy hold suppresses restarts before it is overridden.
+
+    ANGELUS_BELFRY_HOLD_MAX_AGE_SEC overrides the default; same fail-safe parse
+    as the other belfry knobs (an unparseable value logs and falls back rather
+    than crashing the tick).  Floored at 1: a non-positive max age would make
+    every hold instantly stale, defeating the latch.
+    """
+    raw = os.environ.get("ANGELUS_BELFRY_HOLD_MAX_AGE_SEC")
+    if raw is None:
+        return DEFAULT_HOLD_MAX_AGE_SEC
+    try:
+        secs = int(raw)
+    except ValueError:
+        log_err(
+            "angelus belfry: invalid ANGELUS_BELFRY_HOLD_MAX_AGE_SEC; "
+            "using default"
+        )
+        return DEFAULT_HOLD_MAX_AGE_SEC
+    return max(1, secs)
+
+
+def hold_status(state_dir: Path) -> tuple[str, float | None]:
+    """Classify the deploy hold sentinel: ('absent'|'active'|'stale', age_sec).
+
+    'active' -- file present and younger than hold_max_age_sec(): a deploy is in
+    flight, suppress the restart action this tick.
+    'stale'  -- file present but older than the max age: a deploy died without
+    releasing it; do NOT suppress (resume restarts) and report it as its own
+    DOWN reason so the abandoned lock is surfaced.
+    'absent' -- no hold file, or it cannot be stat'd.  An unreadable hold fails
+    OPEN (treated as absent): belfry's restart hand and alarm must never be
+    blocked by a hold it cannot even read.
+    """
+    path = hold_path(state_dir)
+    try:
+        mtime = path.stat().st_mtime
+    except FileNotFoundError:
+        return ("absent", None)
+    except OSError as exc:
+        log_err(f"angelus belfry: cannot stat deploy hold {path}: {exc}")
+        return ("absent", None)
+    age = time.time() - mtime
+    if age < hold_max_age_sec():
+        return ("active", age)
+    return ("stale", age)
 
 
 def read_failcheck_watermark(path: Path) -> int | None:
