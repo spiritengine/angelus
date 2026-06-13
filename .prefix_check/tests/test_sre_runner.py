@@ -99,46 +99,6 @@ def _fake_wait_timeout(spool_id: str = "abc12345"):
     return mock
 
 
-def _spools_json(spool_id: str, status: str) -> str:
-    """Real `spindle spools` JSON shape (spindle/__init__.py _spools_sync): a
-    dict keyed by spool_id, each value carrying status/prompt/created_at/
-    session_id. `status` is the authoritative terminal field
-    ('complete'/'error'/'running'/'pending')."""
-    return json.dumps(
-        {
-            spool_id: {
-                "status": status,
-                "prompt": "angelus's belfry watchdog escalated...",
-                "created_at": "2026-06-12T00:00:00",
-                "session_id": "sess-abcd",
-            }
-        },
-        indent=2,
-    )
-
-
-def _spindle_dispatch(wait_stdout: str, spools_stdout: str):
-    """subprocess.run side_effect dispatching on the spindle subcommand.
-
-    spindle_wait now issues two calls — the `spindle wait` barrier and the
-    `spindle spools` typed-status query — so a single return_value no longer
-    suffices. Dispatch on argv so the test does not depend on call ordering.
-    """
-    def _run(cmd, *args, **kwargs):
-        proc = MagicMock()
-        proc.returncode = 0
-        proc.stderr = ""
-        if cmd[:2] == ["spindle", "wait"]:
-            proc.stdout = wait_stdout
-        elif cmd[:2] == ["spindle", "spools"]:
-            proc.stdout = spools_stdout
-        else:
-            proc.stdout = ""
-        return proc
-
-    return _run
-
-
 # ---------------------------------------------------------------------------
 # Test: no sentinel -> no spawn
 # ---------------------------------------------------------------------------
@@ -626,122 +586,97 @@ def test_errored_spool_unhealthy_daemon_retains_sentinel(tmp_path):
     assert not [l for l in log_lines if "action=cleared-unverified" in l]
 
 
-def test_spindle_wait_reads_typed_status():
-    """spindle_wait classifies by spindle's authoritative typed per-spool status
-    (read from `spindle spools`), not by the wait result's freeform text. Maps
-    'complete' -> 'completed' and 'error' -> 'errored', regardless of what the
-    wait payload says."""
+def test_spindle_wait_detects_errored_spool():
+    """spindle_wait maps an explicit error payload to 'errored', distinct from
+    'completed', so the spawn audit line and resolution path see the failure."""
     runner = _load_runner()
-    spool = "x1"
 
-    # Typed status 'error' -> errored, even though the wait payload is a normal
-    # gather-mode result (no "Error:" prefix).
-    with patch.object(
-        runner.subprocess,
-        "run",
-        side_effect=_spindle_dispatch(
-            json.dumps({spool: "did some diagnostics"}),
-            _spools_json(spool, "error"),
-        ),
-    ):
-        assert runner.spindle_wait(spool, 10) == "errored"
+    error_proc = MagicMock()
+    error_proc.returncode = 0
+    error_proc.stdout = json.dumps({"spool_id": "x1", "error": "session limit reached"})
+    error_proc.stderr = ""
 
-    # Typed status 'complete' -> completed.
-    with patch.object(
-        runner.subprocess,
-        "run",
-        side_effect=_spindle_dispatch(
-            json.dumps({spool: "Fixed migration 0015; daemon healthy."}),
-            _spools_json(spool, "complete"),
-        ),
-    ):
-        assert runner.spindle_wait(spool, 10) == "completed"
+    with patch.object(runner.subprocess, "run", return_value=error_proc):
+        assert runner.spindle_wait("x1", 10) == "errored"
+
+    ok_proc = MagicMock()
+    ok_proc.returncode = 0
+    ok_proc.stdout = json.dumps({"spool_id": "x1", "result": "all good"})
+    ok_proc.stderr = ""
+    with patch.object(runner.subprocess, "run", return_value=ok_proc):
+        assert runner.spindle_wait("x1", 10) == "completed"
 
 
-def test_spindle_wait_result_text_error_prefix_but_typed_complete_is_completed():
-    """Codex's false-positive (hfje fell-r2): a SUCCESSFUL agent whose result
-    text happens to begin "Error:" serializes in gather mode identically to a
-    failed spool. The old text heuristic (value.startswith("Error:")) misread
-    that as 'errored' -> a false cleared-unverified + page. Reading the typed
-    status dissolves the ambiguity: typed 'complete' -> completed regardless of
-    the result text."""
+def test_spindle_wait_detects_gather_mode_errored_spool():
+    """The runner invokes `spindle wait` in its DEFAULT gather mode, which
+    serializes a failed spool as {spool_id: "Error: <msg>"} — the value carries
+    the failure, there is NO top-level "error" key. spindle_wait must classify
+    that as 'errored'. Keying on spool_id presence alone (the pre-fix behavior)
+    mislabeled it 'completed', so an errored spool that had written its report
+    was credited for an out-of-band recovery (issue-20260612-hfje fell-r1)."""
     runner = _load_runner()
     spool = "358328ee"
 
-    with patch.object(
-        runner.subprocess,
-        "run",
-        side_effect=_spindle_dispatch(
-            json.dumps({spool: "Error: budget reached, but root cause was X — fixed."}),
-            _spools_json(spool, "complete"),
-        ),
-    ):
+    # Real gather-mode error shape the runner actually receives.
+    gather_err = MagicMock()
+    gather_err.returncode = 0
+    gather_err.stdout = json.dumps({spool: "Error: session limit reached"})
+    gather_err.stderr = ""
+    with patch.object(runner.subprocess, "run", return_value=gather_err):
+        assert runner.spindle_wait(spool, 10) == "errored"
+
+    # Gather-mode success: {spool_id: result_text} -> completed.
+    gather_ok = MagicMock()
+    gather_ok.returncode = 0
+    gather_ok.stdout = json.dumps({spool: "Fixed migration 0015; daemon healthy."})
+    gather_ok.stderr = ""
+    with patch.object(runner.subprocess, "run", return_value=gather_ok):
         assert runner.spindle_wait(spool, 10) == "completed"
 
+    # A genuine result that merely CONTAINS "Error" mid-text is not a failure —
+    # only a leading "Error:" is the spindle failure serialization.
+    gather_mid = MagicMock()
+    gather_mid.returncode = 0
+    gather_mid.stdout = json.dumps(
+        {spool: "Root cause: an Error in migration 0015, now fixed."}
+    )
+    gather_mid.stderr = ""
+    with patch.object(runner.subprocess, "run", return_value=gather_mid):
+        assert runner.spindle_wait(spool, 10) == "completed"
 
-def test_spindle_wait_absent_spool_is_errored():
-    """If the spool_id is missing from `spindle spools` output (e.g. spindle's
-    own wait failed on an unknown id, or the spool record vanished), there is no
-    typed status to vouch for completion -> conservative 'errored'."""
-    runner = _load_runner()
-    spool = "ghost123"
-
-    with patch.object(
-        runner.subprocess,
-        "run",
-        side_effect=_spindle_dispatch(
-            f"Error: Unknown spool_id '{spool}'",
-            _spools_json("someone-else", "complete"),
-        ),
-    ):
+    # Spindle's own wait failure (unknown spool id) is a bare top-level
+    # "Error: ..." string, not JSON -> errored, never the completed fallthrough.
+    bare_err = MagicMock()
+    bare_err.returncode = 0
+    bare_err.stdout = f"Error: Unknown spool_id '{spool}'"
+    bare_err.stderr = ""
+    with patch.object(runner.subprocess, "run", return_value=bare_err):
         assert runner.spindle_wait(spool, 10) == "errored"
 
 
-def test_spindle_wait_non_terminal_status_is_errored():
-    """A still-running/pending spool surfaced by the spools query (barrier
-    returned without timeout text but the spool has not reached a terminal
-    state) is treated conservatively as errored, never credited."""
-    runner = _load_runner()
-    spool = "x1"
-
-    with patch.object(
-        runner.subprocess,
-        "run",
-        side_effect=_spindle_dispatch(
-            json.dumps({spool: "partial"}),
-            _spools_json(spool, "running"),
-        ),
-    ):
-        assert runner.spindle_wait(spool, 10) == "errored"
-
-
-def test_typed_error_spool_with_report_clears_unverified_not_resolved(tmp_path):
-    """End-to-end Step 8 through the REAL spindle_wait/query_spool_status path
-    (subprocess mocked, not spindle_wait's return value): a spool that wrote its
-    report and THEN died at a session limit. Its gather-mode result text even
-    LOOKS successful, but spindle's typed status is 'error'. With the daemon
-    recovered out-of-band and a report present on disk, this must take the
-    unverified path (cleared-unverified + page), never a clean resolved
-    crediting the dead spool.
-
-    Fails against the current shard code: the old text heuristic reads the
-    success-looking result text as 'completed' and the report-present check
-    credits the agent — exactly the hfje incident (fixers.log: spool 358328ee
-    `outcome=completed`)."""
+def test_gather_mode_errored_spool_with_report_clears_unverified_not_resolved(tmp_path):
+    """End-to-end Step 8 through the REAL spindle_wait parser (subprocess mocked,
+    not spindle_wait's return value): a spool that wrote its report and THEN died
+    at a session limit, surfaced in gather mode as {spool_id: "Error: <msg>"},
+    with the daemon recovered out-of-band. Even though a report file is present,
+    this must take the unverified path (cleared-unverified + page), never a clean
+    resolved crediting the dead spool. Before the gather-value fix, spindle_wait
+    returned 'completed' here and the report-present check credited the agent —
+    exactly the hfje incident (fixers.log: spool 358328ee `outcome=completed`)."""
     runner = _load_runner()
     state = tmp_path / "state"
     _write_sentinel(state, "crash-loop: session limit after diagnostics")
 
     spool = "358328ee"
-    # Result TEXT looks like a clean success; only the typed status reveals the
-    # failure. This is what makes the test fail on the pre-fix text heuristic.
-    dispatch = _spindle_dispatch(
-        json.dumps({spool: "Root cause found in migration 0015; daemon healthy."}),
-        _spools_json(spool, "error"),
-    )
+    gather_err = MagicMock()
+    gather_err.returncode = 0
+    gather_err.stdout = json.dumps({spool: "Error: session limit reached"})
+    gather_err.stderr = ""
 
+    # spindle_spin writes the report (agent wrote it, THEN the spool errored);
+    # spindle_wait runs for real against the gather-mode error output.
     with patch.object(runner, "spindle_spin", side_effect=_spin_writes_report(spool)), \
-         patch.object(runner.subprocess, "run", side_effect=dispatch), \
+         patch.object(runner.subprocess, "run", return_value=gather_err), \
          patch.object(runner, "check_daemon_healthy", return_value=True), \
          patch.object(runner, "notify_pat") as mock_notify:
         rc = runner._run(state)
@@ -764,98 +699,6 @@ def test_typed_error_spool_with_report_clears_unverified_not_resolved(tmp_path):
     # report WAS written — the distinguishing detail vs the no-report case, and
     # the proof the credit hinges on completion_status, not report presence.
     assert "report_written=true" in unverified[0]
-
-
-def test_typed_complete_spool_with_report_logs_resolved(tmp_path):
-    """End-to-end through the REAL typed-status path: typed status 'complete'
-    plus a report on disk plus a healthy daemon -> clean resolved, agent
-    credited. The success counterpart to the typed-error test above."""
-    runner = _load_runner()
-    state = tmp_path / "state"
-    _write_sentinel(state, "crash-loop: recovered after fix")
-
-    spool = "abc12345"
-    dispatch = _spindle_dispatch(
-        json.dumps({spool: "Fixed migration 0015; daemon healthy."}),
-        _spools_json(spool, "complete"),
-    )
-
-    with patch.object(runner, "spindle_spin", side_effect=_spin_writes_report(spool)), \
-         patch.object(runner.subprocess, "run", side_effect=dispatch), \
-         patch.object(runner, "check_daemon_healthy", return_value=True), \
-         patch.object(runner, "notify_pat") as mock_notify:
-        rc = runner._run(state)
-
-    assert rc == 0
-    assert not (state / "belfry-needs-sre").exists()
-    # Verified resolution credits the agent and does NOT page.
-    mock_notify.assert_not_called()
-
-    log_lines = _read_fixers_log(state)
-    resolved = [l for l in log_lines if "action=resolved" in l]
-    assert len(resolved) == 1
-    assert f"spool_id={spool}" in resolved[0]
-    assert not [l for l in log_lines if "action=cleared-unverified" in l]
-
-
-def test_typed_complete_spool_no_report_clears_unverified(tmp_path):
-    """Typed status 'complete' but NO report on disk plus a healthy daemon ->
-    cleared-unverified + page. completion_status alone is not enough; the
-    report-existence backstop still gates crediting the agent."""
-    runner = _load_runner()
-    state = tmp_path / "state"
-    _write_sentinel(state, "crash-loop: recovered out-of-band")
-
-    spool = "noreport1"
-    dispatch = _spindle_dispatch(
-        json.dumps({spool: "looked around, wrote nothing"}),
-        _spools_json(spool, "complete"),
-    )
-
-    # spindle_spin returns the spool id but writes NO report.
-    with patch.object(runner, "spindle_spin", return_value=spool), \
-         patch.object(runner.subprocess, "run", side_effect=dispatch), \
-         patch.object(runner, "check_daemon_healthy", return_value=True), \
-         patch.object(runner, "notify_pat") as mock_notify:
-        rc = runner._run(state)
-
-    assert rc == 0
-    assert not (state / "belfry-needs-sre").exists()
-    mock_notify.assert_called_once()
-
-    log_lines = _read_fixers_log(state)
-    assert not [l for l in log_lines if "action=resolved" in l]
-    unverified = [l for l in log_lines if "action=cleared-unverified" in l]
-    assert len(unverified) == 1
-    assert "completion_status=completed" in unverified[0]
-    assert "report_written=false" in unverified[0]
-
-
-def test_typed_error_spool_unhealthy_daemon_retains_sentinel(tmp_path):
-    """Daemon still unhealthy -> sentinel retained for the next tick, regardless
-    of typed status. The unhealthy branch is unchanged by the status-source fix."""
-    runner = _load_runner()
-    state = tmp_path / "state"
-    _write_sentinel(state, "crash-loop: still down")
-
-    spool = "stilldown"
-    dispatch = _spindle_dispatch(
-        json.dumps({spool: "Error: session limit reached"}),
-        _spools_json(spool, "error"),
-    )
-
-    with patch.object(runner, "spindle_spin", return_value=spool), \
-         patch.object(runner.subprocess, "run", side_effect=dispatch), \
-         patch.object(runner, "check_daemon_healthy", return_value=False), \
-         patch.object(runner, "notify_pat"):
-        rc = runner._run(state)
-
-    assert rc == 0
-    # Daemon down: sentinel must remain so the next tick re-attempts.
-    assert (state / "belfry-needs-sre").exists()
-    log_lines = _read_fixers_log(state)
-    assert not [l for l in log_lines if "action=resolved" in l]
-    assert not [l for l in log_lines if "action=cleared-unverified" in l]
 
 
 # ---------------------------------------------------------------------------

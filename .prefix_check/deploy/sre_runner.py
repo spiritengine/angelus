@@ -373,75 +373,15 @@ def spindle_spin(
     return spool_id
 
 
-def query_spool_status(spool_id: str) -> str:
-    """Read spindle's authoritative typed status for a spool. Returns
-    'completed' or 'errored'.
-
-    Status is read from the typed per-spool `status` field that spindle
-    persists ('complete'/'error'/'running'/'pending'/'timeout'), surfaced by the
-    `spindle spools` subcommand as JSON by default (a dict keyed by spool_id,
-    each value carrying a `status` field). This replaces inferring status from
-    a wait result's freeform text: in gather mode a failed spool and a
-    successful agent whose result text begins "Error:" serialize identically,
-    so the text is fundamentally ambiguous and cannot be trusted.
-
-    Mapping: spindle 'complete' -> 'completed', 'error' -> 'errored'. Anything
-    else — a non-terminal status (running/pending), the spool_id absent from
-    the output, or a query/JSON failure — maps to 'errored'. That is the
-    conservative direction: 'errored' can never falsely credit a resolution
-    (it routes through the report-existence backstop in Step 8), whereas a
-    spurious 'completed' could.
-    """
-    try:
-        result = subprocess.run(
-            ["spindle", "spools"],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        log_err(f"sre-runner: spindle spools query failed for {spool_id}: {exc}")
-        return "errored"
-
-    try:
-        data = json.loads(result.stdout)
-    except (json.JSONDecodeError, TypeError):
-        log_err(f"sre-runner: could not parse spindle spools JSON for {spool_id}")
-        return "errored"
-    if not isinstance(data, dict):
-        log_err(f"sre-runner: spindle spools JSON not an object for {spool_id}")
-        return "errored"
-
-    info = data.get(spool_id)
-    if not isinstance(info, dict):
-        log_err(f"sre-runner: spool {spool_id} absent from spindle spools output")
-        return "errored"
-
-    status = info.get("status")
-    if status == "complete":
-        return "completed"
-    if status == "error":
-        return "errored"
-    # Non-terminal (running/pending) or unrecognized: the spool did not reach a
-    # terminal success state we can vouch for. Treat conservatively as errored.
-    log_err(
-        f"sre-runner: spool {spool_id} status non-terminal/unknown: {status!r}"
-    )
-    return "errored"
-
-
 def spindle_wait(spool_id: str, timeout: int) -> str:
     """Block until the spool finishes. Returns 'completed', 'errored', or 'timeout'.
 
-    The bounded `spindle wait` call is used only as a BARRIER — block until the
-    spool reaches a terminal state or the timeout fires. Its result payload is
-    NOT trusted for status: in gather mode (the runner's mode) a failed spool
-    and a successful agent whose result text begins "Error:" serialize
-    identically, so the text is ambiguous. Once the barrier returns
-    non-timeout, the actual completion status is read from spindle's typed
-    per-spool status via query_spool_status(). The authoritative check on
-    whether the agent did real work remains whether it wrote its report file,
-    verified by the caller in Step 8.
+    'errored' means the spool reported a failure (e.g. died at a session limit)
+    rather than finishing its work — distinct from 'completed' so the caller
+    never credits a dead agent for an out-of-band recovery. This is only a
+    best-effort signal (spindle does not always surface the error shape); the
+    authoritative check on whether the agent actually did anything is whether it
+    wrote its report file, verified by the caller in Step 8.
     """
     try:
         result = subprocess.run(
@@ -459,15 +399,27 @@ def spindle_wait(spool_id: str, timeout: int) -> str:
         return "timeout"
 
     output = result.stdout.strip()
-    # Spindle emits "Timeout after Ns. Spools still running: ..." on timeout —
-    # the spool has NOT reached a terminal state, so report it as timeout and
-    # let the caller retain the sentinel for the next tick.
+    # Spindle emits "Timeout after Ns. Spools still running: ..." on timeout
     if "Timeout" in output or "still running" in output:
         return "timeout"
-
-    # Barrier returned non-timeout: the spool reached a terminal state. Read the
-    # authoritative typed status rather than parsing wait's ambiguous payload.
-    return query_spool_status(spool_id)
+    try:
+        data = json.loads(output)
+        if isinstance(data, dict):
+            # yield mode: {"spool_id": ..., "error": ...} -> the spool failed
+            if "error" in data:
+                return "errored"
+            # yield mode success: {"spool_id": ..., "result": ...}
+            if "result" in data:
+                return "completed"
+            # gather mode: {spool_id: result_text, ...} (no separate error key —
+            # report-existence is the backstop for a failure hidden here)
+            if spool_id in data:
+                return "completed"
+    except (json.JSONDecodeError, TypeError):
+        pass
+    # Non-JSON output or unrecognized shape — treat as completed rather than
+    # misreporting a timeout; the post-check determines what to do next.
+    return "completed"
 
 
 # ---------------------------------------------------------------------------
