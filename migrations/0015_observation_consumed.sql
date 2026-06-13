@@ -15,15 +15,17 @@
 --
 -- SQLite cannot ALTER a CHECK constraint, so the table is rebuilt: create the
 -- new shape, copy rows, drop the old table, rename, recreate the indexes
--- (0001's two and 0013's covering index). The DROP runs with
--- PRAGMA foreign_keys=ON, so a database whose findings reference observation
--- rows would fail the implicit DELETE -- acceptable because the production DB
--- starts fresh on deploy (documented in migration 0012) and every test DB is
--- built fresh through this chain. Rename direction matters: renaming the OLD
--- table aside would drag findings' REFERENCES along with it (SQLite >= 3.25
--- rewrites child FKs on RENAME), so the old table is dropped in place and the
--- new one renamed into the vacated name, which findings' existing
--- REFERENCES observations (id) then resolves to.
+-- (0001's two and 0013's covering index). The DROP would fail under
+-- PRAGMA foreign_keys=ON on a live DB whose findings reference observation rows
+-- (the implicit DELETE trips the FK) -- this is safe because the migration
+-- runner applies every migration with FK enforcement deferred and runs
+-- PRAGMA foreign_key_check before commit (storage/migrations.py), so a rebuild
+-- that preserves the referenced rows passes and one that orphans a child rolls
+-- back. Rename direction matters: renaming the OLD table aside would drag
+-- findings' REFERENCES along with it (SQLite >= 3.25 rewrites child FKs on
+-- RENAME), so the old table is dropped in place and the new one renamed into the
+-- vacated name, which findings' existing REFERENCES observations (id) then
+-- resolves to.
 CREATE TABLE observations_new (
     id INTEGER PRIMARY KEY,
     source TEXT NOT NULL,

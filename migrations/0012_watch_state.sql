@@ -38,9 +38,9 @@ CREATE TABLE watch_state (
 -- (health's per-source last-fire, belfry's wedge detection, the timeline)
 -- now reads watch_state.last_checked_at, and a state transition surfaces as
 -- the observation it writes -- the timeline already renders observations.
--- The production DB starts fresh on deploy, so no data migration is needed;
--- the chain stays append-only and correct (0001 creates source_fires, this
--- migration drops it). Drop the index explicitly before the table for intent;
--- DROP TABLE would cascade it anyway.
+-- No data migration is needed: source_fires holds only per-tick "we checked"
+-- bookkeeping that nothing reads back, so dropping its rows in place loses
+-- nothing (0001 creates source_fires, this migration drops it). Drop the index
+-- explicitly before the table for intent; DROP TABLE would cascade it anyway.
 DROP INDEX idx_source_fires_source_fired_at;
 DROP TABLE source_fires;

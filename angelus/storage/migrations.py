@@ -46,19 +46,55 @@ def migrate(
     for path in migration_paths:
         if path.name in applied:
             continue
-        connection.execute("BEGIN")
+        # Table-rebuild migrations (e.g. 0015) DROP a parent table whose rows are
+        # still referenced by child rows on a live DB (findings -> observations).
+        # Under PRAGMA foreign_keys=ON that DROP fails with a FOREIGN KEY violation,
+        # which is exactly what crash-looped the 2026-06-12 deploy. SQLite's
+        # documented table-rebuild procedure is to drop FK enforcement for the
+        # duration and verify integrity with PRAGMA foreign_key_check before
+        # committing. PRAGMA foreign_keys is a no-op inside an open transaction, so
+        # the toggle has to bracket the BEGIN: off before, restored ON only after
+        # the transaction closes. The restore lives in a finally so neither a
+        # broken migration nor a failed integrity check can leave the connection
+        # FK-off for whatever runs next.
+        connection.execute("PRAGMA foreign_keys = OFF")
         try:
-            for statement in _iter_sql_statements(path.read_text(encoding="utf-8")):
-                connection.execute(statement)
-            connection.execute(
-                "INSERT INTO schema_migrations (version) VALUES (?)",
-                (path.name,),
-            )
-        except Exception:
-            connection.rollback()
-            raise
-        else:
-            connection.commit()
+            connection.execute("BEGIN")
+            try:
+                for statement in _iter_sql_statements(path.read_text(encoding="utf-8")):
+                    connection.execute(statement)
+                violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+                if violations:
+                    raise sqlite3.IntegrityError(
+                        f"migration {path.name} left foreign key violations: "
+                        f"{_format_fk_violations(violations)}"
+                    )
+                connection.execute(
+                    "INSERT INTO schema_migrations (version) VALUES (?)",
+                    (path.name,),
+                )
+            except Exception:
+                connection.rollback()
+                raise
+            else:
+                connection.commit()
+        finally:
+            connection.execute("PRAGMA foreign_keys = ON")
+
+
+def _format_fk_violations(rows: list[sqlite3.Row]) -> str:
+    """Render PRAGMA foreign_key_check rows for an error message.
+
+    Each row is (table, rowid, referred_table, fk_index); rowid is NULL for
+    WITHOUT ROWID tables. Naming the offending table and the parent it dangles
+    from is what makes a rolled-back migration diagnosable in production.
+    """
+    parts = []
+    for row in rows:
+        table, rowid, referred, _fk_index = row
+        where = f" rowid {rowid}" if rowid is not None else ""
+        parts.append(f"{table}{where} -> {referred}")
+    return "; ".join(parts)
 
 
 def _iter_sql_statements(sql: str) -> list[str]:
