@@ -1,0 +1,26 @@
+-- Covering index for the retention prune predicate (brief-20260607-6qsq,
+-- Stage 2). The daemon's periodic prune (catalog.prune_observations) selects
+--
+--     status IN ('consumed', 'triage_failed')
+--       AND created_at < :cutoff
+--       AND NOT EXISTS (a finding referencing the row)
+--
+-- With only 0015's idx_observations_status (status alone) the planner sought
+-- the status equality but then filtered created_at row-by-row -- it walked
+-- EVERY terminal observation on each prune, and the terminal set is exactly
+-- the population this job exists to bound (consumed is now the dominant exit
+-- from `ready`, so it accumulates until pruned). EXPLAIN QUERY PLAN before:
+--   SEARCH observations USING INDEX idx_observations_status (status=?)
+-- after:
+--   SEARCH observations USING INDEX idx_observations_status_created_at
+--     (status=? AND created_at<?)
+-- so each of the two status values becomes a range seek bounded by the
+-- horizon cutoff -- only the genuinely-old terminal rows are touched. Column
+-- order matters: status is the equality the predicate leads with (two IN
+-- probes), created_at the trailing range, so status must come first for the
+-- range bound to apply. The finding anti-join already seeks
+-- idx_findings_observation_id (0001), so no new index is needed there.
+--
+-- Purely additive: no query or schema change, no existing index touched.
+CREATE INDEX idx_observations_status_created_at
+    ON observations (status, created_at);

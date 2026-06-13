@@ -255,6 +255,46 @@ def _no_triager_consume_grace_seconds() -> int:
     return seconds
 
 
+# Cadence of the retention prune loop. The horizon is measured in days, so an
+# hourly sweep is far more than fine for keeping the terminal-observation set
+# and its body files bounded; tests drive _prune_once directly and do not
+# depend on it.
+_PRUNE_INTERVAL_SEC = 3600.0
+
+# Default retention horizon for terminal observations (consumed /
+# triage_failed). Must be >= the postmortem/timeline window the team wants:
+# rows and bodies prune together, so the timeline reaches back exactly this
+# far (brief-20260607-6qsq Stage 2).
+DEFAULT_OBSERVATION_RETENTION_DAYS = 90
+
+
+def _observation_retention_days() -> int:
+    """Retention horizon for terminal observations, in days.
+
+    ANGELUS_OBSERVATION_RETENTION_DAYS overrides; default is 90. Invalid or
+    non-positive overrides fall back to the default so the prune loop never
+    crashes on a misconfigured env -- the same fail-safe contract as
+    ANGELUS_NO_TRIAGER_CONSUME_GRACE_SEC above.
+    """
+    raw = os.environ.get("ANGELUS_OBSERVATION_RETENTION_DAYS")
+    if raw is None:
+        return DEFAULT_OBSERVATION_RETENTION_DAYS
+    try:
+        days = int(raw)
+    except ValueError:
+        LOGGER.warning(
+            "invalid ANGELUS_OBSERVATION_RETENTION_DAYS=%r; using default", raw
+        )
+        return DEFAULT_OBSERVATION_RETENTION_DAYS
+    if days <= 0:
+        LOGGER.warning(
+            "ANGELUS_OBSERVATION_RETENTION_DAYS=%d must be positive; using default",
+            days,
+        )
+        return DEFAULT_OBSERVATION_RETENTION_DAYS
+    return days
+
+
 class AngelusDaemon:
     def __init__(self, root: Path, *, clock: Clock | None = None) -> None:
         self.root = root
@@ -291,6 +331,16 @@ class AngelusDaemon:
         # Read once at construction (like FaultRegistry.from_env above): the
         # knob is deployment config, not something to mutate on a live daemon.
         self._no_triager_consume_grace_sec = _no_triager_consume_grace_seconds()
+        # Retention horizon for the prune loop (B24 clock-measured). Read once
+        # at construction like the grace knob above -- deployment config, not a
+        # live-mutable value.
+        self._observation_retention_days = _observation_retention_days()
+        # Last-prune bookkeeping for the health surface. In-memory and
+        # restart-scoped by design (the _source_fail_counts precedent): a fresh
+        # daemon reports "nothing pruned yet this generation" until its first
+        # sweep, which is honest and costs no persistence.
+        self._last_prune_deleted = 0
+        self._last_prune_at: str | None = None
         self.scheduler = AsyncIOScheduler(timezone="UTC")
         self.scheduler_semaphore = asyncio.Semaphore(10)
         self.triage_semaphore = asyncio.Semaphore(10)
@@ -456,6 +506,13 @@ class AngelusDaemon:
                 asyncio.create_task(
                     self._consume_sweep_loop(), name="consume-sweep-loop"
                 )
+            )
+            # Registered in self.tasks so the shared teardown budget's final
+            # reap stage (brief-20260608-13w0) cancels and awaits it like the
+            # triage and consume-sweep loops -- it parks on stop_event between
+            # sweeps, so a stop wakes it promptly.
+            self.tasks.append(
+                asyncio.create_task(self._prune_loop(), name="prune-loop")
             )
             self._fixer_loop_task = asyncio.create_task(
                 self._fixer_loop(), name="fixer-loop"
@@ -1009,6 +1066,21 @@ class AngelusDaemon:
                 "findings_pending_dispatch": (
                     self.catalog.findings_pending_dispatch_by_pipe()
                 ),
+                # Retention prune surface (brief-20260607-6qsq Stage 2): how
+                # many terminal observations the next sweep would delete, plus
+                # last-sweep stats. The count reuses the prune predicate and is
+                # bounded by the 0016 (status, created_at) index, so it is
+                # cheap to read here.
+                "retention": {
+                    "prunable_observations": (
+                        self.catalog.prunable_observations_count(
+                            self._observation_retention_days
+                        )
+                    ),
+                    "horizon_days": self._observation_retention_days,
+                    "last_prune_deleted": self._last_prune_deleted,
+                    "last_prune_at": self._last_prune_at,
+                },
             },
             # Belfry is a separate external process (belfry/belfry.py) that
             # cannot write sqlite (single-writer-to-sqlite invariant). On each
@@ -2006,6 +2078,43 @@ class AngelusDaemon:
             try:
                 await asyncio.wait_for(
                     self.stop_event.wait(), timeout=_CONSUME_SWEEP_INTERVAL_SEC
+                )
+            except TimeoutError:
+                continue
+
+    def _prune_once(self) -> None:
+        """One retention prune pass: delete terminal observations older than
+        the horizon that no finding references (observation row + triage rows +
+        body files), recording the outcome for the health surface. Reads the
+        horizon captured at construction -- deployment config, not a live knob
+        (the _no_triager_consume_grace_sec precedent). Tests drive this
+        directly, not through the loop."""
+        deleted, body_refs = self.catalog.prune_observations(
+            self._observation_retention_days
+        )
+        self._last_prune_at = self.clock.now_iso()
+        self._last_prune_deleted = deleted
+        if deleted:
+            LOGGER.info(
+                "pruned %d terminal observation(s) older than %dd "
+                "(%d body file(s))",
+                deleted,
+                self._observation_retention_days,
+                len(body_refs),
+            )
+
+    async def _prune_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                self._prune_once()
+            except Exception:
+                # A bad pass must not kill the loop; the rows stay prunable and
+                # the next pass retries (the _fixer_loop / consume-sweep
+                # contract).
+                LOGGER.exception("retention prune pass crashed")
+            try:
+                await asyncio.wait_for(
+                    self.stop_event.wait(), timeout=_PRUNE_INTERVAL_SEC
                 )
             except TimeoutError:
                 continue

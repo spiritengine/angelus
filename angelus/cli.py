@@ -928,6 +928,15 @@ def _render_health(result: dict[str, Any]) -> None:
         click.echo("  none")
     for pipe in sorted(pending):
         click.echo(f"  {pipe}: {pending[pipe]}")
+    retention = queues.get("retention")
+    if retention is not None:
+        last_prune = retention.get("last_prune_at") or "never"
+        click.echo(
+            f"prunable observations: {retention['prunable_observations']} "
+            f"(horizon {retention['horizon_days']}d; "
+            f"last prune {last_prune} removed "
+            f"{retention['last_prune_deleted']})"
+        )
     _render_delivery(result.get("delivery") or {})
     _render_belfry(result["belfry"])
     _render_deps(result.get("deps") or [])

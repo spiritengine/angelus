@@ -7,6 +7,7 @@ count is a simple indexed lookup instead of parsing finding_ids JSON.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import sqlite3
@@ -35,6 +36,22 @@ _NO_FINDING = 0
 
 def _format_time(value: datetime) -> str:
     return value.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+# The retention prune predicate (brief-20260607-6qsq, Stage 2). A row is
+# prunable when it is in a TERMINAL status, OLDER than the horizon cutoff, and
+# referenced by NO finding. Defined once so the body-ref SELECT, the row
+# DELETE, the triage DELETE, and the prunable-count probe cannot drift apart --
+# a divergence could unlink a body whose row survives, the one outcome
+# atomicity must never produce. `o` is the observations alias every caller
+# binds; the single bind parameter is the cutoff timestamp.
+_PRUNE_PREDICATE = """
+    o.status IN ('consumed', 'triage_failed')
+    AND o.created_at < ?
+    AND NOT EXISTS (
+        SELECT 1 FROM findings f WHERE f.observation_id = o.id
+    )
+"""
 
 
 class Catalog:
@@ -414,6 +431,102 @@ class Catalog:
         )
         self.connection.commit()
         return cursor.rowcount
+
+    def prune_observations(self, retention_days: int) -> tuple[int, list[str]]:
+        """Delete terminal observations older than the retention horizon that
+        no finding references -- triage rows + observation row in ONE commit,
+        body files best-effort after. Returns (rows_deleted, body_refs).
+
+        Predicate (_PRUNE_PREDICATE): status terminal ('consumed' or
+        'triage_failed'), created_at strictly older than now - retention_days
+        on the injected clock, and no finding pointing at the row.
+
+        - Terminal-only is what protects un-triaged and still-retrying work:
+          'writing'/'ready'/'failed' rows are never prunable, so nothing a
+          triager could still pick up is deleted. There is no age at which a
+          non-terminal row prunes -- the status predicate gives this for free.
+        - The finding anti-join is the audit spine. findings.observation_id
+          REFERENCES observations(id) under PRAGMA foreign_keys=ON, so deleting
+          a referenced row would raise IntegrityError; excluding them keeps
+          findings (and the open incidents and replays that hang off them)
+          intact and means this DELETE can never cascade. Findings are NOT
+          pruned by this work.
+        - Horizon: created_at < cutoff is strict, so the prune reaches back
+          EXACTLY retention_days -- a row stamped at the cutoff boundary
+          survives; only strictly-older rows go. Rows and bodies prune
+          together, so the timeline (which windows observations.created_at and
+          reads no bodies) reaches back exactly as far as the retained rows.
+
+        Atomicity: triage rows are deleted BEFORE the observation row (the
+        triage FK references observations, so the reverse order would itself
+        raise), both under one commit. Body unlink runs AFTER the commit and is
+        best-effort (the _prune_digest_staging precedent): a failed unlink
+        leaves an orphan body a later prune re-attempts, which is tolerable --
+        the inverse (a live row whose body is gone) is impossible because the
+        row is deleted before its body is touched, so a crash in the unlink
+        window can only ever leave an orphan body, never a bodyless row.
+        Single-writer (the daemon's prune loop) means the set the SELECT
+        captures equals the set the DELETE removes. Predicate-based DELETEs
+        (an `id IN (SELECT ...)` subquery, not an id-list IN clause) keep the
+        statements within SQLite's bound-variable limit no matter how many rows
+        a single sweep prunes.
+        """
+        cutoff = _format_time(self._clock.now() - timedelta(days=retention_days))
+        rows = self.connection.execute(
+            f"SELECT o.id, o.body_ref FROM observations o WHERE {_PRUNE_PREDICATE}",
+            (cutoff,),
+        ).fetchall()
+        if not rows:
+            return 0, []
+        body_refs = [row["body_ref"] for row in rows if row["body_ref"]]
+        self.connection.execute(
+            f"""
+            DELETE FROM observation_triage
+            WHERE observation_id IN (
+                SELECT o.id FROM observations o WHERE {_PRUNE_PREDICATE}
+            )
+            """,
+            (cutoff,),
+        )
+        cursor = self.connection.execute(
+            f"""
+            DELETE FROM observations
+            WHERE id IN (
+                SELECT o.id FROM observations o WHERE {_PRUNE_PREDICATE}
+            )
+            """,
+            (cutoff,),
+        )
+        self.connection.commit()
+        for body_ref in body_refs:
+            self._unlink_body(body_ref)
+        return cursor.rowcount, body_refs
+
+    def prunable_observations_count(self, retention_days: int) -> int:
+        """Count of observations the next prune would delete -- the same
+        _PRUNE_PREDICATE as prune_observations. Cheap: the 0016
+        (status, created_at) index turns it into a bounded range count rather
+        than a terminal-set scan. Health-surface only; read-only."""
+        cutoff = _format_time(self._clock.now() - timedelta(days=retention_days))
+        row = self.connection.execute(
+            f"SELECT COUNT(*) AS n FROM observations o WHERE {_PRUNE_PREDICATE}",
+            (cutoff,),
+        ).fetchone()
+        return int(row["n"])
+
+    def _unlink_body(self, body_ref: str) -> None:
+        """Best-effort removal of one observation body file and its now-empty
+        per-id directory. Swallows OSError (the _prune_digest_staging
+        precedent): a failed unlink leaves an orphan body a later prune
+        re-attempts, never a kept row with a missing body (prune_observations
+        deletes the row first). observations/<date>/<id>/ holds only this one
+        body, so removing the directory reclaims the inode too; the shared
+        date directory is left for later housekeeping."""
+        path = self.root / body_ref
+        with contextlib.suppress(OSError):
+            path.unlink()
+        with contextlib.suppress(OSError):
+            path.parent.rmdir()
 
     def ready_observations_for_sources(
         self, source_refs: set[str]
