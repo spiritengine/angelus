@@ -18,9 +18,11 @@ from pathlib import Path
 import pytest
 
 from angelus.storage import init_db
-from angelus.storage.migrations import migrate
+from angelus.storage.migrations import DEFAULT_MIGRATIONS_DIR, migrate
 
-MIGRATIONS = Path(__file__).resolve().parent.parent / "migrations"
+# The real migrations now live inside the package; resolve via the runner's
+# package-relative constant rather than re-deriving the path.
+MIGRATIONS = Path(DEFAULT_MIGRATIONS_DIR)
 
 
 def _migrations_through(tmp_path: Path, last: str) -> Path:

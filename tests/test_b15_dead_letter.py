@@ -51,7 +51,7 @@ from angelus.lodging import Channel, Pipe
 from angelus.pipes import PipeDrain
 from angelus.storage import Catalog, init_db
 from angelus.storage.catalog import MAX_RETRY_ATTEMPTS
-from angelus.storage.migrations import migrate
+from angelus.storage.migrations import DEFAULT_MIGRATIONS_DIR, migrate
 
 PINNED = datetime(2026, 6, 3, 12, 0, 0, tzinfo=UTC)
 
@@ -60,7 +60,9 @@ PINNED = datetime(2026, 6, 3, 12, 0, 0, tzinfo=UTC)
 # enough drains to exhaust its ladder. Mirrors test_b14's _PAST_BACKOFF.
 _PAST_BACKOFF = timedelta(hours=9)
 
-MIGRATIONS = Path(__file__).resolve().parent.parent / "migrations"
+# The real migrations now live inside the package; resolve via the runner's
+# package-relative constant rather than re-deriving the path.
+MIGRATIONS = Path(DEFAULT_MIGRATIONS_DIR)
 
 
 # --------------------------------------------------------------------------

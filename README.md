@@ -557,7 +557,7 @@ Two ways in:
 
 ## Storage
 
-SQLite is the authoritative lifecycle store. Migrations live in `migrations/` as ordered SQL files named `<NNNN>_<name>.sql`. The storage initializer enables WAL mode and applies pending migrations in order, with each migration and its `schema_migrations` bookkeeping recorded atomically.
+SQLite is the authoritative lifecycle store. Migrations live in `angelus/migrations/` as ordered SQL files named `<NNNN>_<name>.sql`. They live *inside* the package (and ship as package data) so a non-editable wheel install can resolve them at runtime; the storage runner finds them package-relative via `importlib.resources`. The storage initializer enables WAL mode and applies pending migrations in order, with each migration and its `schema_migrations` bookkeeping recorded atomically.
 
 The initial migration creates the v3.1 tables:
 

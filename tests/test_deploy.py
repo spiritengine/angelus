@@ -30,11 +30,16 @@ from pathlib import Path
 
 import pytest
 
+from angelus.storage.migrations import DEFAULT_MIGRATIONS_DIR
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_PATH = REPO_ROOT / "deploy" / "deploy.py"
 BELFRY_PATH = REPO_ROOT / "belfry" / "belfry.py"
-SRC_MIGRATIONS = REPO_ROOT / "migrations"
+# Migrations now live inside the package (angelus/migrations/) so they ship in
+# the wheel; resolve them via the runner's own package-relative constant rather
+# than re-deriving the path (finding-20260613-mbfc).
+SRC_MIGRATIONS = Path(DEFAULT_MIGRATIONS_DIR)
 
 # Migration filenames in order, so a "live db at version N" / "target ref at
 # version N" can be built by selecting a prefix of this list.
@@ -96,6 +101,9 @@ angelus = "angelus.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["angelus*"]
+
+[tool.setuptools.package-data]
+angelus = ["migrations/*.sql"]
 """
 
 
@@ -116,10 +124,17 @@ def build_dev_repo(dest: Path, upto: str) -> str:
     code. Returns the HEAD sha.
     """
     dest.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(REPO_ROOT / "angelus", dest / "angelus")
-    (dest / "migrations").mkdir()
+    # Migrations live inside the package now. Copy the package WITHOUT its
+    # migrations, then stage only the prefix up to `upto` into the package's
+    # migrations dir -- so the dev repo mirrors the real install layout exactly
+    # (the checkout resolves them package-relative) at the chosen schema version.
+    shutil.copytree(
+        REPO_ROOT / "angelus", dest / "angelus",
+        ignore=shutil.ignore_patterns("migrations", "__pycache__", "*.pyc"),
+    )
+    (dest / "angelus" / "migrations").mkdir()
     for name in _migrations_upto(upto):
-        shutil.copy(SRC_MIGRATIONS / name, dest / "migrations" / name)
+        shutil.copy(SRC_MIGRATIONS / name, dest / "angelus" / "migrations" / name)
     (dest / "belfry").mkdir()
     shutil.copy(BELFRY_PATH, dest / "belfry" / "belfry.py")
     (dest / "deploy").mkdir()
@@ -349,7 +364,7 @@ def dev_repo_breaking(tmp_path_factory) -> tuple[Path, str]:
     post-czir."""
     dest = tmp_path_factory.mktemp("devbreak") / "repo"
     build_dev_repo(dest, M0015)
-    (dest / "migrations" / _BREAKING_MIGRATION_NAME).write_text(
+    (dest / "angelus" / "migrations" / _BREAKING_MIGRATION_NAME).write_text(
         _BREAKING_MIGRATION_SQL, encoding="utf-8"
     )
     _git(dest, "add", "-A")
@@ -392,8 +407,8 @@ def test_happy_path_order_log_and_hold_released(
     order: list[str] = []
     dep = fake_prod.deploy
     for step in ("hold_belfry", "preflight", "backup_live_db", "pip_install",
-                 "copy_belt", "restart_unit", "verify", "append_deploys_log",
-                 "release_hold"):
+                 "verify_installed_migrations", "copy_belt", "restart_unit",
+                 "verify", "append_deploys_log", "release_hold"):
         original = getattr(dep, step)
 
         def make_wrapper(name, func):
@@ -411,8 +426,8 @@ def test_happy_path_order_log_and_hold_released(
     # belt before restart, verify before log, hold released last.
     assert order == [
         "hold_belfry", "preflight", "backup_live_db", "pip_install",
-        "copy_belt", "restart_unit", "verify", "append_deploys_log",
-        "release_hold",
+        "verify_installed_migrations", "copy_belt", "restart_unit", "verify",
+        "append_deploys_log", "release_hold",
     ]
 
     # deploys.log line records the deploy.
@@ -590,7 +605,7 @@ def test_mutation_skipping_dryrun_hits_integrity_error(
     sys.path.insert(0, str(REPO_ROOT))
     from angelus.storage.migrations import init_db
     with pytest.raises(sqlite3.IntegrityError):
-        init_db(fake_prod.live_db, repo / "migrations").close()
+        init_db(fake_prod.live_db, repo / "angelus" / "migrations").close()
 
 
 # ===========================================================================

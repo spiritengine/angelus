@@ -4,10 +4,21 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from importlib.resources import files
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_MIGRATIONS_DIR = PROJECT_ROOT / "migrations"
+# Resolve the migrations dir package-relative so it works identically under an
+# editable install (dev tree) and a non-editable wheel install (site-packages).
+# The dir lives INSIDE the angelus package (angelus/migrations/) and ships as
+# package-data; importlib.resources.files("angelus") returns the package root in
+# both layouts. A __file__-relative form (parents[1] / "migrations") would also
+# work for unzipped installs, but files() is robust against the wheel/zip layout
+# differences that made the old parents[2] / top-level "migrations" resolution
+# crash-loop a non-editable install (finding-20260613-mbfc). Wheels install
+# unzipped, so files() yields a concrete filesystem Path that iterdir()/glob()
+# work on directly -- as_file() would only matter for a zipimport install, which
+# is not how the daemon is deployed.
+DEFAULT_MIGRATIONS_DIR = Path(str(files("angelus") / "migrations"))
 MIGRATION_RE = re.compile(r"^\d{4}_.+\.sql$")
 
 

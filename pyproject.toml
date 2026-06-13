@@ -23,7 +23,17 @@ angelus = "angelus.cli:main"
 [tool.setuptools.packages.find]
 include = ["angelus*"]
 
+# Ship the SQL migrations as package data. They live in angelus/migrations/
+# (a data subdir, not a package) and the daemon resolves them package-relative
+# at runtime, so they MUST travel inside the wheel -- a non-editable install
+# that omitted them crash-loops at startup (finding-20260613-mbfc).
+[tool.setuptools.package-data]
+angelus = ["migrations/*.sql"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
 pythonpath = ["."]
+markers = [
+    "slow: marks tests that build/install a wheel (deselect with '-m \"not slow\"'); runs by default",
+]

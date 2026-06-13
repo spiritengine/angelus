@@ -44,6 +44,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import sysconfig
 import tarfile
 import tempfile
 import time
@@ -94,6 +95,35 @@ _DRYRUN_SNIPPET = (
     "from angelus.storage import init_db\n"
     "conn = init_db(sys.argv[1])\n"
     "conn.close()\n"
+)
+
+# Post-install check: the FRESHLY INSTALLED package must be able to LOCATE its
+# bundled migrations. The dry-run above proves the migrations APPLY, but it runs
+# from the tmp checkout (cwd-import), so it can't see whether the installed wheel
+# actually carries migrations -- the exact gap that crash-looped the 2026-06-13
+# cutover (finding-20260613-mbfc). This imports the installed package and exits
+# nonzero if it resolves a migrations dir with no .sql in it.
+#
+# argv[1] is cfg.repo (the dev tree). The snippet first proves it imported the
+# INSTALLED copy, not the dev tree: if either the imported angelus package or its
+# resolved migrations dir lives UNDER the repo, some env/cwd path let the dev
+# tree shadow the install, so it fails closed (exit 8) instead of reporting a
+# false pass. The caller sanitizes PYTHONPATH so this should never trip, but the
+# guard is self-validating if a future env path slips through (codex fell-r1).
+_INSTALLED_MIGRATIONS_SNIPPET = (
+    "import sys\n"
+    "from pathlib import Path\n"
+    "import angelus\n"
+    "from angelus.storage.migrations import DEFAULT_MIGRATIONS_DIR as d\n"
+    "repo = Path(sys.argv[1]).resolve()\n"
+    "migdir = Path(str(d)).resolve()\n"
+    "pkg = Path(angelus.__file__).resolve()\n"
+    "if migdir.is_relative_to(repo) or pkg.is_relative_to(repo):\n"
+    "    print('post-install check imported the DEV TREE under '\n"
+    "          f'{repo} (angelus={pkg}, migrations={migdir}), not the '\n"
+    "          'installed package', file=sys.stderr)\n"
+    "    sys.exit(8)\n"
+    "sys.exit(0 if any(migdir.glob('*.sql')) else 9)\n"
 )
 
 # Config-integrity (B18) under the target ref against the LIVE lodging. Replays
@@ -418,8 +448,13 @@ def readable_applied_versions(db_path: Path) -> set[str] | None:
 
 
 def target_versions(checkout: Path) -> set[str]:
-    """Migration filenames present in the target ref's migrations dir."""
-    mig = checkout / "migrations"
+    """Migration filenames present in the target ref's migrations dir.
+
+    Migrations live inside the package (angelus/migrations/) so they ship in the
+    wheel; the checkout mirrors that layout, so read them there -- the old
+    top-level migrations/ path no longer exists post-move (finding-20260613-mbfc).
+    """
+    mig = checkout / "angelus" / "migrations"
     if not mig.is_dir():
         return set()
     return {p.name for p in mig.iterdir() if p.is_file() and MIGRATION_RE.match(p.name)}
@@ -566,6 +601,69 @@ def pip_install(cfg: Config, sha: str) -> None:
         detail = (result.stderr.strip() or result.stdout.strip()
                   or f"exit {result.returncode}")
         raise DeployError(f"pip install of {sha} failed:\n{detail}")
+
+
+def verify_installed_migrations(cfg: Config) -> None:
+    """Confirm the FRESHLY INSTALLED package can locate its bundled migrations.
+
+    This is the deterministic guard for the 2026-06-13 class: a non-editable
+    install whose wheel omitted migrations crash-loops the daemon at startup
+    (finding-20260613-mbfc). The dry-run preflight runs the target migrations
+    from the tmp CHECKOUT, so it validates their CONTENT but never the INSTALLED
+    package's ability to FIND them. This runs after pip_install and before the
+    restart, so the packaging gap fails the deploy loudly here instead of via the
+    crash-loop verify backstop.
+
+    The probe must resolve angelus to what pip just installed, NOT the dev tree,
+    regardless of the inherited environment. Two things could shadow the install:
+    a stray ./angelus in the deploy's launch directory (handled by the neutral
+    cwd), and an inherited PYTHONPATH pointing at the repo (common in a dev shell;
+    `make deploy` inherits the operator's shell env). So the probe env is
+    sanitized per install mode:
+
+      * NO-PREFIX mode (real prod: pip installs into pip_python's own env) --
+        REMOVE any inherited PYTHONPATH so the import resolves ONLY from the
+        installed env's site-packages. Without this, PYTHONPATH=<repo> makes the
+        probe import the DEV TREE, which always finds migrations package-relative,
+        and the guard false-passes even when the installed wheel omitted them
+        (codex fell-r1).
+      * PREFIX mode (the test harness, and any --prefix deploy) -- pip placed the
+        package under cfg.pip_prefix, which is NOT on pip_python's default path,
+        so SET PYTHONPATH to EXACTLY that purelib (computed with the interpreter
+        that runs the probe, so it matches where pip placed the package). Replace,
+        never prepend-to-inherited: an inherited entry ahead of purelib could
+        still shadow the install.
+
+    The snippet is itself self-validating: it fails closed if the imported
+    angelus resolves under cfg.repo (passed as argv), so a dev-tree import can
+    never report a false pass even if some future env path slips through.
+    """
+    env = dict(os.environ)
+    if cfg.pip_prefix:
+        purelib = sysconfig.get_path(
+            "purelib", vars={"base": cfg.pip_prefix, "platbase": cfg.pip_prefix}
+        )
+        env["PYTHONPATH"] = purelib
+    else:
+        env.pop("PYTHONPATH", None)
+    with tempfile.TemporaryDirectory(prefix="angelus-migcheck-") as tmp:
+        result = subprocess.run(
+            [cfg.pip_python, "-c", _INSTALLED_MIGRATIONS_SNIPPET, str(cfg.repo)],
+            cwd=tmp,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    if result.returncode != 0:
+        detail = (result.stderr.strip() or result.stdout.strip()
+                  or f"exit {result.returncode}")
+        raise DeployError(
+            "post-install check FAILED -- the installed angelus package cannot "
+            "locate its bundled migrations. A restart would crash-loop the daemon "
+            f"(FileNotFoundError on the migrations dir):\n{detail}"
+        )
+    log("post-install: installed package can locate its migrations")
 
 
 def copy_belt(cfg: Config, checkout: Path) -> None:
@@ -932,6 +1030,10 @@ def cmd_deploy(cfg: Config, ref: str, restore_backup: bool) -> int:
 
         # Install the target ref, non-editable.
         pip_install(cfg, sha)
+
+        # Post-install: the installed package must be able to find its bundled
+        # migrations BEFORE we restart onto it (else the daemon crash-loops).
+        verify_installed_migrations(cfg)
 
         # Deploy the belt layer from the tmp checkout (ref-consistent).
         copy_belt(cfg, checkout)
