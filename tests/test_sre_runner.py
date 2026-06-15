@@ -54,20 +54,25 @@ def _report_path_from_prompt(prompt: str) -> Path | None:
     return None
 
 
-def _spin_writes_report(spool_id: str = "abc12345"):
+_RECOVERED_REPORT = (
+    "outcome: resolved\nroot-cause: test\nservice-state: recovered\n"
+    "confidence: high\n"
+)
+
+
+def _spin_writes_report(spool_id: str = "abc12345", content: str = _RECOVERED_REPORT):
     """Fake spindle_spin that simulates the agent writing its report file.
 
     Mirrors the verified happy path: the spool runs and leaves a report at the
-    exact path the runner passed in the prompt.
+    exact path the runner passed in the prompt. `content` defaults to a
+    recovered/resolved header; pass an honest-failure or malformed header to
+    exercise the report-content gate.
     """
     def _spin(prompt, working_dir, tags, env=None):
         report_path = _report_path_from_prompt(prompt)
         assert report_path is not None, "report path not found in prompt"
         report_path.parent.mkdir(parents=True, exist_ok=True)
-        report_path.write_text(
-            "outcome: resolved\nroot-cause: test\nservice-state: recovered\n"
-            "confidence: high\n"
-        )
+        report_path.write_text(content)
         return spool_id
     return _spin
 
@@ -841,6 +846,175 @@ def test_typed_complete_spool_no_report_clears_unverified(tmp_path):
     assert len(unverified) == 1
     assert "completion_status=completed" in unverified[0]
     assert "report_written=false" in unverified[0]
+
+
+# ---------------------------------------------------------------------------
+# Report-content gate (issue-20260613-oe3x): the report's EXISTENCE is not
+# proof of a fix — the SRE prompt requires a report in EVERY outcome, including
+# an honest escalated-to-human / service-state: not-recovered. Credit a clean
+# resolved only when the report's own header affirmatively claims recovery
+# (outcome: resolved AND service-state: recovered). Any other header — an
+# honest failure, a contradiction, or a missing/malformed field — must NOT
+# credit and must page (fail-loud). This closes the concurrent-external-
+# recovery false-attribution case hfje left as a follow-up.
+# ---------------------------------------------------------------------------
+
+def test_report_claims_recovery_parses_header():
+    """Unit-level: the parser credits ONLY outcome: resolved + service-state:
+    recovered, and fails closed on every other shape."""
+    runner = _load_runner()
+
+    def _check(content, tmp):
+        p = tmp / "r.md"
+        p.write_text(content)
+        return runner.report_claims_recovery(p)
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        tmp = Path(d)
+        # The one credited shape.
+        assert _check(
+            "outcome: resolved\nservice-state: recovered\nconfidence: high\n", tmp
+        ) is True
+        # Case/whitespace tolerance on the value.
+        assert _check(
+            "outcome:  Resolved \nservice-state:\tRECOVERED\n", tmp
+        ) is True
+        # Honest failure: escalated + not-recovered.
+        assert _check(
+            "outcome: escalated-to-human\nservice-state: not-recovered\n", tmp
+        ) is False
+        # Contradictions never credit.
+        assert _check("outcome: resolved\nservice-state: not-recovered\n", tmp) is False
+        assert _check("outcome: escalated-to-human\nservice-state: recovered\n", tmp) is False
+        # Unknown service-state.
+        assert _check("outcome: resolved\nservice-state: unknown\n", tmp) is False
+        # Missing fields entirely.
+        assert _check("root-cause: something\nconfidence: low\n", tmp) is False
+        assert _check("outcome: resolved\n", tmp) is False
+        # Decorated value (exact-token match) -> fail-loud, does not credit.
+        assert _check(
+            "outcome: resolved\nservice-state: recovered (daemon up)\n", tmp
+        ) is False
+        # Duplicated header: a credited-looking first occurrence followed by a
+        # contradicting duplicate is ambiguous -> fail closed, must page.
+        assert _check(
+            "outcome: resolved\nservice-state: recovered\n"
+            "outcome: escalated-to-human\nservice-state: not-recovered\n",
+            tmp,
+        ) is False
+        # Benign exact-duplicate (values agree) is still ambiguous under the
+        # fail-loud posture -> fail closed regardless of agreement.
+        assert _check(
+            "outcome: resolved\nservice-state: recovered\n"
+            "service-state: recovered\n",
+            tmp,
+        ) is False
+        # Empty / junk file.
+        assert _check("", tmp) is False
+        assert _check("totally unstructured prose with no header at all", tmp) is False
+
+    # Unreadable file (does not exist) fails closed, never raises.
+    assert runner.report_claims_recovery(Path("/nonexistent/report.md")) is False
+
+
+def test_recovered_report_credits_resolved(tmp_path):
+    """Completed spool + report whose header says outcome: resolved /
+    service-state: recovered + healthy daemon -> the one credited case."""
+    runner = _load_runner()
+    state = tmp_path / "state"
+    _write_sentinel(state, "crash-loop: genuine fix")
+
+    with patch.object(runner, "spindle_spin", side_effect=_spin_writes_report("rec01")), \
+         patch.object(runner, "spindle_wait", return_value="completed"), \
+         patch.object(runner, "check_daemon_healthy", return_value=True), \
+         patch.object(runner, "notify_pat") as mock_notify:
+        rc = runner._run(state)
+
+    assert rc == 0
+    assert not (state / "belfry-needs-sre").exists()
+    mock_notify.assert_not_called()
+
+    log_lines = _read_fixers_log(state)
+    resolved = [l for l in log_lines if "action=resolved" in l and "outcome=cleared" in l]
+    assert len(resolved) == 1
+    assert "spool_id=rec01" in resolved[0]
+    assert not [l for l in log_lines if "action=cleared-unverified" in l]
+
+
+def test_honest_not_recovered_report_does_not_credit_and_pages(tmp_path):
+    """The oe3x case: a live agent COMPLETES and honestly writes an
+    escalated-to-human / service-state: not-recovered report, while the daemon
+    recovers out-of-band. Existence-only crediting would falsely log resolved;
+    the content gate must route to cleared-unverified + page instead."""
+    runner = _load_runner()
+    state = tmp_path / "state"
+    _write_sentinel(state, "crash-loop: agent could not fix")
+
+    honest = (
+        "outcome: escalated-to-human\n"
+        "root-cause: bad env value in angelus.env; needs a human\n"
+        "actions-taken: - diagnosed, did not change config\n"
+        "commits: none\n"
+        "service-state: not-recovered\n"
+        "confidence: high\n"
+        "follow-ups: human should fix the env value and redeploy\n"
+    )
+
+    with patch.object(runner, "spindle_spin", side_effect=_spin_writes_report("honest1", honest)), \
+         patch.object(runner, "spindle_wait", return_value="completed"), \
+         patch.object(runner, "check_daemon_healthy", return_value=True), \
+         patch.object(runner, "notify_pat") as mock_notify:
+        rc = runner._run(state)
+
+    assert rc == 0
+    # Sentinel cleared (daemon is up) but the agent is NOT credited.
+    assert not (state / "belfry-needs-sre").exists()
+
+    mock_notify.assert_called_once()
+    assert "verified" in mock_notify.call_args[0][0].lower()
+
+    log_lines = _read_fixers_log(state)
+    # NO resolved line crediting an agent that itself said "not recovered".
+    assert not [l for l in log_lines if "action=resolved" in l]
+    unverified = [l for l in log_lines if "action=cleared-unverified" in l]
+    assert len(unverified) == 1
+    assert "spool_id=honest1" in unverified[0]
+    assert "completion_status=completed" in unverified[0]
+    # The report WAS written — the distinguishing detail vs the no-report case,
+    # proving the credit hinges on CONTENT, not existence.
+    assert "report_written=true" in unverified[0]
+    assert "recovery_claimed=false" in unverified[0]
+
+
+def test_malformed_report_header_does_not_credit_and_pages(tmp_path):
+    """A report present on disk but with a missing/unparseable header (the agent
+    wrote freeform prose, or the header drifted) must fail closed: not credited,
+    cleared-unverified, paged — consistent with resolve_engine_repo's fail-loud
+    posture."""
+    runner = _load_runner()
+    state = tmp_path / "state"
+    _write_sentinel(state, "crash-loop: garbled report")
+
+    garbled = "I poked around for a while and think it's probably fine now.\n"
+
+    with patch.object(runner, "spindle_spin", side_effect=_spin_writes_report("junk1", garbled)), \
+         patch.object(runner, "spindle_wait", return_value="completed"), \
+         patch.object(runner, "check_daemon_healthy", return_value=True), \
+         patch.object(runner, "notify_pat") as mock_notify:
+        rc = runner._run(state)
+
+    assert rc == 0
+    assert not (state / "belfry-needs-sre").exists()
+    mock_notify.assert_called_once()
+    assert "verified" in mock_notify.call_args[0][0].lower()
+
+    log_lines = _read_fixers_log(state)
+    assert not [l for l in log_lines if "action=resolved" in l]
+    unverified = [l for l in log_lines if "action=cleared-unverified" in l]
+    assert len(unverified) == 1
+    assert "report_written=true" in unverified[0]
+    assert "recovery_claimed=false" in unverified[0]
 
 
 def test_typed_error_spool_unhealthy_daemon_retains_sentinel(tmp_path):

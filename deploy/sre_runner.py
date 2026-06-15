@@ -419,6 +419,57 @@ def check_daemon_healthy(state: Path) -> bool:
         return True
 
 
+def report_claims_recovery(report_path: Path) -> bool:
+    """True only if the SRE report's own header affirmatively states the
+    service recovered AND the incident was resolved.
+
+    build_sre_prompt mandates a fixed header the agent must write in EVERY
+    outcome (including an honest 'couldn't fix it'):
+
+        outcome: resolved | unresolved | escalated-to-human
+        service-state: recovered | not-recovered | unknown
+
+    The report's mere EXISTENCE is not proof of a fix — the prompt requires one
+    even when the agent escalates with service-state: not-recovered. So a clean
+    'resolved' is credited only when the content reads exactly
+    `outcome: resolved` AND `service-state: recovered`. Every other shape —
+    an escalated-to-human/not-recovered report, a contradiction
+    (resolved+not-recovered or escalated+recovered), an unknown service-state,
+    a missing or duplicated header field, junk values, or an unreadable file —
+    returns False so the caller routes to the not-resolved/page path.
+
+    Fail-loud by construction: ambiguity never credits a resolution. A false
+    negative merely pages a human about a daemon that is in fact healthy
+    (annoying, safe); a false positive would log a dead/honest-failure agent as
+    resolved and stay silent (the bug this closes). Exact-token match on the
+    lower-cased value enforces that direction — a decorated value like
+    'recovered (daemon up)' does not match and pages rather than credits.
+    """
+    try:
+        text = report_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        log_err(f"sre-runner: cannot read SRE report {report_path}: {exc}")
+        return False
+
+    fields: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        key, sep, value = line.partition(":")
+        if not sep:
+            continue
+        key = key.strip().lower()
+        if key in ("outcome", "service-state"):
+            if key in fields:
+                # A duplicated header field is ambiguous — a later occurrence
+                # may contradict (or merely echo) the first. Either way we
+                # cannot trust the header, so fail closed regardless of value
+                # agreement, per the fail-loud posture.
+                return False
+            fields[key] = value.strip().lower()
+
+    return fields.get("outcome") == "resolved" and fields.get("service-state") == "recovered"
+
+
 # ---------------------------------------------------------------------------
 # Spindle invocation
 # ---------------------------------------------------------------------------
@@ -861,16 +912,28 @@ def _run(state: Path) -> int:
         # apply + restart) while the spool dies after read-only diagnostics —
         # exactly the 2026-06-12 incident, where a dead spool got logged as a
         # clean resolved/cleared because the post-check only looked at daemon
-        # health. Credit the agent only when its spool COMPLETED and it wrote
-        # its report.
+        # health. Credit the agent only when its spool COMPLETED, it wrote its
+        # report, AND that report's own header affirmatively claims the service
+        # recovered.
         #
         # report_path is the host-side path of the file the agent writes: the
         # reports dir is bind-mounted writable into the shard sandbox at the
         # same absolute path (SPINDLE_SHARD_WRITABLE_BINDS, set above the
         # spawn), so the agent's write lands on the host at report_path and the
         # runner can stat it directly.
+        #
+        # Report EXISTENCE is necessary but still not sufficient: the prompt
+        # mandates a report in EVERY outcome, including an honest escalated-to-
+        # human / service-state: not-recovered. So an agent that correctly
+        # reports "couldn't fix it" while the daemon recovers out-of-band would,
+        # under an existence-only check, be falsely logged as resolved
+        # (issue-20260613-oe3x). Gate on the report's CONTENT: only the agent's
+        # own outcome: resolved + service-state: recovered credits a clean
+        # resolution. A missing/unparseable/contradictory header fails closed
+        # (report_claims_recovery -> False -> page).
         report_written = report_path.is_file()
-        agent_verified = completion_status == "completed" and report_written
+        recovery_claimed = report_written and report_claims_recovery(report_path)
+        agent_verified = completion_status == "completed" and recovery_claimed
 
         # Clear the sentinel either way: the daemon is up, so leaving it would
         # just re-spawn an SRE agent every tick against a healthy daemon.
@@ -882,8 +945,8 @@ def _run(state: Path) -> int:
 
         if agent_verified:
             log_out(
-                "sre-runner: post-check: daemon healthy and agent wrote its "
-                "report; clearing sentinel (agent-verified resolution)"
+                "sre-runner: post-check: daemon healthy and agent's report "
+                "confirms recovery; clearing sentinel (agent-verified resolution)"
             )
             append_fixers_log(
                 flog_path, "sre-runner", "resolved", sentinel_reason, "cleared",
@@ -891,19 +954,23 @@ def _run(state: Path) -> int:
             )
         else:
             # Daemon recovered but the agent cannot be credited: its spool
-            # errored/died, or it wrote no report. Clear the sentinel (daemon
-            # is up) but log it honestly — NOT a resolved/cleared line that
-            # credits a dead agent — and page a human, because this almost
-            # always means the SRE machinery failed and someone recovered the
-            # daemon by hand.
-            detail = (
-                "no report written" if completion_status == "completed"
-                else f"spool {completion_status}"
-            )
+            # errored/died, it wrote no report, or its report does not claim
+            # recovery (an honest escalation, a contradiction, or a malformed
+            # header). Clear the sentinel (daemon is up) but log it honestly —
+            # NOT a resolved/cleared line that credits an uncredited agent —
+            # and page a human, because this almost always means the SRE
+            # machinery failed and someone recovered the daemon by hand.
+            if completion_status != "completed":
+                detail = f"spool {completion_status}"
+            elif not report_written:
+                detail = "no report written"
+            else:
+                detail = "report does not confirm recovery"
             log_err(
                 "sre-runner: post-check: daemon healthy but recovery is "
                 f"UNVERIFIED ({detail}; completion_status={completion_status}, "
-                f"report_written={str(report_written).lower()}); clearing "
+                f"report_written={str(report_written).lower()}, "
+                f"recovery_claimed={str(recovery_claimed).lower()}); clearing "
                 "sentinel but NOT crediting the agent"
             )
             append_fixers_log(
@@ -915,6 +982,7 @@ def _run(state: Path) -> int:
                 spool_id=spool_id,
                 completion_status=completion_status,
                 report_written=str(report_written).lower(),
+                recovery_claimed=str(recovery_claimed).lower(),
             )
             notify_pat(
                 f"angelus sre-runner: daemon recovered but WITHOUT a verified "
