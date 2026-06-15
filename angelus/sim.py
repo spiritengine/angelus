@@ -111,6 +111,7 @@ class SimHarness:
         self.daemon = AngelusDaemon(self.root, clock=self.clock)
         self._closed = False
         self._startup_recovery()
+        self._startup_register()
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -132,6 +133,39 @@ class SimHarness:
         self.daemon.catalog.clear_channel_health()
         self.daemon.catalog.clear_digest_channel_attempts()
         self.daemon.catalog.clear_immediate_channel_attempts()
+
+    def _startup_register(self) -> None:
+        """Mirror the REST of run()'s synchronous, loop-free startup block --
+        the steps between the recover/clear calls above and ``scheduler.start()``
+        that reconcile incidents, run the B18 config validation, and persist the
+        delivery/check SLA contracts to sqlite.
+
+        B27 decision (the startup-validation harness question the spec flags):
+        these are mirrored into construction rather than left to the caller,
+        exactly like the recover/clear block, so the sim's startup is faithful
+        BY CONSTRUCTION -- a scenario never has to remember to "also validate."
+        Three fragility-class scenarios depend on this running at startup:
+          - the per-pipe delivery SLA belfry reads (sla_failure) needs
+            _sync_pipe_sla to have written pipe_sla (S1);
+          - the per-source check SLA belfry reads (source_overdue_failure) needs
+            _sync_source_sla to have written source_sla (S5);
+          - B18 degraded startup -- a channel whose required env is unset must
+            come up with an open internal/config incident and a loud distress
+            finding -- is exactly _validate_channel_config, so S6 becomes
+            "construct the harness with the env unset" with no harness method to
+            call by hand.
+        The only run() steps still NOT mirrored are the genuine scheduler/loop/
+        socket concerns the harness docstring already says it omits
+        (_register_initial_jobs, scheduler.start, the async loops, the control
+        socket, the reloader). On a well-configured fresh root the reconcile and
+        validate calls are no-ops; on a misconfigured or reused root they give
+        the same first-tick state a real daemon would have.
+        """
+        self.daemon._reconcile_orphaned_internal_incidents()
+        self.daemon._reconcile_dead_letter_incidents()
+        self.daemon._validate_channel_config()
+        self.daemon._sync_pipe_sla()
+        self.daemon._sync_source_sla()
 
     def close(self) -> None:
         """Close the sqlite connection and restore the dry-run env override.

@@ -36,4 +36,5 @@ addopts = "-q"
 pythonpath = ["."]
 markers = [
     "slow: marks tests that build/install a wheel (deselect with '-m \"not slow\"'); runs by default",
+    "scenario: B27 end-to-end fragility-class reproducers (tests/scenarios/); runs by default, select with '-m scenario'",
 ]
