@@ -118,6 +118,7 @@ def _write_reference_lodging(
     status_code: int = 503,
     daily_max_interval: str | None = "24h",
     daily_channels: tuple[str, ...] = ("email",),
+    now_channels: tuple[str, ...] = ("push",),
     email_to: str = "person@example.com",
     email_env_var: str | None = None,
     email_backup: str | None = None,
@@ -135,6 +136,12 @@ def _write_reference_lodging(
         the out-of-band SLA to fire).
       - ``daily_channels``: the digest's channels (default email-only; pass
         ("email", "push") for the additive transports shape).
+      - ``now_channels``: the immediate `now` pipe's channels (default push-only,
+        the production shape). A scenario exercising the B13 immediate-path
+        failover ladder routes `now` to ("email",) with ``email_backup="push"``
+        so a degraded email primary fails over to the push backup (the digest
+        path does not honour ``backup`` -- see runner._drain_digest -- so the
+        failover ladder lives only on the immediate path).
       - ``email_to`` / ``email_env_var``: the email channel's recipient as a
         literal address, or as a B18 ``$env:NAME`` marker (env-marker form, for
         the degraded-startup class) when ``email_env_var`` is given.
@@ -181,7 +188,7 @@ def _write_reference_lodging(
     pipes = root / "pipes"
     pipes.mkdir(exist_ok=True)
     (pipes / "now.yaml").write_text(
-        "cadence: immediate\nchannels: [push]\n"
+        "cadence: immediate\nchannels: [" + ", ".join(now_channels) + "]\n"
         "render:\n  kind: dumb-alert\n"
         "  template: '[now] {source} {type}:{entity}'\n",
         encoding="utf-8",
