@@ -34,11 +34,22 @@ checkout is the one with sharp edges. The full migration plan is SKEIN brief
    and anything naming Patrick's hosts/sites belong in the private lodging
    repo. This repo ships `examples/lodging/` only, and the tests run against
    it (full suite ~600 tests, `python -m pytest`).
-4. **belfry and sre_runner run from cron with cwd at the lodging root** but
-   are invoked by absolute path from this repo. Both derive the engine repo
-   via their own `__file__` (`CODE_ROOT`) — keep it that way; the
-   deployment-root/code-root conflation has bitten twice (see the
-   2026-06-12 fell, commits 5b0aa5b..772da21).
+4. **belfry and sre_runner run from cron with cwd at the lodging root.**
+   Post-cutover `make deploy` copies both into `<lodging>/bin/` and cron runs
+   them from there, so the old `__file__`-based `CODE_ROOT` (`parent.parent`)
+   now resolves to the lodging root — a YAML-only repo with no engine code.
+   That conflation has bitten repeatedly (the 2026-06-12 fell, commits
+   5b0aa5b..772da21; then again at the cutover, issue-20260615-njaq). The
+   fix: the engine repo must be resolved, not derived from file location.
+   `sre_runner` now calls `resolve_engine_repo()` — it reads the installed
+   `angelus` package's PEP 610 provenance (`direct_url.json`), falling back to
+   the imported package's own location for an editable dev tree, and validates
+   the result is a real engine checkout before spawning the SRE fixer agent
+   there (fail-loud-and-page if it cannot). belfry's `stale_deployment` git
+   check still uses `CODE_ROOT` and is consequently inert post-cutover; its
+   rework is folded into the deploy-identity follow-up (piece 2 of
+   brief-20260613-3spy). Do NOT reintroduce a `__file__`/`CODE_ROOT`
+   derivation for locating the engine repo.
 
 ## Pending: the lineage swap
 

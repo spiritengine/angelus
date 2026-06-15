@@ -231,11 +231,12 @@ def test_spawn_invocation_shape(tmp_path):
     prompt = captured_prompt["v"]
     working_dir = captured_working_dir["v"]
 
-    # The fixer agent must land in the ENGINE repo (CODE_ROOT), never the
-    # deployment root the runner was invoked against -- in a split deployment
-    # that root is a YAML-only lodging repo with no code or tests (the same
-    # deployment-root/code-root conflation belfry's stale-deploy check had).
-    assert working_dir == str(runner.CODE_ROOT)
+    # The fixer agent must land in the ENGINE repo, never the deployment root
+    # the runner was invoked against -- in a split deployment that root is a
+    # YAML-only lodging repo with no code or tests (the same deployment-root/
+    # code-root conflation belfry's stale-deploy check had). The repo is
+    # resolved from the installed package's provenance, not __file__.
+    assert working_dir == str(runner.resolve_engine_repo())
     assert working_dir != str(tmp_path)
 
     # prompt must contain the absolute report path under state/sre-reports/
@@ -247,6 +248,17 @@ def test_spawn_invocation_shape(tmp_path):
     # prompt must reference the required fields
     for field in ("outcome:", "root-cause:", "actions-taken:", "service-state:", "confidence:"):
         assert field in prompt
+
+    # Diagnose-and-tender model: the agent prepares a fix on its shard branch but
+    # does NOT deploy (it can't from the sandbox, and a restart wouldn't apply it
+    # under the non-editable install). The prompt must say it does not deploy and
+    # must NOT instruct it to merge/deploy/restart as the apply path.
+    assert "YOU DO NOT DEPLOY" in prompt
+    assert "COMMIT it to your shard branch" in prompt
+    assert "Do NOT merge to master" in prompt
+    # No leftover "restart heals" or "run make deploy to apply" instruction.
+    assert "systemctl --user restart angelus` and verify it comes" not in prompt
+    assert "run `make deploy`. This is the only" not in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -1004,3 +1016,153 @@ def test_reports_dir_created_before_spawn(tmp_path):
         runner._run(state)
 
     assert dir_existed_at_spin["v"] is True
+
+
+# ---------------------------------------------------------------------------
+# Engine-repo resolution (issue-20260615-njaq): post-cutover the runner is
+# copied to <lodging>/bin, so __file__/cwd no longer point at the engine repo.
+# It must resolve the repo from the installed package's provenance, and refuse
+# to spawn (fail loud, retain sentinel) when it cannot find a valid one.
+# ---------------------------------------------------------------------------
+
+def _make_engine_repo(path: Path) -> Path:
+    """Construct the minimum that is_valid_engine_repo accepts."""
+    (path / "angelus").mkdir(parents=True, exist_ok=True)
+    (path / "angelus" / "__init__.py").write_text("", encoding="utf-8")
+    (path / ".git").mkdir(exist_ok=True)
+    (path / "Makefile").write_text("deploy:\n\t@true\n", encoding="utf-8")
+    return path
+
+
+def test_is_valid_engine_repo_requires_git_package_and_makefile(tmp_path):
+    runner = _load_runner()
+    good = _make_engine_repo(tmp_path / "good")
+    assert runner.is_valid_engine_repo(good) is True
+
+    # A YAML-only lodging root (no angelus/, no Makefile, no .git) is rejected --
+    # this is exactly the codeless tree the cutover regression pointed at.
+    lodging = tmp_path / "lodging"
+    (lodging / "entities").mkdir(parents=True)
+    assert runner.is_valid_engine_repo(lodging) is False
+
+    # Each missing component individually fails the check.
+    for missing in ("angelus", ".git", "Makefile"):
+        partial = _make_engine_repo(tmp_path / f"no_{missing.strip('.')}")
+        target = partial / missing
+        if target.is_dir():
+            __import__("shutil").rmtree(target)
+        else:
+            target.unlink()
+        assert runner.is_valid_engine_repo(partial) is False, missing
+
+
+def test_resolve_engine_repo_prefers_direct_url_provenance(tmp_path):
+    """A non-editable install (prod): the PEP 610 file:// URL wins, even though
+    the imported-package fallback would point at site-packages."""
+    runner = _load_runner()
+    repo = _make_engine_repo(tmp_path / "engine")
+    with patch.object(
+        runner, "_direct_url_repo", return_value=repo
+    ), patch.object(
+        runner, "_imported_package_repo", return_value=Path("/some/site-packages")
+    ):
+        assert runner.resolve_engine_repo() == repo
+
+
+def test_resolve_engine_repo_falls_back_to_imported_location(tmp_path):
+    """An editable/dev checkout carries no direct_url; the repo is inferred from
+    where the angelus package is imported from."""
+    runner = _load_runner()
+    repo = _make_engine_repo(tmp_path / "engine")
+    with patch.object(
+        runner, "_direct_url_repo", return_value=None
+    ), patch.object(runner, "_imported_package_repo", return_value=repo):
+        assert runner.resolve_engine_repo() == repo
+
+
+def test_resolve_engine_repo_rejects_invalid_candidates(tmp_path):
+    """Both strategies yield non-repos (e.g. site-packages, the lodging root):
+    resolve returns None rather than handing the agent a codeless tree."""
+    runner = _load_runner()
+    not_a_repo = tmp_path / "lodging"
+    not_a_repo.mkdir()
+    with patch.object(
+        runner, "_direct_url_repo", return_value=not_a_repo
+    ), patch.object(runner, "_imported_package_repo", return_value=None):
+        assert runner.resolve_engine_repo() is None
+
+
+def test_direct_url_repo_parses_real_provenance_and_fails_soft(tmp_path):
+    """Exercise the actual direct_url.json parsing (not a mock of the strategy):
+    a git+file install records `url: file://<repo>` -> the repo path; a
+    git+file-prefixed scheme, a non-string url, and a malformed authority must
+    all return None (never raise -- a raise would skip the caller's fail-loud
+    page). This is the parse most likely to break silently on a pip change."""
+    runner = _load_runner()
+
+    class _Dist:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def read_text(self, name):
+            assert name == "direct_url.json"
+            return self._payload
+
+    def _with(payload):
+        return patch.object(
+            runner.importlib.metadata, "distribution", return_value=_Dist(payload)
+        )
+
+    # Canonical git+file install: pip strips git+, records a file:// URL.
+    with _with('{"url": "file:///home/p/projects/angelus", '
+               '"vcs_info": {"vcs": "git", "commit_id": "abc"}}'):
+        assert runner._direct_url_repo() == Path("/home/p/projects/angelus")
+
+    # Fail-soft (return None, never raise) on each malformed shape.
+    for payload in (
+        '{"url": "git+file:///home/p/angelus"}',   # scheme not file -> None
+        '{"url": 123}',                            # non-string url
+        '{"url": "file://["}',                     # bad authority -> ValueError
+        '{"no_url": "x"}',                         # missing url
+        "not json at all",                         # unparseable
+    ):
+        with _with(payload):
+            assert runner._direct_url_repo() is None, payload
+
+
+def test_run_fails_loud_and_does_not_spawn_without_engine_repo(tmp_path):
+    """When no valid engine repo can be resolved, the runner must NOT spawn an
+    agent into a wrong/codeless tree: it pages, retains the needs-sre sentinel,
+    logs a blocked outcome, and rate-limits via last-spawn WITHOUT consuming the
+    escalation budget (spawn log stays empty)."""
+    runner = _load_runner()
+    state = tmp_path / "state"
+    _write_sentinel(state, "crash-loop: real reason")
+
+    with patch.object(runner, "resolve_engine_repo", return_value=None), \
+         patch.object(runner, "spindle_spin") as mock_spin, \
+         patch.object(runner, "notify_pat") as mock_notify:
+        rc = runner._run(state)
+
+    assert rc == 0
+    # The agent was never spawned.
+    mock_spin.assert_not_called()
+    # Sentinel retained for a human; daemon is still down.
+    assert (state / "belfry-needs-sre").exists()
+    # A human is paged.
+    mock_notify.assert_called_once()
+    assert "engine repo" in mock_notify.call_args[0][0]
+    # Budget untouched (this is a deploy/env fault, not an escalation attempt),
+    # but the page is rate-limited via the last-spawn timestamp.
+    assert not (state / "sre-spawn-log").exists() or _read_lines(
+        state / "sre-spawn-log"
+    ) == []
+    assert (state / "sre-last-spawn-at").exists()
+    # Logged honestly.
+    assert any("blocked-no-engine-repo" in line for line in _read_fixers_log(state))
+
+
+def _read_lines(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    return [line for line in path.read_text().splitlines() if line.strip()]

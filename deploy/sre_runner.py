@@ -13,11 +13,14 @@ stdlib; agent-spawning machinery lives here.  Runs from raw cron as the user
 from __future__ import annotations
 
 import fcntl
+import importlib.metadata
+import importlib.util
 import json
 import os
 import subprocess
 import sys
 import time
+import urllib.parse
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -35,14 +38,103 @@ DEFAULT_FIXERS_LOG_FILENAME = "fixers.log"
 DEFAULT_ENV_FILENAME = "angelus.env"
 DEFAULT_SYSTEMD_UNIT = "angelus"
 
-# The engine repo, derived from this file's own location (deploy/sre_runner.py
-# lives one level under it). In a split deployment the runner's cwd is the
-# lodging root (state/ and the sentinel live there), but the SRE fixer agent
-# must land in the repo the daemon's CODE comes from -- spawning it against
-# the lodging root hands it a YAML-only repo with no code, no tests, and
-# nothing to merge. Same deployment-root/code-root distinction as belfry's
-# CODE_ROOT.
-CODE_ROOT = Path(__file__).resolve().parent.parent
+# Locating the engine repo the SRE fixer agent must work in.
+#
+# Pre-cutover this runner lived inside the engine repo (deploy/sre_runner.py),
+# so `Path(__file__).parent.parent` was the engine root. Post-cutover `make
+# deploy` copies this file to <lodging>/bin/, so that derivation now resolves
+# to the LODGING root -- a YAML-only repo with no angelus package, no tests,
+# and nothing to deploy. Spawning the fixer there is the exact deployment-root/
+# code-root conflation that has bitten repeatedly. cwd is no help either (cron
+# sets it to the lodging root).
+#
+# So we read the provenance pip itself recorded for the installed `angelus`
+# distribution. PEP 610 direct_url.json carries the `file://` URL the package
+# was installed from -- deploy.py does `pip install git+file://<repo>@<sha>`,
+# so that URL IS the engine repo. The source of truth is the install that is
+# actually running: it cannot drift from reality and needs no separate pinned
+# path to keep in sync.
+
+
+def _direct_url_repo() -> Path | None:
+    """Engine repo from the installed package's PEP 610 provenance.
+
+    deploy.py installs prod as `pip install git+file://<repo>@<sha>`, so
+    direct_url.json carries `url: file://<repo>` -- the authoritative source of
+    truth for a non-editable install. Absent for a legacy egg-info editable
+    install (the dev tree), which the __file__ fallback below covers instead.
+    """
+    try:
+        dist = importlib.metadata.distribution("angelus")
+        raw = dist.read_text("direct_url.json")
+    except (importlib.metadata.PackageNotFoundError, OSError):
+        return None
+    if not raw:
+        return None
+    try:
+        url = json.loads(raw).get("url", "")
+    except (json.JSONDecodeError, AttributeError):
+        return None
+    # A malformed direct_url must yield None (caller fails loud), never raise:
+    # a non-string url breaks urlsplit, and a bad authority (e.g. "file://[")
+    # raises ValueError. Either would otherwise escape and crash the tick,
+    # skipping the fail-loud page.
+    if not isinstance(url, str):
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(url)
+    except ValueError:
+        return None
+    if parsed.scheme != "file" or not parsed.path:
+        return None
+    return Path(urllib.parse.unquote(parsed.path))
+
+
+def _imported_package_repo() -> Path | None:
+    """Engine repo inferred from where the `angelus` package is imported from.
+
+    Covers an editable/dev checkout, where the package runs straight from the
+    repo (``<repo>/angelus/__init__.py``) and carries no direct_url. Uses
+    find_spec so the package is LOCATED, not executed. Correctly yields the
+    wrong answer for a non-editable install (site-packages/angelus -> walks up
+    to site-packages, which is_valid_engine_repo then rejects), so it can only
+    ever ADD a valid candidate, never override the authoritative provenance.
+    """
+    try:
+        spec = importlib.util.find_spec("angelus")
+    except (ImportError, ValueError):
+        return None
+    if spec is None or not spec.origin:
+        return None
+    return Path(spec.origin).resolve().parent.parent
+
+
+def resolve_engine_repo() -> Path | None:
+    """The angelus engine git repo the SRE fixer agent must work in, or None
+    (the caller then fails loud). Tries the installed package's pip provenance
+    first (authoritative for the deployed non-editable install), then the
+    imported package's own location (the editable dev tree). Returns the first
+    candidate that is a real engine checkout, so a stale or codeless path is
+    never handed to the agent.
+    """
+    for candidate in (_direct_url_repo(), _imported_package_repo()):
+        if candidate is not None and is_valid_engine_repo(candidate):
+            return candidate
+    return None
+
+
+def is_valid_engine_repo(path: Path) -> bool:
+    """A usable engine repo is a git checkout carrying the angelus package and
+    the Makefile -- the structural fingerprint of the engine tree, where the
+    fixer agent can branch, edit, and run tests. Guards against a provenance/
+    import path that points somewhere stale, codeless (the lodging root), or
+    half-removed."""
+    return (
+        path.is_dir()
+        and (path / ".git").exists()
+        and (path / "angelus" / "__init__.py").is_file()
+        and (path / "Makefile").is_file()
+    )
 
 DEFAULT_MIN_SPAWN_INTERVAL_SEC = 2700    # 45 min between retries on same incident
 DEFAULT_MAX_SPAWNS = 3                   # hard cap in rolling window
@@ -474,11 +566,14 @@ def spindle_wait(spool_id: str, timeout: int) -> str:
 # SRE agent prompt
 # ---------------------------------------------------------------------------
 
-def build_sre_prompt(sentinel_reason: str, state: Path, report_path: Path) -> str:
+def build_sre_prompt(
+    sentinel_reason: str, state: Path, report_path: Path, engine_repo: Path
+) -> str:
     """Construct the explicit, self-contained SRE agent prompt."""
     belfry_log = state / "belfry.log"
     fixers_log = state / "fixers.log"
     angelus_log = state / "angelus.log"
+    deploys_log = state / "deploys.log"
 
     return (
         f"angelus's belfry watchdog escalated because the daemon is crash-looping / "
@@ -488,21 +583,28 @@ def build_sre_prompt(sentinel_reason: str, state: Path, report_path: Path) -> st
         f"- Recent tail of belfry log: {belfry_log}\n"
         f"- Recent fixer actions: {fixers_log}\n"
         f"- Errors and warnings in daemon log: {angelus_log} (grep for ERROR and WARNING lines)\n"
+        f"- Recent deploys (sha + timestamps — a recent one may be the cause): {deploys_log}\n"
         f"- System design and guardrails: run `skein folio brief-20260531-q9uf`\n\n"
-        f"You are an SRE acting autonomously. Diagnose why the angelus daemon will not stay "
-        f"running. You are in an isolated git shard (worktree) — fix the root cause there: "
-        f"edit code, run the tests (pytest), and if they pass, commit and merge your shard "
-        f"to the main branch, then `systemctl --user restart angelus` and verify it comes "
-        f"back healthy (pid alive). You may run arbitrary commands; a classifier vets them.\n\n"
+        f"You are an SRE acting autonomously, in an isolated git shard (worktree) of the "
+        f"angelus ENGINE repo at {engine_repo}. Diagnose why the daemon will not stay running. "
+        f"If you identify the root cause, write the fix and run the tests (pytest) IN YOUR "
+        f"WORKTREE. You may run arbitrary commands; a classifier vets them.\n\n"
+        f"YOU DO NOT DEPLOY. The sandbox is read-only outside your worktree, and angelus runs "
+        f"from a non-editable install — a restart would not load your fix anyway. Your job is "
+        f"to hand a human a ready fix, not to ship it:\n"
+        f"- If you found and fixed the root cause: COMMIT it to your shard branch and confirm "
+        f"the tests pass. Name the branch and commit sha in the report's `commits:` field. Do "
+        f"NOT merge to master and do NOT run `make deploy` or `systemctl` — a human reviews "
+        f"your branch and deploys it.\n"
+        f"- If the fault is a bad config/env value rather than a code bug, or you cannot "
+        f"confidently fix it: do NOT guess — diagnose it as precisely as you can and escalate "
+        f"in the report. A precise diagnosis a human can act on beats a guessed fix.\n\n"
         f"Hard limits:\n"
         f"- Do NOT rewrite git history (no force-push, no rebase/reset of shared branches).\n"
-        f"- Do NOT auto-rollback config or auto-redeploy.\n"
-        f"- Do NOT edit state/angelus.env.\n"
-        f"- If the fault is a bad config/env value rather than a code bug, do NOT guess a "
-        f"value — report it for a human.\n"
-        f"- If you cannot confidently fix it, or the tests do not pass, or you are unsure: "
-        f"do NOT merge and do NOT leave the service worse — escalate and write up what you "
-        f"found. A wrong fix merged is worse than an honest escalation.\n\n"
+        f"- Do NOT merge to master, run `make deploy`, or restart the daemon — applying the "
+        f"fix is the human's decision after reading your report.\n"
+        f"- Do NOT edit, guess, or roll back lodging config or state/angelus.env.\n"
+        f"- Leave the service no worse than you found it.\n\n"
         f"Required final action — you MUST write your report to this exact absolute path "
         f"before finishing:\n"
         f"{report_path}\n\n"
@@ -628,6 +730,41 @@ def _run(state: Path) -> int:
         )
         return 0
 
+    # Precondition: locate the engine repo the fixer agent must work in.
+    # Resolved from the installed package's pip provenance (see
+    # resolve_engine_repo) -- neither cwd nor __file__ points at it post-cutover.
+    # A miss here means the fixer would land in a wrong or codeless tree, which
+    # is WORSE than not spawning: it would burn the escalation budget, thrash
+    # with nothing to fix, and could write a misleading report a later tick
+    # credits as resolved. Fail LOUD and leave the sentinel for a human.
+    engine_repo = resolve_engine_repo()
+    if engine_repo is None or not is_valid_engine_repo(engine_repo):
+        msg = (
+            f"sre-runner: cannot locate a valid angelus engine repo to fix in "
+            f"(resolved: {engine_repo}); refusing to spawn an SRE agent into a "
+            f"wrong/codeless tree. Daemon still down; needs-sre sentinel retained; "
+            f"human intervention needed."
+        )
+        log_err(msg)
+        notify_pat(msg)
+        append_fixers_log(
+            flog_path,
+            "sre-runner",
+            "blocked-no-engine-repo",
+            sentinel_reason,
+            "blocked-no-engine-repo",
+        )
+        # Rate-limit the page to the spawn interval WITHOUT consuming the
+        # escalation budget: a missing engine repo is a deploy/environment
+        # fault, not an escalation attempt, so it must not exhaust the
+        # max-spawns cap -- but it also must not re-page every cron tick. The
+        # MIN_SPAWN_INTERVAL guard reads this timestamp, so writing it here
+        # suppresses re-paging for one interval. If the write fails the page
+        # repeats next tick -- acceptable, since unwritable state/ is itself a
+        # page-worthy fault, so the loudness degrades safe.
+        write_last_spawn_ts(last_spawn_path, now_ts)
+        return 0
+
     # Step 4: record spawn BEFORE invoking spindle
     # (a spawn that hangs or fails still counts toward guards — same as B12)
     in_window.append(now_ts)
@@ -665,10 +802,13 @@ def _run(state: Path) -> int:
     else:
         child_env["SPINDLE_SHARD_WRITABLE_BINDS"] = reports_abs
 
-    prompt = build_sre_prompt(sentinel_reason, state, report_path)
-    log_out(f"sre-runner: spawning SRE agent; expected report path: {report_path}")
+    prompt = build_sre_prompt(sentinel_reason, state, report_path, engine_repo)
+    log_out(
+        f"sre-runner: spawning SRE agent in engine repo {engine_repo}; "
+        f"expected report path: {report_path}"
+    )
     spool_id = spindle_spin(
-        prompt, str(CODE_ROOT), tags="angelus-sre", env=child_env
+        prompt, str(engine_repo), tags="angelus-sre", env=child_env
     )
 
     if spool_id is None:
