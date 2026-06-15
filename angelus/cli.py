@@ -85,6 +85,30 @@ def _socket_path(root: Path) -> Path:
     return root / "state" / "angelus.sock"
 
 
+def _installed_version(root: Path) -> str:
+    """The sha recorded by the last `make deploy`, or 'unknown'.
+
+    Reads state/installed-version, the stamp deploy.py writes (see
+    deploy/deploy.py:write_stamp). This is the INSTALLED code -- what a
+    restart would load -- which on the live path normally equals the running
+    daemon's code; a process that predates the stamp is exactly belfry's
+    stale-deploy page. Read CLI-side (not from the daemon) so the line is
+    present on the daemon-down fallback too, where "what code is installed?"
+    matters most. Fail-soft to 'unknown' on any read error, mirroring
+    deploy.py:read_stamp -- a missing stamp must never turn `angelus health`
+    into a traceback.
+    """
+    try:
+        return (
+            (root / "state" / "installed-version")
+            .read_text(encoding="utf-8")
+            .strip()
+            or "unknown"
+        )
+    except OSError:
+        return "unknown"
+
+
 def _control_timeout() -> float:
     """Resolve the control-socket timeout in seconds.
 
@@ -281,7 +305,7 @@ def health(root: Path) -> None:
     if not response.get("ok"):
         click.echo(f"error: {response.get('error')}", err=True)
         raise SystemExit(1)
-    _render_health(response["result"])
+    _render_health(response["result"], root)
 
 
 @main.group()
@@ -904,10 +928,11 @@ def _format_timeline_event(event: dict[str, Any]) -> str:
     return line
 
 
-def _render_health(result: dict[str, Any]) -> None:
+def _render_health(result: dict[str, Any], root: Path) -> None:
     daemon_info = result["daemon"]
     click.echo("daemon: running")
     click.echo(f"pid: {daemon_info['pid']}")
+    click.echo(f"code: {_installed_version(root)}")
     click.echo("sources:")
     if not result["sources"]:
         click.echo("  none")
@@ -1107,6 +1132,7 @@ def _render_health_fallback(root: Path, daemon_status: str | None = None) -> Non
     click.echo(f"daemon: {status}")
     if pid is not None:
         click.echo(f"pid: {pid}")
+    click.echo(f"code: {_installed_version(root)}")
     connection = _ro_connect(root / "state" / "angelus.sqlite3")
     if connection is None:
         click.echo("sqlite: unavailable")

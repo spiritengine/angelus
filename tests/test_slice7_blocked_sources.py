@@ -78,8 +78,23 @@ def test_op_health_surfaces_sources_blocked_by_unhealthy_lodged_deps(
 
 def test_health_render_surfaces_blocked_source_line(tmp_path, capsys) -> None:
     health = _health_with_dep_statuses(tmp_path)
-    _render_health(health)
+    _render_health(health, tmp_path)
     rendered = capsys.readouterr().out
     assert "scheduled/chain-check" in rendered
     assert "blocked by: mill-wheel" in rendered
     assert "scheduled/healthy-check" in rendered
+
+
+def test_health_render_surfaces_installed_code_line(tmp_path, capsys) -> None:
+    """Live (daemon-up) path renders `code: <sha>` from the deploy stamp,
+    right after the pid line (Spin 2, brief-20260613-3spy)."""
+    (tmp_path / "state").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "state" / "installed-version").write_text(
+        "deadbeefcafe\n", encoding="utf-8"
+    )
+    health = _health_with_dep_statuses(tmp_path)
+    _render_health(health, tmp_path)
+    lines = capsys.readouterr().out.splitlines()
+    assert "code: deadbeefcafe" in lines
+    # Ordering contract: code line sits between pid and sources.
+    assert lines.index("code: deadbeefcafe") < lines.index("sources:")

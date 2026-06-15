@@ -221,6 +221,37 @@ def test_daemon_down_health_reads_sqlite(tmp_path) -> None:
     assert "skein: healthy" in result.output
     assert "patbot-email: unhealthy" in result.output
     assert "detail: exit 2: auth failed" in result.output
+    # Spin 2: the installed-code line is present on the daemon-DOWN path too
+    # -- "what code is installed?" matters most when the daemon won't start.
+    # No stamp here -> fail-soft 'unknown'.
+    assert "code: unknown" in result.output
+
+
+def test_health_code_line_reports_installed_version(tmp_path) -> None:
+    """`angelus health` surfaces the deploy stamp as a `code:` line (Spin 2,
+    brief-20260613-3spy). Read CLI-side from state/installed-version, so it
+    works on the daemon-down path the same as live."""
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "installed-version").write_text(
+        "8471cbab49f98d4124541ae2ac3622842a716e12\n", encoding="utf-8"
+    )
+    # Daemon down (no socket): the fallback path still reads the stamp.
+    result = CliRunner().invoke(main, ["health", "--root", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert "code: 8471cbab49f98d4124541ae2ac3622842a716e12" in result.output
+
+
+def test_health_code_line_fail_soft_on_blank_stamp(tmp_path) -> None:
+    """A present-but-empty stamp reads as 'unknown', never a blank `code:`
+    line -- mirrors deploy.py:read_stamp. Discriminates against a naive
+    read_text().strip() that would emit `code: `."""
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "installed-version").write_text("\n", encoding="utf-8")
+    result = CliRunner().invoke(main, ["health", "--root", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert "code: unknown" in result.output
 
 
 def test_daemon_down_incident_list_reads_sqlite(tmp_path) -> None:
