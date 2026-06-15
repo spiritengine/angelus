@@ -1,0 +1,40 @@
+# Auto-reprocess fixer (brief-20260612-q7de). When a triager exhausts its
+# retry ladder on a collapsed transition observation, the product finding for
+# that transition is lost until the next state change (brief-20260612-29he).
+# Exhaustion is loud -- it opens an internal/triage incident -- but the product
+# alert is gone. This fixer reaches for the documented heal:
+# catalog.reprocess_source returns the exhausted observation to 'ready' so the
+# triage loop re-picks it (brief-20260607-6qsq Stage 1), scoped to the failing
+# triager's source.
+#
+# Shipped DISABLED (the `.disabled` suffix keeps _enabled_yaml_files from
+# loading it) so it documents the shape without firing in a deployment that has
+# not opted in. Drop the suffix (or copy this file) to activate it.
+condition:
+  # Fires while an internal/triage incident is open. The incident's entity is
+  # the failing triager's NAME; the daemon resolves it to that triager's source
+  # and passes it to the handler as condition.source_ref, so the reprocess is
+  # scoped to exactly that source. (incident_type narrows the match to the
+  # exhaustion finding specifically.)
+  kind: open_internal_incident
+  source: internal/triage
+  incident_type: triage_failed
+
+handler:
+  kind: python
+  path: fixers/handlers/reprocess.py
+  timeout_seconds: 30
+
+guardrails:
+  # The cap is what makes a broken triager CONVERGE rather than storm. The
+  # open-incident identity (source/type/entity) is stable across close/reopen,
+  # so attempts accumulate against one condition_key even as the incident
+  # clears and re-opens: a deterministically-broken triager re-exhausts after
+  # each reprocess, re-opens the SAME incident, and burns one attempt per
+  # backoff until the budget is spent -- after which the fixer goes quiet and
+  # the incident stays open (belfry red, the alert the operator actually
+  # needs). A transient failure heals on the first reprocess and never reaches
+  # the cap. At most 3 reprocesses per 24h window, spaced 10 minutes apart.
+  max_attempts: 3
+  window_seconds: 86400
+  backoff_seconds: 600

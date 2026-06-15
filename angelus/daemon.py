@@ -2192,9 +2192,23 @@ class AngelusDaemon:
                     f"open_internal_incident:{incident.get('source')}:"
                     f"{incident.get('type')}:{incident.get('entity')}"
                 )
-                matches.append(
-                    (key, {"kind": condition.kind, "incident": incident})
-                )
+                context = {"kind": condition.kind, "incident": incident}
+                # An internal/triage incident carries the FAILING TRIAGER's
+                # name as its entity (write_internal_finding(..., entity=
+                # triager.name)). The auto-reprocess fixer needs the triager's
+                # SOURCE to scope catalog.reprocess_source, so resolve name ->
+                # source_ref from the lodged triager here -- the daemon is the
+                # only holder of that mapping. Gated on source == internal/triage
+                # (matching the write site and the shipped binding's source) so a
+                # different open_internal_incident source whose entity happens to
+                # coincide with a lodged triager name does NOT get source_ref and
+                # cannot reprocess an unrelated source. Left absent otherwise --
+                # exactly the fixers that do not reprocess.
+                if incident.get("source") == "internal/triage":
+                    triager = self.lodging.triagers.get(incident.get("entity"))
+                    if triager is not None:
+                        context["source_ref"] = triager.source_ref
+                matches.append((key, context))
         elif condition.kind == "channel_unhealthy":
             for row in self.catalog.all_channel_health():
                 if row.get("status") != "unhealthy":

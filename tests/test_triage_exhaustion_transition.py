@@ -27,16 +27,16 @@ exhaustion quiet):
   down-alert was lost.
 
 Interplay with brief-20260607-6qsq Stage 1 (terminal 'consumed' observation
-status, commit e42c0fc, in flight on another shard when this was written):
-with a SINGLE lodged triager, an exhausted observation is whole-row terminal
-('triage_failed') under both the pre-6qsq first-exhaust flip and the
-post-6qsq all-triagers-terminal rule, so everything in the main regression
-test holds under both semantics. The one behavior 6qsq changes -- whether
-catalog.reprocess_source heals an exhausted observation back to 'ready' --
-is pinned in the disposition test at the bottom, which forks explicitly on
-the observation's post-reprocess status and asserts each world's
-consequences. When 6qsq merges, the pre-6qsq branch becomes dead code and
-the test can be simplified to the post-6qsq branch only.
+status, commit e42c0fc, now MERGED): with a SINGLE lodged triager, an
+exhausted observation is whole-row terminal ('triage_failed') under both the
+pre-6qsq first-exhaust flip and the post-6qsq all-triagers-terminal rule, so
+everything in the main regression test holds under both semantics. The one
+behavior 6qsq changed -- whether catalog.reprocess_source heals an exhausted
+observation back to 'ready' -- is pinned in the disposition test at the
+bottom; it forked on the observation's post-reprocess status until 6qsq
+merged, and the dead pre-6qsq branch has since been removed (the heal now
+completes). The auto-reprocess fixer that drives that seam from the daemon is
+brief-20260612-q7de (tests/test_reprocess_fixer.py).
 
 Scenario mechanics: a SimHarness (B26) drives the production step methods
 under a FakeClock. The source's check `cat`s a JSON fixture the test rewrites
@@ -327,26 +327,20 @@ def test_reprocess_is_the_heal_seam_disposition(tmp_path: Path) -> None:
     """Brief item 2 (disposition): the natural heal for an exhausted
     transition is catalog.reprocess_source -- delete the observation_triage
     rows so the loop re-picks the observation. This test pins what reprocess
-    actually does to an exhausted observation, forking on the one behavior
-    brief-20260607-6qsq Stage 1 changes:
+    does to an exhausted observation now that brief-20260607-6qsq Stage 1
+    (commit e42c0fc) is merged.
 
-    - pre-6qsq (this shard's base): exhaustion flipped the observation row to
-      'triage_failed', ready_observations_for only surfaces status='ready',
-      and reprocess_source does NOT reset the row -- so the heal seam is
-      BROKEN for exactly the observation that needs it. Reprocess deletes
-      the triage rows, the loop re-picks nothing, the alert stays lost.
-    - post-6qsq (commit e42c0fc): reprocess_source returns consumed /
-      triage_failed observations to 'ready', the loop re-picks the doomed
-      observation, and a now-healthy triager finally emits the product
-      finding.
+    6qsq made reprocess_source return consumed / triage_failed observations to
+    'ready', so the heal seam now works for exactly the observation that needs
+    it: reprocess flips the doomed observation back to 'ready', the loop
+    re-picks it, and a now-healthy triager finally emits the lost product
+    finding. (Pre-6qsq this fork also exercised the broken world, where the
+    'triage_failed' row stayed invisible to ready_observations_for and the
+    alert stayed lost forever; that branch went dead when 6qsq merged and has
+    been removed.)
 
-    The fork is on the observation's post-reprocess STATUS (the structural
-    semantic 6qsq changes), and each branch asserts its world's downstream
-    consequence, so the test is honest under both and the pre-6qsq branch
-    goes dead -- not silently green -- when 6qsq merges. Disposition
-    recommendation lives in the shard tender: any exhaustion-recovery wiring
-    (operator runbook or a fixers/ auto-reprocess) only works post-6qsq, so
-    it must land after that shard merges."""
+    This is the seam the auto-reprocess fixer (brief-20260612-q7de) drives in
+    the daemon -- see tests/test_reprocess_fixer.py for the registry wiring."""
     fixture, wedge = _write_lodging(tmp_path)
 
     async def scenario(sim: SimHarness) -> None:
@@ -359,49 +353,28 @@ def test_reprocess_is_the_heal_seam_disposition(tmp_path: Path) -> None:
         assert _open_internal_triage(sim), "precondition: exhaustion was loud"
 
         # The transient failure passes (the brief's flaky-subprocess /
-        # resource-exhaustion framing), and an operator -- prompted by the
-        # internal/triage alert -- reaches for the existing heal seam.
+        # resource-exhaustion framing), and the heal seam is reached -- by an
+        # operator running `angelus reprocess` or by the auto-reprocess fixer.
         wedge.unlink()
         reprocessed = sim.daemon.catalog.reprocess_source(SOURCE)
         assert reprocessed >= 1, "reprocess must report the re-budgeted observations"
 
-        status = _observation_status(sim, doomed_id)
-        if status == "ready":
-            # post-6qsq: the heal completes -- the re-picked observation
-            # triages cleanly and the lost product finding finally exists.
-            await sim.run_triage()
-            healed = [
-                f
-                for f in _product_findings(sim)
-                if f["observation_id"] == doomed_id and f["type"] == "down"
-            ]
-            assert healed, (
-                "post-6qsq reprocess must let the exhausted transition "
-                "produce its product finding"
-            )
-        else:
-            # pre-6qsq: the seam is broken for exactly the observation that
-            # needs it. Reprocess deleted its triage rows, but the
-            # 'triage_failed' row status keeps it invisible to
-            # ready_observations_for forever -- while the already-triaged up
-            # observation (still status 'ready') IS re-surfaced and gets
-            # pointlessly re-run.
-            assert status == "triage_failed"
-            ready_ids = {
-                row["id"]
-                for row in sim.daemon.catalog.ready_observations_for(
-                    TRIAGER, SOURCE
-                )
-            }
-            assert doomed_id not in ready_ids, (
-                "pre-6qsq: reprocess does not surface the exhausted observation"
-            )
-            await sim.run_triage()
-            assert not [
-                f
-                for f in _product_findings(sim)
-                if f["observation_id"] == doomed_id
-            ], "pre-6qsq: the alert stays lost even after reprocess"
+        # post-6qsq: reprocess returns the exhausted observation to 'ready', so
+        # the loop re-picks it and the now-healthy triager produces the
+        # previously-lost product finding.
+        assert _observation_status(sim, doomed_id) == "ready", (
+            "6qsq: reprocess must surface the exhausted observation as 'ready'"
+        )
+        await sim.run_triage()
+        healed = [
+            f
+            for f in _product_findings(sim)
+            if f["observation_id"] == doomed_id and f["type"] == "down"
+        ]
+        assert healed, (
+            "post-6qsq reprocess must let the exhausted transition produce "
+            "its product finding"
+        )
 
     with SimHarness(tmp_path, START) as sim:
         asyncio.run(scenario(sim))
