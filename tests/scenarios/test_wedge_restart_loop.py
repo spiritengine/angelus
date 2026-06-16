@@ -75,9 +75,9 @@ def _mock_belfry_io(belfry, monkeypatch):
     monkeypatch.setenv("ANGELUS_BELFRY_DOWN_URL", "https://hc.example/down")
     # Drift axis off the table: systemd reports the live pid, so no drift.
     monkeypatch.setattr(belfry, "systemd_main_pid", lambda: os.getpid())
-    # Stale-deploy axis off the table: a 1970 process start (the "old daemon"
-    # below) would otherwise read every recent commit as newer-than-running.
-    monkeypatch.setattr(belfry, "last_code_commit_epoch", lambda _root: None)
+    # Code-drift axis is already inert here: this scenario's reference lodging
+    # writes no running-version/installed-version files, so code_drift_failure
+    # returns None (it compares two plain state files, no git, no process age).
     return systemctl, notify, pings
 
 
@@ -160,7 +160,7 @@ def test_wedge_restart_loop(tmp_path, monkeypatch, reference_lodging, belfry, be
 
         systemctl, notify, _pings = _mock_belfry_io(belfry, monkeypatch)
         # Re-apply the old process age (the helper above did not touch it, but
-        # it re-stubbed systemd_main_pid/last_code_commit_epoch).
+        # it re-stubbed systemd_main_pid).
         monkeypatch.setattr(belfry, "process_start_epoch", lambda _pid: 1_000.0)
 
         # Ticks 1..3 each attempt exactly one restart (the daemon stays wedged

@@ -45,11 +45,24 @@ checkout is the one with sharp edges. The full migration plan is SKEIN brief
    `angelus` package's PEP 610 provenance (`direct_url.json`), falling back to
    the imported package's own location for an editable dev tree, and validates
    the result is a real engine checkout before spawning the SRE fixer agent
-   there (fail-loud-and-page if it cannot). belfry's `stale_deployment` git
-   check still uses `CODE_ROOT` and is consequently inert post-cutover; its
-   rework is folded into the deploy-identity follow-up (piece 2 of
-   brief-20260613-3spy). Do NOT reintroduce a `__file__`/`CODE_ROOT`
-   derivation for locating the engine repo.
+   there (fail-loud-and-page if it cannot). belfry's old `stale_deployment`
+   commit-time-vs-process-start check (and `CODE_ROOT`) is GONE — it was
+   doubly broken post-cutover (CODE_ROOT resolved to the codeless lodging
+   root, and commit-time-vs-start false-pages every merge since master runs
+   ahead of the pin by design). It is replaced by `code_drift_failure()`
+   (piece 2 of brief-20260613-3spy): the daemon snapshots its own installed
+   sha to `state/running-version` once at boot (PEP 610
+   `direct_url.json` `vcs_info.commit_id`, or the literal `editable` for a dev
+   tree), and belfry compares that PLAIN FILE against `state/installed-version`
+   (the pin `make deploy` records). belfry does this with stdlib only — it
+   reads two state files and does NOT import angelus and does NOT derive the
+   engine repo (preserving its import-independence at `<lodging>/bin`). Drift
+   is alert-only (never auto-restart — that is the 0015 loop) and the page is
+   suppressed while a deploy hold is active (the deploy window is exactly when
+   a transient mismatch is expected). The "installed N commits behind master"
+   read lives in the daemon's daily digest only (never pages). Do NOT
+   reintroduce a `__file__`/`CODE_ROOT` derivation for locating the engine
+   repo, and do NOT make belfry import angelus or call git to determine drift.
 
 ## Pending: the lineage swap
 

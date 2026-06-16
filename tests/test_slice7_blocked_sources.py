@@ -86,10 +86,14 @@ def test_health_render_surfaces_blocked_source_line(tmp_path, capsys) -> None:
 
 
 def test_health_render_surfaces_installed_code_line(tmp_path, capsys) -> None:
-    """Live (daemon-up) path renders `code: <sha>` from the deploy stamp,
-    right after the pid line (Spin 2, brief-20260613-3spy)."""
+    """Live (daemon-up) path renders `code: <sha>` right after the pid line
+    (brief-20260613-3spy). With running-version == installed-version (a
+    deployed-and-restarted daemon) the line collapses to the single sha."""
     (tmp_path / "state").mkdir(parents=True, exist_ok=True)
     (tmp_path / "state" / "installed-version").write_text(
+        "deadbeefcafe\n", encoding="utf-8"
+    )
+    (tmp_path / "state" / "running-version").write_text(
         "deadbeefcafe\n", encoding="utf-8"
     )
     health = _health_with_dep_statuses(tmp_path)

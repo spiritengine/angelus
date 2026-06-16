@@ -1038,6 +1038,21 @@ def cmd_deploy(cfg: Config, ref: str, restore_backup: bool) -> int:
         # Deploy the belt layer from the tmp checkout (ref-consistent).
         copy_belt(cfg, checkout)
 
+        # Stamp the installed sha NOW -- the target code + belt are on disk and
+        # migration-verified, so the pin truthfully reflects "what's installed /
+        # what a restart will load". This MUST precede the restart/verify branch:
+        # if pip_install succeeded (site-packages = sha) but the restart or
+        # verify below fails, we still want installed-version == sha so belfry's
+        # code_drift_failure can see running(old) != installed(sha) and backstop
+        # the drift once the deploy hold goes stale. Were the stamp written only
+        # after a clean verify, a failed restart would leave the stamp at the OLD
+        # sha, matching the still-running old daemon, and belfry would be blind to
+        # a genuinely drifted box (new code on disk, old code running). belfry
+        # reads only this plain file (it must not import angelus or read
+        # provenance), so the stamp is its sole source of "what should be
+        # running": it must mean "installed on disk", not "last verified deploy".
+        write_stamp(cfg, sha)
+
         # Bring the unit onto the new code. The restore path stops, restores,
         # then starts so the older code never opens the newer-schema db.
         if restore_source is not None:
@@ -1060,8 +1075,10 @@ def cmd_deploy(cfg: Config, ref: str, restore_backup: bool) -> int:
 
         verify(cfg)
 
-        # Record + stamp + release the hold (only now, on full success).
-        write_stamp(cfg, sha)
+        # Record the completed deploy + release the hold (only now, on full
+        # success). The stamp was already written above when the code landed;
+        # deploys.log stays the audit trail of COMPLETED deploys and the hold
+        # releases only on a fully-verified deploy.
         append_deploys_log(
             cfg,
             from_version,

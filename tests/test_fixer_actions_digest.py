@@ -244,6 +244,13 @@ def test_structured_inputs_contains_fixer_actions(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     monkeypatch.setenv("ANGELUS_BELFRY_FIXERS_LOG_PATH", str(log))
+    # Hermetic: pin deploy_staleness to None so the digest's structured inputs
+    # don't shell real git against the parent repo (wall-clock-dependent once the
+    # un-deployed commits age past 7d). pipe_runner is captured at import, so this
+    # lands on the SAME module object PipeDrain._deploy_staleness resolves the name
+    # in, even after another test pops angelus.* (see _RUNNER_MOD note in
+    # test_deploy_staleness_digest.py).
+    monkeypatch.setattr(pipe_runner, "deploy_staleness", lambda *a, **k: None)
 
     connection = init_db(tmp_path / "angelus.sqlite3")
     catalog = Catalog(connection, tmp_path)

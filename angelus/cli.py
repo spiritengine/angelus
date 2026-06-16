@@ -91,8 +91,9 @@ def _installed_version(root: Path) -> str:
     Reads state/installed-version, the stamp deploy.py writes (see
     deploy/deploy.py:write_stamp). This is the INSTALLED code -- what a
     restart would load -- which on the live path normally equals the running
-    daemon's code; a process that predates the stamp is exactly belfry's
-    stale-deploy page. Read CLI-side (not from the daemon) so the line is
+    daemon's code; a daemon whose running-version differs from this stamp is
+    exactly belfry's code_drift page (see belfry.code_drift_failure). Read
+    CLI-side (not from the daemon) so the line is
     present on the daemon-down fallback too, where "what code is installed?"
     matters most. Fail-soft to 'unknown' on any read error, mirroring
     deploy.py:read_stamp -- a missing stamp must never turn `angelus health`
@@ -107,6 +108,58 @@ def _installed_version(root: Path) -> str:
         )
     except OSError:
         return "unknown"
+
+
+def _running_version(root: Path) -> str | None:
+    """The sha the live daemon snapshotted at boot, or None.
+
+    Reads state/running-version, written once by daemon.run from the install's
+    PEP 610 provenance (the literal 'editable' for a dev tree with no pin).
+    Unlike _installed_version this is the RUNNING code -- what the live process
+    actually loaded -- which can lag the installed pin after a `make deploy`
+    that has not been restarted into. Returns None (not 'unknown') when the
+    file is absent or empty so the caller can distinguish "daemon predates this
+    feature / never wrote it" from a present value; fail-soft on any read error,
+    mirroring _installed_version -- a missing stamp must never turn `angelus
+    health` into a traceback.
+    """
+    try:
+        value = (
+            (root / "state" / "running-version")
+            .read_text(encoding="utf-8")
+            .strip()
+        )
+    except OSError:
+        return None
+    return value or None
+
+
+def _code_line(root: Path) -> str:
+    """The `code:` health line, reconciling running vs installed version.
+
+    The PRIMARY value is the RUNNING sha (what the live process loaded); the
+    installed pin is surfaced only on divergence, where it means "a deploy
+    landed but the daemon has not restarted into it." Renderings:
+
+      * running == installed        -> ``code: <sha>``
+      * running != installed        -> ``code: <running> running, PINNED
+                                        <installed> — restart pending``
+      * running == 'editable'       -> ``code: editable``
+      * running absent, installed present (daemon predates this feature, before
+        its first redeploy) -> ``code: <installed> (pinned; running unknown)``
+      * both absent                 -> ``code: unknown``
+    """
+    running = _running_version(root)
+    installed = _installed_version(root)  # 'unknown' when absent
+    if running == "editable":
+        return "code: editable"
+    if running is None:
+        if installed != "unknown":
+            return f"code: {installed} (pinned; running unknown)"
+        return "code: unknown"
+    if installed == "unknown" or running == installed:
+        return f"code: {running}"
+    return f"code: {running} running, PINNED {installed} — restart pending"
 
 
 def _control_timeout() -> float:
@@ -932,7 +985,7 @@ def _render_health(result: dict[str, Any], root: Path) -> None:
     daemon_info = result["daemon"]
     click.echo("daemon: running")
     click.echo(f"pid: {daemon_info['pid']}")
-    click.echo(f"code: {_installed_version(root)}")
+    click.echo(_code_line(root))
     click.echo("sources:")
     if not result["sources"]:
         click.echo("  none")
@@ -1132,7 +1185,7 @@ def _render_health_fallback(root: Path, daemon_status: str | None = None) -> Non
     click.echo(f"daemon: {status}")
     if pid is not None:
         click.echo(f"pid: {pid}")
-    click.echo(f"code: {_installed_version(root)}")
+    click.echo(_code_line(root))
     connection = _ro_connect(root / "state" / "angelus.sqlite3")
     if connection is None:
         click.echo("sqlite: unavailable")

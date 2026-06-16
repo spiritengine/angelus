@@ -407,8 +407,9 @@ def test_happy_path_order_log_and_hold_released(
     order: list[str] = []
     dep = fake_prod.deploy
     for step in ("hold_belfry", "preflight", "backup_live_db", "pip_install",
-                 "verify_installed_migrations", "copy_belt", "restart_unit",
-                 "verify", "append_deploys_log", "release_hold"):
+                 "verify_installed_migrations", "copy_belt", "write_stamp",
+                 "restart_unit", "verify", "append_deploys_log",
+                 "release_hold"):
         original = getattr(dep, step)
 
         def make_wrapper(name, func):
@@ -423,12 +424,17 @@ def test_happy_path_order_log_and_hold_released(
     assert rc == 0
 
     # Order: hold first, preflight before any mutation, backup before pip,
-    # belt before restart, verify before log, hold released last.
+    # belt before stamp, stamp BEFORE restart (so a failed restart still leaves
+    # installed-version == target for belfry's drift backstop), verify before
+    # log, hold released last.
     assert order == [
         "hold_belfry", "preflight", "backup_live_db", "pip_install",
-        "verify_installed_migrations", "copy_belt", "restart_unit", "verify",
-        "append_deploys_log", "release_hold",
+        "verify_installed_migrations", "copy_belt", "write_stamp",
+        "restart_unit", "verify", "append_deploys_log", "release_hold",
     ]
+    # Explicit stamp-before-restart pin: the stamp must be on disk before the
+    # unit is brought onto the new code.
+    assert order.index("write_stamp") < order.index("restart_unit")
 
     # deploys.log line records the deploy.
     assert fake_prod.deploys_log.exists()
@@ -485,14 +491,66 @@ def test_verify_fails_on_crash_looping_daemon(
     # reads "active" + health exits 0 on the first poll), so this assertion is
     # the red that proves the new sustained-liveness gate is doing the work.
 
-    # The deploy did NOT declare success: hold left to self-expire, no stamp,
-    # no deploys.log line, operator notified loudly.
+    # The deploy did NOT declare success: hold left to self-expire, no
+    # deploys.log line, operator notified loudly.
     assert fake_prod.hold.exists()
-    assert not fake_prod.stamp.exists()
     assert not fake_prod.deploys_log.exists()
     assert fake_prod.notified()
+    # The stamp IS written even though verify failed: the target code is on disk
+    # (pip_install succeeded) so installed-version == target sha. This is the
+    # drift-backstop invariant -- with the new code installed but the daemon not
+    # healthy on it, belfry must be able to read installed != running and page
+    # once the deploy hold goes stale. Were the stamp suppressed on failure it
+    # would lie (stay at the old sha) and mask a genuinely drifted box.
+    assert fake_prod.stamp.read_text().strip() == sha
     # verify did reach the supervisor-state poll (not is-active).
     assert "show" in " | ".join(fake_prod.systemctl_calls())
+
+
+def test_failed_restart_stamps_target_not_old_sha(
+    fake_prod, dev_repo_0014, monkeypatch
+):
+    """Regression pin for the stamp-masking bug: a deploy whose code lands but
+    whose restart/verify FAILS must leave installed-version at the TARGET sha,
+    not the old one.
+
+    The hazard: pip_install succeeds (site-packages now holds sha B,
+    direct_url=B), then the restart/verify fails and cmd_deploy aborts. If the
+    stamp were written only after a clean verify, installed-version would stay at
+    the OLD sha A -- matching the still-running old daemon (running-version=A), so
+    belfry's code_drift_failure sees no drift and never pages. The box is
+    genuinely drifted (disk B, daemon A) but the backstop is blind. Writing the
+    stamp as soon as the code is on disk fixes that: installed-version == B while
+    running == A, so drift is visible.
+
+    This test pre-seeds an OLD sha A into the stamp, runs a deploy that crash-
+    loops on verify, and asserts the stamp is rewritten to the target B despite
+    the failure. Mutation-verify: move write_stamp back below verify and this
+    goes red -- the stamp stays at A."""
+    repo, sha = dev_repo_0014
+    _set_repo(monkeypatch, repo)
+    _build_db(fake_prod.live_db, M0014, with_findings=True)
+
+    # Pre-seed the stamp with an old sha (the deploy that is currently live).
+    old_sha = "a" * 40
+    fake_prod.state.mkdir(parents=True, exist_ok=True)
+    fake_prod.stamp.write_text(f"{old_sha}\n", encoding="utf-8")
+
+    # New code installs fine but the daemon keeps crashing -> verify fails.
+    fake_prod.set_nrestarts(3)
+    fake_prod.crash_loop()
+    monkeypatch.setenv("ANGELUS_DEPLOY_VERIFY_TIMEOUT_SEC", "1")
+
+    rc = fake_prod.deploy.cmd_deploy(fake_prod.config(), sha, restore_backup=False)
+    assert rc == 1  # the deploy failed
+
+    # The stamp now reflects the INSTALLED (target) sha, not the old one: the
+    # code is on disk, so belfry must see installed(B) != running(A).
+    assert fake_prod.stamp.read_text().strip() == sha
+    assert fake_prod.stamp.read_text().strip() != old_sha
+    # Failure semantics intact: hold left to self-expire, no completed-deploy row.
+    assert fake_prod.hold.exists()
+    assert not fake_prod.deploys_log.exists()
 
 
 def test_verify_passes_recovery_from_crash_loop(
@@ -675,6 +733,8 @@ def test_schema_ahead_restores_with_flag(fake_prod, dev_repo_0014, monkeypatch):
     log_line = fake_prod.deploys_log.read_text()
     assert f"restored={prior}" in log_line
     assert not fake_prod.hold.exists()
+    # The rollback path stamps the TARGET ref sha (what is now installed/running).
+    assert fake_prod.stamp.read_text().strip() == sha
     # Sanity: the prior backup file itself was not mutated by the restore.
     assert _digest(prior) == prior_digest
 
@@ -899,7 +959,7 @@ def _run_belfry_main(belfry, root: Path, monkeypatch, pid_alive: bool):
     )
     # Silence the live-daemon checks that would otherwise read sqlite.
     for name in ("wedge_failure", "failure_surface", "drift_failure",
-                 "stale_deployment", "sla_failure", "source_overdue_failure"):
+                 "code_drift_failure", "sla_failure", "source_overdue_failure"):
         monkeypatch.setattr(belfry, name, lambda *a, **k: None)
     monkeypatch.setattr(belfry, "touch_sentinel", lambda path: None)
 

@@ -230,7 +230,9 @@ def test_daemon_down_health_reads_sqlite(tmp_path) -> None:
 def test_health_code_line_reports_installed_version(tmp_path) -> None:
     """`angelus health` surfaces the deploy stamp as a `code:` line (Spin 2,
     brief-20260613-3spy). Read CLI-side from state/installed-version, so it
-    works on the daemon-down path the same as live."""
+    works on the daemon-down path the same as live. With no running-version
+    (a daemon that predates the running-snapshot feature, before its first
+    redeploy) the pin is surfaced gracefully, not as a scary false 'unknown'."""
     state = tmp_path / "state"
     state.mkdir()
     (state / "installed-version").write_text(
@@ -239,7 +241,10 @@ def test_health_code_line_reports_installed_version(tmp_path) -> None:
     # Daemon down (no socket): the fallback path still reads the stamp.
     result = CliRunner().invoke(main, ["health", "--root", str(tmp_path)])
     assert result.exit_code == 0, result.output
-    assert "code: 8471cbab49f98d4124541ae2ac3622842a716e12" in result.output
+    assert (
+        "code: 8471cbab49f98d4124541ae2ac3622842a716e12 "
+        "(pinned; running unknown)" in result.output
+    )
 
 
 def test_health_code_line_fail_soft_on_blank_stamp(tmp_path) -> None:

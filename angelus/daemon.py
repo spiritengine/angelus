@@ -37,6 +37,7 @@ from angelus.lodging import (
 from angelus.lodging.reloader import LodgingReloader
 from angelus.pipes import DrainSummary, PipeDrain
 from angelus.pipes.runner import _is_internal
+from angelus.provenance import installed_commit_id
 from angelus.sources import run_shell_source
 from angelus.sources.runner import _REAP_TIMEOUT
 from angelus.storage import Catalog, init_db
@@ -306,6 +307,9 @@ class AngelusDaemon:
         # parent dir is the other half of that exposure (issue-20260519-cd8z).
         state_dir.chmod(0o700)
         self.pid_file = state_dir / "angelus.pid"
+        # Boot snapshot of the sha THIS process loaded (see run()): written once
+        # at startup, read live by belfry/health to detect code drift.
+        self.running_version_file = state_dir / "running-version"
         self.socket_path = state_dir / "angelus.sock"
         self.connection = init_db(state_dir / "angelus.sqlite3")
         # Single clock for the process (B24). Threaded into the catalog and
@@ -433,6 +437,21 @@ class AngelusDaemon:
         control_started = False
         try:
             self.pid_file.write_text(str(os.getpid()), encoding="utf-8")
+            # Snapshot the sha THIS process actually loaded, once, right here at
+            # boot. The value is the installed pin's commit_id from PEP 610
+            # provenance (installed_commit_id); when that is unavailable -- an
+            # editable/dev tree with no pin -- we record the literal marker
+            # `editable`. belfry and `angelus health` read this plain file to
+            # compare the RUNNING sha against the on-disk pin: the on-disk
+            # direct_url can change under this long-lived process when a later
+            # `make deploy` pip-installs a new ref, so a snapshot taken at boot
+            # is what makes a subsequent mismatch meaningful (it means a new
+            # release was installed but this process never restarted to load it).
+            # Never re-read live, written atomically, and fail-soft -- a boot
+            # must not abort because provenance could not be stamped.
+            _write_running_version(
+                self.running_version_file, installed_commit_id() or "editable"
+            )
             await self.control.start()
             control_started = True
             LOGGER.info("control socket listening at %s", self.socket_path)
@@ -2336,6 +2355,27 @@ def _parse_iso(value: str) -> datetime | None:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _write_running_version(path: Path, value: str) -> None:
+    """Atomically stamp the boot-time running-version sentinel.
+
+    Write to a sibling ``.tmp`` then ``os.replace`` so a concurrent reader
+    (belfry, ``angelus health``) never sees a half-written file -- the same
+    copy-then-rename atomicity deploy.py uses for the lodging config files.
+    Fail-soft: a stamp failure is logged and swallowed, never aborting daemon
+    boot. The cost of a missing stamp is graceful (health prints "running
+    unknown", belfry's drift check skips); crashing the daemon over it is not.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(f"{value}\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        LOGGER.warning(
+            "failed to write running-version sentinel %s", path, exc_info=True
+        )
 
 
 def _fixers_log_path(root: Path) -> Path:

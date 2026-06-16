@@ -21,6 +21,7 @@ from angelus.channels import send_email, send_push
 from angelus.clock import Clock
 from angelus.faults import FaultRegistry
 from angelus.lodging import Channel, Pipe
+from angelus.provenance import deploy_staleness
 from angelus.sources.runner import _kill_and_reap
 from angelus.storage import Catalog
 
@@ -1135,6 +1136,17 @@ class PipeDrain:
         if suppressed:
             lines.append("")
             lines.append(f"Rate-limit overflow ({len(suppressed)}).")
+        # Behind-master deploy staleness: a low-severity FYI, rendered
+        # deterministically on the push leg (the reliable receipt) when present.
+        # Never an alarm -- master running ahead of the pin is the normal
+        # post-cutover state; this just surfaces when the lag grows notable.
+        staleness = structured.get("deploy_staleness")
+        if staleness:
+            lines.append("")
+            lines.append(
+                f"Deploy: installed {staleness['commits_behind']} commit(s) "
+                f"behind master, oldest {staleness['oldest_days']} day(s)."
+            )
         return "\n".join(lines)
 
     async def _send_channel(self, channel: Channel, message: str, subject: str) -> None:
@@ -1182,7 +1194,34 @@ class PipeDrain:
         for collection in raw.values():
             for item in collection:
                 _attach_local_timestamps(item)
+        # Behind-master deploy staleness: a digest-only, never-pages FYI added
+        # AFTER the list-processing loops above (it is a scalar dict|None, not a
+        # finding collection, so it must not flow through _cap_digest_input /
+        # _attach_local_timestamps). None in the common case (pin current, or
+        # the engine repo can't be located -- a dev tree); a dict only once the
+        # pin trails master past the staleness threshold. Computed here so it
+        # rides the same render path as every other digest input.
+        raw["deploy_staleness"] = self._deploy_staleness()
         return raw
+
+    def _deploy_staleness(self) -> dict | None:
+        """Behind-master staleness for the digest (provenance.deploy_staleness).
+
+        Fail-soft and digest-only: returns the {commits_behind, oldest_days}
+        dict when the installed pin trails master past the threshold, else
+        None. Never writes a finding, opens an incident, or pages -- so it can
+        never flip belfry red. `now` comes from the injected clock so a test
+        controls the age arithmetic.
+
+        Defence-in-depth catch-all: deploy_staleness is itself fail-soft, but
+        the digest must NEVER fail to render because a staleness probe raised
+        (no repo, a malformed provenance path, git missing, an unexpected OS
+        error). Any escape is swallowed to None so the FYI line is simply
+        omitted rather than crashing the daily digest."""
+        try:
+            return deploy_staleness(self._clock.now().timestamp())
+        except Exception:  # pragma: no cover - belt-and-suspenders, digest-only
+            return None
 
     def _render_preamble(self, pipe: Pipe, structured: dict[str, Any]) -> str:
         environment = Environment(

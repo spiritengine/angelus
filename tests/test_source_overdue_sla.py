@@ -696,10 +696,11 @@ def test_source_overdue_pings_down_alert_only(tmp_path, monkeypatch) -> None:
         lambda args, check=False, **_: calls.append(args)
         or _completed(args),
     )
-    # Take drift/stale-deploy off the table so source_overdue is the only OTHER
-    # reason moving the result.
+    # Take drift off the table so source_overdue is the only OTHER reason
+    # moving the result. The code-drift axis is already inert here (no
+    # running-version/installed-version files in this tmp state dir ->
+    # code_drift_failure returns None).
     monkeypatch.setattr(belfry, "systemd_main_pid", lambda: None)
-    monkeypatch.setattr(belfry, "last_code_commit_epoch", lambda _root: None)
     # belfry tick time is "now"; freeze it so the seeded ages hold.
     monkeypatch.setattr(belfry, "datetime", _FrozenDatetime)
     # The process is old (not in startup grace) so the overdue is not suppressed.

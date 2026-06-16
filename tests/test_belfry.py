@@ -1135,176 +1135,171 @@ def _write_pid(root: Path, pid: int) -> Path:
     return pid_file
 
 
-def test_stale_deployment_code_newer_than_start_flags(tmp_path, monkeypatch) -> None:
-    """Code committed after the daemon started -> the running process is on
-    stale code -> a reason naming the pid and both timestamps."""
-    belfry = _load_belfry()
-    pid_file = _write_pid(tmp_path, 4321)
-    monkeypatch.setattr(belfry, "process_start_epoch", lambda _pid: 1_000.0)
-    monkeypatch.setattr(belfry, "last_code_commit_epoch", lambda _root: 2_000.0)
+def _write_versions(
+    root: Path, running: str | None, installed: str | None
+) -> None:
+    """Write the two plain version sentinels belfry's drift check compares.
 
-    reason = belfry.stale_deployment(pid_file, tmp_path)
+    A None value leaves that file absent (the fail-soft "missing" case)."""
+    (root / "state").mkdir(exist_ok=True)
+    if running is not None:
+        (root / "state" / "running-version").write_text(
+            f"{running}\n", encoding="utf-8"
+        )
+    if installed is not None:
+        (root / "state" / "installed-version").write_text(
+            f"{installed}\n", encoding="utf-8"
+        )
+
+
+def test_code_drift_match_returns_none(tmp_path) -> None:
+    """running-version == installed-version -> the live process loaded the
+    pinned code -> no drift."""
+    belfry = _load_belfry()
+    _write_versions(tmp_path, "abc123", "abc123")
+    assert belfry.code_drift_failure(tmp_path / "state") is None
+
+
+def test_code_drift_mismatch_names_both_shas(tmp_path) -> None:
+    """A live daemon on an OLDER sha than the installed pin (a deploy landed but
+    the process never restarted into it) -> a page-worthy reason naming BOTH
+    shas. Mutation guard: the only way to get this string is a real mismatch."""
+    belfry = _load_belfry()
+    _write_versions(tmp_path, "oldsha111", "newsha222")
+    reason = belfry.code_drift_failure(tmp_path / "state")
     assert reason is not None
-    assert reason.startswith("stale-deploy:")
-    assert "4321" in reason
+    assert reason.startswith("code-drift:")
+    assert "oldsha111" in reason
+    assert "newsha222" in reason
 
 
-def test_stale_deployment_code_older_than_start_returns_none(
-    tmp_path, monkeypatch
-) -> None:
-    """Daemon started after the last commit -> it is running current code ->
-    no reason."""
+def test_code_drift_editable_returns_none(tmp_path) -> None:
+    """running-version == 'editable' (a dev box with no pin to drift against)
+    -> None even when installed-version holds some sha."""
     belfry = _load_belfry()
-    pid_file = _write_pid(tmp_path, 4321)
-    monkeypatch.setattr(belfry, "process_start_epoch", lambda _pid: 2_000.0)
-    monkeypatch.setattr(belfry, "last_code_commit_epoch", lambda _root: 1_000.0)
-
-    assert belfry.stale_deployment(pid_file, tmp_path) is None
+    _write_versions(tmp_path, "editable", "newsha222")
+    assert belfry.code_drift_failure(tmp_path / "state") is None
 
 
-def test_stale_deployment_fails_open_when_signal_unreadable(
-    tmp_path, monkeypatch
-) -> None:
-    """If either the commit time or the start time is unknowable, the check
-    fails open (None) -- never a false DOWN. Mirrors drift's fail-open."""
+def test_code_drift_missing_file_returns_none(tmp_path) -> None:
+    """Either sentinel absent or empty -> fail-soft None (the version stamps
+    are not a liveness backstop; an unreadable stamp must never manufacture a
+    false DOWN)."""
     belfry = _load_belfry()
-    pid_file = _write_pid(tmp_path, 4321)
-    monkeypatch.setattr(belfry, "process_start_epoch", lambda _pid: 2_000.0)
-    monkeypatch.setattr(belfry, "last_code_commit_epoch", lambda _root: None)
-    assert belfry.stale_deployment(pid_file, tmp_path) is None
+    # running present, installed absent.
+    _write_versions(tmp_path, "abc123", None)
+    assert belfry.code_drift_failure(tmp_path / "state") is None
+    # installed present, running absent.
+    (tmp_path / "state" / "running-version").unlink()
+    _write_versions(tmp_path, None, "abc123")
+    assert belfry.code_drift_failure(tmp_path / "state") is None
+    # A present-but-empty file reads as missing (None), never as "" == "".
+    (tmp_path / "state" / "running-version").write_text("\n", encoding="utf-8")
+    (tmp_path / "state" / "installed-version").write_text("\n", encoding="utf-8")
+    assert belfry.code_drift_failure(tmp_path / "state") is None
 
-    monkeypatch.setattr(belfry, "last_code_commit_epoch", lambda _root: 2_000.0)
-    monkeypatch.setattr(belfry, "process_start_epoch", lambda _pid: None)
-    assert belfry.stale_deployment(pid_file, tmp_path) is None
 
-
-def test_stale_deployment_missing_pid_file_returns_none(tmp_path) -> None:
-    """No pid file -> pid_failure owns the dead/missing case; stale has
-    nothing to compare and fails open."""
+def test_read_version_file_empty_is_none(tmp_path) -> None:
+    """_read_version_file: a missing or whitespace-only file is None, a
+    populated one is its first stripped line."""
     belfry = _load_belfry()
-    assert belfry.stale_deployment(tmp_path / "state" / "angelus.pid", tmp_path) is None
+    path = tmp_path / "v"
+    assert belfry._read_version_file(path) is None
+    path.write_text("   \n", encoding="utf-8")
+    assert belfry._read_version_file(path) is None
+    path.write_text("sha\n", encoding="utf-8")
+    assert belfry._read_version_file(path) == "sha"
 
 
-def test_stale_deployment_pings_down_alert_only(tmp_path, monkeypatch) -> None:
-    """A live but stale daemon pings DOWN naming the stale reason, and does
-    NOT trigger a restart -- stale-deploy is an alert-only OTHER reason (a
-    restart is a deliberate deploy action, never autoremediated)."""
+def test_code_drift_pings_down_alert_only(tmp_path, monkeypatch) -> None:
+    """A live daemon with running != installed pings DOWN naming the drift, and
+    does NOT trigger a restart -- code-drift is alert-only (a restart into
+    ambiguous code is the 0015 loop; a human runs `make deploy`)."""
     belfry = _load_belfry()
     _set_urls(monkeypatch)
     _alive_for_drift(tmp_path)
+    _write_versions(tmp_path, "oldsha111", "newsha222")
     pings, calls = _record_mocks(belfry, monkeypatch)
-    monkeypatch.setattr(belfry, "last_code_commit_epoch", lambda _root: 2_000.0)
-    monkeypatch.setattr(belfry, "process_start_epoch", lambda _pid: 1_000.0)
     # Guard against any restart slipping through: fail loudly if invoked.
     monkeypatch.setattr(
         belfry,
         "_autoremediate_absence",
-        lambda *a, **k: pytest.fail("stale-deploy must not restart"),
+        lambda *a, **k: pytest.fail("code-drift must not restart"),
     )
 
     assert belfry.main([str(tmp_path)]) == 1
     assert pings[-1] == "https://hc.example/down"
-    assert "stale-deploy" in " ".join(calls[-1])
+    payload = " ".join(calls[-1])
+    assert "code-drift" in payload
+    assert "oldsha111" in payload
+    assert "newsha222" in payload
+    # Alert-only: no systemctl restart was issued this tick.
+    assert not any("systemctl" in " ".join(c) for c in calls)
 
 
-def test_stale_deployment_interrogates_code_root_not_deployment_root(
-    tmp_path, monkeypatch
-) -> None:
-    """main() must hand the stale check CODE_ROOT (the engine repo), never the
-    deployment root it was invoked with. This is the call-site half of the
-    2026-06-12 lodging-split regression: with the lodging root passed instead,
-    `git -C <lodging> log -- angelus` matches nothing and the check goes
-    inert. The constant-derivation half is pinned separately; this pins the
-    wiring, so a revert to `stale_deployment(..., root)` fails here even
-    though every other stale test monkeypatches last_code_commit_epoch with a
-    root-blind lambda."""
+def test_code_drift_suppressed_during_active_hold(tmp_path, monkeypatch) -> None:
+    """A transient running != installed during a `make deploy` (the pin flips
+    before the restart lands) must NOT page while the deploy hold is ACTIVE --
+    that window is exactly when the mismatch is the deploy in progress. With no
+    other reason, belfry pings SUCCESS. Discrimination: remove the hold and the
+    same mismatch pages (test_code_drift_pings_down_alert_only)."""
     belfry = _load_belfry()
     _set_urls(monkeypatch)
     _alive_for_drift(tmp_path)
-    _record_mocks(belfry, monkeypatch)
-    roots: list = []
-    monkeypatch.setattr(
-        belfry, "last_code_commit_epoch", lambda root: roots.append(root) or None
-    )
-
-    belfry.main([str(tmp_path)])
-    assert roots == [belfry.CODE_ROOT]
-    assert roots[0] != tmp_path.resolve()
-
-
-def test_stale_deployment_does_not_fire_when_fresh(tmp_path, monkeypatch) -> None:
-    """A live daemon started after the last commit pings SUCCESS -- no stale
-    reason, no restart."""
-    belfry = _load_belfry()
-    _set_urls(monkeypatch)
-    _alive_for_drift(tmp_path)
+    _write_versions(tmp_path, "oldsha111", "newsha222")
+    # A fresh hold sentinel -> hold_status 'active' (younger than max age).
+    (tmp_path / "state" / "belfry-hold").write_text("", encoding="utf-8")
     pings, calls = _record_mocks(belfry, monkeypatch)
-    monkeypatch.setattr(belfry, "last_code_commit_epoch", lambda _root: 1_000.0)
-    monkeypatch.setattr(belfry, "process_start_epoch", lambda _pid: 2_000.0)
+
+    assert belfry.main([str(tmp_path)]) == 0
+    assert pings == ["https://hc.example/success"]
+    assert not any("code-drift" in " ".join(c) for c in calls)
+
+
+def test_code_drift_pages_through_stale_hold(tmp_path, monkeypatch) -> None:
+    """A STALE deploy hold (abandoned lock from a died deploy, past max age)
+    must NOT suppress code-drift: only an ACTIVE hold gates the deploy-window
+    alarm. A deploy that crashed after installing the new sha but before the
+    restart landed leaves running != installed AND an abandoned hold; once that
+    hold goes stale belfry must surface the drift, not stay silent.
+
+    Discrimination: only the `hold_kind != "active"` guard lets a stale hold
+    through. A regression to `hold_kind == "absent"` (suppress on anything but
+    absent) would swallow this drift -- the assertion below flips."""
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    _alive_for_drift(tmp_path)
+    _write_versions(tmp_path, "oldsha111", "newsha222")
+    # A hold sentinel aged past the max -> hold_status 'stale' (not 'active').
+    hold = tmp_path / "state" / "belfry-hold"
+    hold.write_text("", encoding="utf-8")
+    old_time = time.time() - (belfry.hold_max_age_sec() + 3600)
+    os.utime(hold, (old_time, old_time))
+    pings, calls = _record_mocks(belfry, monkeypatch)
+
+    assert belfry.main([str(tmp_path)]) == 1
+    assert pings[-1] == "https://hc.example/down"
+    payload = " ".join(calls[-1])
+    # The drift IS reported despite the (stale) hold, naming both shas.
+    assert "code-drift" in payload
+    assert "oldsha111" in payload and "newsha222" in payload
+    # The abandoned lock is surfaced too (stale-hold is its own DOWN reason).
+    assert "deploy-hold-stale" in payload
+
+
+def test_code_drift_does_not_fire_when_match(tmp_path, monkeypatch) -> None:
+    """A live daemon whose running sha equals the installed pin pings SUCCESS --
+    no drift reason, no restart. Master running ahead of the pin is irrelevant:
+    the check compares the RUNNING snapshot to the installed pin, not master."""
+    belfry = _load_belfry()
+    _set_urls(monkeypatch)
+    _alive_for_drift(tmp_path)
+    _write_versions(tmp_path, "samesha", "samesha")
+    pings, calls = _record_mocks(belfry, monkeypatch)
 
     assert belfry.main([str(tmp_path)]) == 0
     assert pings == ["https://hc.example/success"]
     assert calls == []
-
-
-def test_last_code_commit_epoch_parses_ct(tmp_path, monkeypatch) -> None:
-    """last_code_commit_epoch returns the git %ct as a float."""
-    belfry = _load_belfry()
-
-    def fake_run(args, **kwargs):
-        return subprocess.CompletedProcess(args, 0, stdout="1700000000\n", stderr="")
-
-    monkeypatch.setattr(belfry.subprocess, "run", fake_run)
-    assert belfry.last_code_commit_epoch(tmp_path) == 1700000000.0
-
-
-def test_last_code_commit_epoch_fails_open_on_non_repo(tmp_path) -> None:
-    """Outside a git repo (non-zero exit), the check fails open to None."""
-    belfry = _load_belfry()
-    # tmp_path is not a git repo; real git returns non-zero -> None.
-    assert belfry.last_code_commit_epoch(tmp_path) is None
-
-
-def test_last_code_commit_epoch_no_angelus_commit_fails_open(tmp_path) -> None:
-    """A real repo whose history never touches angelus/ -> `git log` exits 0
-    with empty stdout -> float('') ValueError -> fail open (None), not crash.
-    Pins the broad `except Exception`: the empty-output case is a ValueError,
-    which a narrower OSError/SubprocessError except would let escape and
-    abort the belfry tick."""
-    belfry = _load_belfry()
-    env = {
-        **os.environ,
-        "GIT_AUTHOR_NAME": "t",
-        "GIT_AUTHOR_EMAIL": "t@t",
-        "GIT_COMMITTER_NAME": "t",
-        "GIT_COMMITTER_EMAIL": "t@t",
-    }
-    run = lambda *a: subprocess.run(  # noqa: E731
-        ["git", "-C", str(tmp_path), *a], check=True, capture_output=True, env=env
-    )
-    run("init", "-q")
-    (tmp_path / "README.md").write_text("not python, not angelus", encoding="utf-8")
-    run("add", "README.md")
-    run("commit", "-qm", "docs only")
-    assert belfry.last_code_commit_epoch(tmp_path) is None
-
-
-def test_code_root_is_the_engine_repo_not_the_deployment_root(tmp_path) -> None:
-    """CODE_ROOT must derive from belfry.py's own location (the engine repo),
-    never the deployment root. In a split deployment the daemon runs with its
-    cwd at a lodging root that contains no angelus/ package and no engine
-    history -- `git -C <lodging> log -- angelus` matches nothing there, and
-    the stale-deploy check silently went inert exactly that way when the
-    lodging was first split out (2026-06-12). The engine repo is one level
-    above belfry/."""
-    belfry = _load_belfry()
-    assert belfry.CODE_ROOT == Path(belfry.__file__).resolve().parent.parent
-    assert (belfry.CODE_ROOT / "belfry").is_dir()
-    # And the engine repo actually yields a code-commit epoch (this test runs
-    # from a git checkout; a non-repo install would fail open to None, which
-    # is the documented degraded mode, not a wiring bug).
-    epoch = belfry.last_code_commit_epoch(belfry.CODE_ROOT)
-    assert epoch is None or epoch > 1_500_000_000.0
 
 
 def test_starttime_ticks_parse_survives_comm_with_spaces_and_parens() -> None:
@@ -2206,7 +2201,7 @@ def test_failed_restart_counts_toward_guard(tmp_path, monkeypatch) -> None:
 # suppresses the wedge ONLY while the daemon PROCESS is young; an old daemon
 # with the same empty/stale heartbeat is a genuine wedge and is still reported.
 # The young/old axis is driven by stubbing process_start_epoch (the /proc-derived
-# start time), mirroring the stale-deployment tests above.
+# start time), which now serves only the startup-grace path.
 
 
 def _empty_watch_state(root: Path) -> None:
@@ -2424,7 +2419,7 @@ def test_startup_grace_end_to_end_no_restart_for_young_daemon(
     )
     _empty_watch_state(tmp_path)
     monkeypatch.setattr(belfry, "process_start_epoch", lambda _pid: time.time())
-    # Take the other axes off the table: no systemd drift, no stale-deploy.
+    # Take the other axes off the table: no systemd drift.
     monkeypatch.setattr(belfry, "systemd_main_pid", lambda: None)
 
     pings: list[str] = []

@@ -27,6 +27,13 @@ render:
       template: rate-limit-callout
     - kind: structured
       template: incident-status
+    # Behind-master deploy staleness (brief-20260613-3spy item 1c): a
+    # low-severity, never-pages FYI that renders only when the installed pin
+    # trails master past the staleness threshold. The push leg renders the same
+    # data deterministically in code (PipeDrain._render_compact); this is the
+    # email long-form leg.
+    - kind: structured
+      template: deploy-staleness
   body:
     kind: llm
     mantle: chronicler

@@ -54,17 +54,16 @@ DEFAULT_TICK_INTERVAL_SEC = 300
 DEFAULT_SENTINEL_FILENAME = "belfry-pinged-at"
 DEFAULT_FAILCHECK_FILENAME = "belfry-failcheck-at"
 DEFAULT_ENV_FILENAME = "angelus.env"
+# Two plain state files the code-drift check compares (see code_drift_failure).
+# running-version is the sha the live daemon SNAPSHOTTED at boot (written once
+# by daemon.run); installed-version is the pin the last `make deploy` recorded.
+# belfry reads both with stdlib only and never imports angelus -- it runs from
+# <lodging>/bin and must work even when the engine code is broken.
+DEFAULT_RUNNING_VERSION_FILENAME = "running-version"
+DEFAULT_INSTALLED_VERSION_FILENAME = "installed-version"
 FAILURE_DETAIL_LIMIT = 3
 DEFAULT_SYSTEMD_UNIT = "angelus"
 SYSTEMCTL_TIMEOUT_SEC = 10
-
-# The engine repo, derived from this file's own location (belfry/belfry.py
-# lives one level under it). The deployment root (`root` in main, where
-# state/ and the lodging live) and the engine repo are different directories
-# in a split deployment, and the stale-deploy check must interrogate the
-# repo the daemon's *code* comes from -- `git -C <deployment-root> log --
-# angelus` matches nothing there and the check silently goes inert.
-CODE_ROOT = Path(__file__).resolve().parent.parent
 
 # B12 restart-fixer defaults.  All overridable via env vars.
 DEFAULT_RESTART_LOG_FILENAME = "belfry-restart-log"
@@ -182,9 +181,12 @@ def main(argv: list[str] | None = None) -> int:
     #   drift_failure -- alive but mis-launched outside the systemd unit:
     #       alerting only (a systemctl restart while a hand-launched instance
     #       holds the pid is messy; that's a human/SRE fix).
-    #   stale_deployment -- alive but running code older than the latest
-    #       commit: alerting only (a restart is a deliberate deploy action;
-    #       auto-restarting could load half-merged code mid-edit).
+    #   code_drift_failure -- alive but running a sha older than the installed
+    #       pin (a `make deploy` landed a new pin the running process never
+    #       restarted to load): alerting only (a restart is a deliberate deploy
+    #       action; auto-restarting into ambiguous code is the 0015-loop). The
+    #       alert itself is suppressed while a deploy hold is active -- that
+    #       window is exactly when a transient running!=installed is expected.
     #   sla_failure -- a pipe alive-but-not-delivering on its cadence (output
     #       side): alerting only.
     #   source_overdue_failure -- a SINGLE source alive-but-not-being-checked
@@ -203,6 +205,19 @@ def main(argv: list[str] | None = None) -> int:
     # an alert-only OTHER reason carried down the normal DOWN path, fired on
     # every tick (dead daemon or not) until the operator fixes the config.
     invariant_reason = grace_invariant_failure()
+
+    # Deploy hold latch (brief-20260613-3spy).  Read the sentinel once, up
+    # front, because two decisions below depend on it: the code-drift ALERT is
+    # suppressed while a hold is 'active' (a `make deploy` flips the pin before
+    # the restart lands, so a transient running!=installed IS the deploy in
+    # progress -- the one alarm that legitimately belongs inside the deploy
+    # window), and the restart ACTION is suppressed too (belfry must not race a
+    # deploy's own restart).  A 'stale' hold (abandoned lock from a died
+    # deploy) suppresses neither -- it surfaces as its own alert-only DOWN
+    # reason below.  Either way the alarm path (DOWN ping, notify, logging) is
+    # untouched: the hold gags only autoremediation and the one deploy-window
+    # alarm, never the rest of alerting.
+    hold_kind, hold_age = hold_status(state)
 
     dead_reason = pid_failure(state / "angelus.pid")
     if dead_reason:
@@ -225,9 +240,17 @@ def main(argv: list[str] | None = None) -> int:
         drift_reason = drift_failure(state / "angelus.pid")
         if drift_reason:
             other_reasons.append(drift_reason)
-        stale_reason = stale_deployment(state / "angelus.pid", CODE_ROOT)
-        if stale_reason:
-            other_reasons.append(stale_reason)
+        # Code-drift: the live daemon is running an older sha than the
+        # installed pin (running-version != installed-version). Alert-only and
+        # SUPPRESSED while a deploy hold is active -- during a `make deploy` the
+        # pin flips before the restart lands, so a transient mismatch is the
+        # deploy in progress, not drift. Once the hold expires/releases, genuine
+        # drift pages. belfry never auto-restarts on drift (a human runs
+        # `make deploy`/restart deliberately; auto-restart is the 0015 loop).
+        if hold_kind != "active":
+            drift_code_reason = code_drift_failure(state)
+            if drift_code_reason:
+                other_reasons.append(drift_code_reason)
         # Delivery SLA: a pipe alive-but-not-delivering. Alert-only (OTHER),
         # never restart -- a stalled pipe is a product/logic failure, and the
         # wedge check already covers a source-firing wedge; restarting here
@@ -252,14 +275,9 @@ def main(argv: list[str] | None = None) -> int:
         if source_overdue_reason:
             other_reasons.append(source_overdue_reason)
 
-    # Deploy hold latch (brief-20260613-3spy).  Read the sentinel once: an
-    # 'active' hold suppresses the restart ACTION below (a deploy is restarting
-    # the daemon itself); a 'stale' hold is an abandoned lock from a deploy that
-    # died -- it does NOT suppress (restarts resume) and is surfaced as its own
-    # alert-only DOWN reason so the forgotten lock is loud.  Either way the
-    # alarm path (DOWN ping, notify, logging) is untouched: the hold gags only
-    # autoremediation, never alerting.
-    hold_kind, hold_age = hold_status(state)
+    # A 'stale' deploy hold (read up front above) is an abandoned lock from a
+    # deploy that died -- it does NOT suppress restarts and is surfaced as its
+    # own alert-only DOWN reason so the forgotten lock is loud.
     if hold_kind == "stale":
         stale_note = (
             f"deploy-hold-stale: belfry-hold present but "
@@ -1157,52 +1175,6 @@ def drift_failure(pid_file: Path) -> str | None:
     )
 
 
-def last_code_commit_epoch(root: Path) -> float | None:
-    """Epoch of the most recent commit to the daemon's runtime package, or None.
-
-    Uses git rather than working-tree mtimes deliberately: an editable
-    install runs the files on disk, so flagging on every uncommitted edit
-    would nag constantly during development. A commit (and the merge that
-    follows) is the deployment event that matters -- it is what landed
-    fixer_actions on 2026-05-31 while the daemon kept running pre-merge
-    code. Fails open (None) outside a git repo or if git is unavailable, so
-    an un-interrogable repo never reports a false DOWN.
-
-    The pathspec is scoped to ``angelus/`` -- the package the daemon imports
-    -- NOT a repo-wide ``*.py``. A commit touching only tests/, belfry/, or
-    docs/ does not change what the running daemon executes, so it must not
-    flip this check to DOWN and nag every tick. Belfry itself runs fresh
-    from cron each tick, so belfry.py is never "stale" the way the
-    long-lived daemon can be.
-
-    Caveat: %ct is the committer date, used as a proxy for "landing time."
-    This repo's shard workflow re-stamps commits at merge (committer date ~=
-    landing time), so the proxy holds. A future move to fast-forward merges
-    of older-authored commits could carry a stale %ct and under-report (a
-    false negative) -- but never a false positive, since that needs a
-    future-dated commit. If merge policy changes, revisit this.
-    """
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(root), "log", "-1", "--format=%ct", "--", "angelus"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode != 0:
-            return None
-        return float(result.stdout.strip())
-    except Exception as exc:
-        # Fail open on anything -- a belfry tick must never crash on the
-        # stale check, or it would suppress every other health ping. This is
-        # the same "never a false DOWN / never abort the tick" contract the
-        # other checks honor; the stale check is the lowest-stakes of them.
-        # Covers git being absent, a non-repo root, a timeout, and unparseable
-        # output (empty/garbled %ct -> ValueError).
-        log_err(f"angelus belfry: stale-deploy git failed: {exc}")
-        return None
-
-
 def _starttime_ticks_from_proc_stat(stat_line: str) -> int:
     """Field 22 (starttime, in clock ticks) from a /proc/<pid>/stat line.
 
@@ -1240,39 +1212,70 @@ def process_start_epoch(pid: int) -> float | None:
             return None
         return btime + starttime_ticks / clk_tck
     except (OSError, ValueError, IndexError) as exc:
-        log_err(f"angelus belfry: stale-deploy /proc read failed: {exc}")
+        log_err(f"angelus belfry: startup-grace /proc read failed: {exc}")
         return None
 
 
-def stale_deployment(pid_file: Path, root: Path) -> str | None:
-    """Flag when committed code is newer than the running daemon.
+def _read_version_file(path: Path) -> str | None:
+    """First non-empty line of a plain version sentinel, or None.
 
-    Called only when a daemon is alive (pid_failure already returned None).
-    Python imports each module once at startup and an editable install does
-    NOT hot-reload, so a daemon that started before code landed is executing
-    stale code. This is exactly the 2026-06-01 failure: fixer_actions merged
-    2026-05-31 but the daemon, up since before the merge, kept rejecting
-    daily.yaml every tick.
-
-    Alert-only (an OTHER reason, like drift): a restart deploys current code,
-    but that is a deliberate human/SRE action -- auto-restarting could load
-    half-merged code mid-edit. Fails open on any unreadable signal.
+    Stdlib-only and fail-soft: a missing file, an unreadable one, or an empty
+    file all yield None. belfry must never import angelus (it runs from
+    <lodging>/bin and has to work when the engine code is broken), so the two
+    version files are read as plain text here, not via importlib.metadata.
     """
     try:
-        pid = int(pid_file.read_text(encoding="utf-8").strip())
-    except (FileNotFoundError, ValueError):
+        text = path.read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, OSError):
         return None
-    code_at = last_code_commit_epoch(root)
-    start_at = process_start_epoch(pid)
-    if code_at is None or start_at is None:
+    return text or None
+
+
+def code_drift_failure(state_dir: Path) -> str | None:
+    """Flag when the live daemon is running a sha OLDER than the installed pin.
+
+    Replaces the old commit-time-vs-process-start staleness check, which was
+    doubly broken post-cutover: CODE_ROOT resolved to the codeless lodging
+    root (so it went inert), and commit-time-vs-start is wrong for a pinned
+    install anyway -- master runs ahead of the pin by design, so it would
+    false-page on every merge.
+
+    Instead, compare two plain state files (no git, no angelus import):
+
+      * running-version -- the sha the live daemon SNAPSHOTTED at its own boot
+        (daemon.run writes it once via PEP 610 provenance).
+      * installed-version -- the pin the last `make deploy` recorded.
+
+    They match for a freshly deployed-and-restarted daemon. They diverge when
+    a `make deploy` pip-installed a newer pin but the running process never
+    restarted to load it -- the exact "restart failed to land / hand-launch
+    drift" case this check exists to page on.
+
+    Fail-soft / alert-only:
+      * either file missing or unreadable -> None (the version stamps are not
+        a liveness backstop; an un-readable stamp must never manufacture a
+        false DOWN -- the pid/wedge/failure-surface checks own liveness).
+      * running-version == "editable" -> None: a dev box with no pin to drift
+        against (installed_commit_id returned None at boot).
+      * running == installed -> None.
+      * otherwise -> a page-worthy reason naming BOTH shas. ALERT-ONLY: belfry
+        does NOT auto-restart on drift. Auto-restarting into ambiguous code is
+        the 0015-loop failure mode; a human runs `make deploy`/restart
+        deliberately. The caller suppresses even the ALERT while a deploy hold
+        is active (the deploy window is exactly when a transient mismatch is
+        expected -- the pin flips before the restart lands).
+    """
+    running = _read_version_file(state_dir / DEFAULT_RUNNING_VERSION_FILENAME)
+    installed = _read_version_file(state_dir / DEFAULT_INSTALLED_VERSION_FILENAME)
+    if running is None or installed is None:
         return None
-    if code_at <= start_at:
+    if running == "editable":
         return None
-    code_iso = datetime.fromtimestamp(code_at).strftime("%Y-%m-%d %H:%M")
-    start_iso = datetime.fromtimestamp(start_at).strftime("%Y-%m-%d %H:%M")
+    if running == installed:
+        return None
     return (
-        f"stale-deploy: daemon PID {pid} started {start_iso} but Python code "
-        f"was last committed {code_iso}; restart to load current code"
+        f"code-drift: daemon running {running} but installed pin is "
+        f"{installed}; restart to load pinned code"
     )
 
 
@@ -1342,8 +1345,9 @@ def within_startup_grace(pid_file: Path, now: float | None = None) -> bool:
     """True when the daemon process is younger than the startup grace window.
 
     Reads the live pid from pid_file and its wall-clock start time from
-    process_start_epoch (the same /proc-derived value the stale-deploy check
-    uses). Fails toward NOT-in-grace -- returns False -- whenever the answer
+    process_start_epoch (the /proc-derived process start time; it now serves
+    only this startup-grace path). Fails toward NOT-in-grace -- returns False
+    -- whenever the answer
     cannot be established: a missing/invalid pid file, an unreadable /proc, or
     a process_start_epoch that returns None. That is the safe direction: an
     UNKNOWN process age must never suppress a wedge; only a provably-young

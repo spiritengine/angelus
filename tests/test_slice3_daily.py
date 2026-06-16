@@ -1444,12 +1444,22 @@ def test_digest_subject_is_local_time_date_only(tmp_path, monkeypatch) -> None:
     assert ":" not in subject
 
 
-def test_structured_inputs_attach_local_timestamp_siblings(tmp_path) -> None:
+def test_structured_inputs_attach_local_timestamp_siblings(
+    tmp_path, monkeypatch
+) -> None:
     """Each finding/incident gets an `<field>_local` sibling for any
     known UTC timestamp field, so templates and the chronicler prompt
     can use human times without each renderer reimplementing
     conversion. The UTC originals must be preserved (downstream code
     and tests assume them)."""
+    # Hermetic: pin deploy_staleness to None so the digest's structured inputs
+    # don't shell real git against the parent repo (whose un-deployed commits
+    # would start threading a staleness dict in once they age past the 7d
+    # threshold -- a wall-clock-dependent flake). pipe_runner is captured at
+    # import, so this lands on the SAME module object PipeDrain._deploy_staleness
+    # resolves the name in, even after another test pops angelus.* from
+    # sys.modules (see the _RUNNER_MOD note in test_deploy_staleness_digest.py).
+    monkeypatch.setattr(pipe_runner, "deploy_staleness", lambda *a, **k: None)
     connection = init_db(tmp_path / "angelus.sqlite3")
     catalog = Catalog(connection, tmp_path)
     drain = PipeDrain(

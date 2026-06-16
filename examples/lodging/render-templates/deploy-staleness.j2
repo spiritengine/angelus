@@ -1,0 +1,8 @@
+{# Behind-master deploy staleness: a low-severity, never-pages FYI. Renders
+   only when deploy_staleness is present (the installed pin trails master past
+   the staleness threshold); empty otherwise, so the preamble drops it. Inline
+   `{{ }}` only, no end-of-line `{% endif %}` -- see incident-status.j2 for the
+   trim_blocks footgun. #}
+{% if deploy_staleness %}
+Deploy staleness: installed {{ deploy_staleness.commits_behind }} commit(s) behind master, oldest {{ deploy_staleness.oldest_days }} day(s). A restart is not a deploy; run `make deploy` to advance the pin when ready.
+{% endif %}
