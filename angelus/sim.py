@@ -162,6 +162,7 @@ class SimHarness:
         the same first-tick state a real daemon would have.
         """
         self.daemon._reconcile_orphaned_internal_incidents()
+        self.daemon._reconcile_orphaned_product_incidents()
         self.daemon._reconcile_dead_letter_incidents()
         self.daemon._validate_channel_config()
         self.daemon._sync_pipe_sla()

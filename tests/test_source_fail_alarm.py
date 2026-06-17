@@ -540,3 +540,217 @@ def test_startup_reconcile_clears_only_unlodged_source_incidents(
         assert [i["entity"] for i in incidents] == ["scheduled/lodged"]
     finally:
         daemon.connection.close()
+
+
+# --- Orphaned PRODUCT incident reconcile -------------------------------------
+#
+# A product incident (source = a real scheduled source; type = thesis-trigger /
+# web-important / ...; keyed (source, type, entity)) closes ONLY via a
+# type="clearance" finding for (source, entity) from the source firing again.
+# A source REMOVED from lodging never fires again, so that close path is gone
+# and the incident orphans forever (re-surfacing in every daily digest). The
+# reconcile sweep clears any open incident whose non-internal source is no
+# longer in self.lodging.sources, mirroring the internal/source coverage.
+
+
+def _seed_product_incident(
+    daemon: AngelusDaemon,
+    source: str,
+    ftype: str = "thesis-trigger",
+    entity: str = "mos-sbec",
+) -> int:
+    """Open a product incident keyed (source, type, entity) by writing one
+    non-clearance finding -- the same edge a triaged source fire takes."""
+    return daemon.catalog.write_finding(
+        None,
+        {
+            "source": source,
+            "type": ftype,
+            "entity": entity,
+            "severity": "high",
+            "target_pipes": ["now"],
+            "body": f"{ftype} fired for {entity}",
+        },
+        set(daemon.lodging.pipes),
+    )
+
+
+def _open_product_incidents(daemon: AngelusDaemon) -> list[dict]:
+    return [
+        i
+        for i in daemon.catalog.open_incidents()
+        if not i["source"].startswith("internal/")
+    ]
+
+
+def _clearance_bodies(daemon: AngelusDaemon, source: str) -> list[str]:
+    rows = daemon.connection.execute(
+        "SELECT body_ref FROM findings WHERE source = ? AND type = 'clearance' "
+        "ORDER BY id",
+        (source,),
+    )
+    return [daemon.catalog.read_body(row["body_ref"]).get("text", "") for row in rows]
+
+
+def test_product_reconcile_clears_unlodged_source_incident(tmp_path: Path) -> None:
+    """A product incident whose source is not in lodging is closed by the
+    startup reconcile, with a clearance recording 'no longer lodged'."""
+    _lodge(tmp_path)  # lodges scheduled/s only
+    daemon = AngelusDaemon(tmp_path)
+    try:
+        _seed_product_incident(
+            daemon, "scheduled/gone", "thesis-trigger", "mos-sbec"
+        )
+        assert [i["source"] for i in _open_product_incidents(daemon)] == [
+            "scheduled/gone"
+        ]
+
+        daemon._reconcile_orphaned_product_incidents()
+
+        assert _open_product_incidents(daemon) == []
+        bodies = _clearance_bodies(daemon, "scheduled/gone")
+        assert len(bodies) == 1
+        assert "no longer lodged" in bodies[0]
+    finally:
+        daemon.connection.close()
+
+
+def test_product_reconcile_leaves_lodged_source_incident(tmp_path: Path) -> None:
+    """A product incident whose source is STILL lodged is untouched -- it
+    recovers off its source's own next clearing fire. Mutation: inverting the
+    predicate (close lodged sources) fails this."""
+    _lodge(tmp_path)  # lodges scheduled/s
+    daemon = AngelusDaemon(tmp_path)
+    try:
+        _seed_product_incident(daemon, "scheduled/s", "thesis-trigger", "e")
+        daemon._reconcile_orphaned_product_incidents()
+
+        assert [i["source"] for i in _open_product_incidents(daemon)] == [
+            "scheduled/s"
+        ]
+        assert _clearance_bodies(daemon, "scheduled/s") == []
+    finally:
+        daemon.connection.close()
+
+
+def test_product_reconcile_leaves_internal_incidents(tmp_path: Path) -> None:
+    """The product pass must not touch internal/* incidents (their own
+    reconcile owns them). Seed an internal/render incident -- whose source is
+    not in lodging.sources -- and confirm the product pass leaves it open.
+    Mutation: dropping the _is_internal guard closes it and fails this."""
+    _lodge(tmp_path)
+    daemon = AngelusDaemon(tmp_path)
+    try:
+        daemon.catalog.write_internal_finding(
+            "internal/render",
+            "render_failed",
+            "digest",
+            "render blew up",
+            set(daemon.lodging.pipes),
+        )
+        assert daemon.catalog.open_internal_incident_count() == 1
+
+        daemon._reconcile_orphaned_product_incidents()
+
+        assert daemon.catalog.open_internal_incident_count() == 1
+        assert _clearance_bodies(daemon, "internal/render") == []
+    finally:
+        daemon.connection.close()
+
+
+def test_product_reconcile_via_apply_lodging_on_source_removal(
+    tmp_path: Path,
+) -> None:
+    """Hot reload: removing the incident's source via apply_lodging closes it;
+    removing an UNRELATED source leaves it open (its source is still lodged)."""
+    _lodge(tmp_path, sources=("gone", "other"))
+    daemon = AngelusDaemon(tmp_path)
+    try:
+        _seed_product_incident(
+            daemon, "scheduled/gone", "thesis-trigger", "mos-sbec"
+        )
+
+        # Remove the unrelated source: gone is still lodged -> incident stays.
+        (tmp_path / "sources" / "scheduled" / "other.yaml").unlink()
+        asyncio.run(daemon.apply_lodging(load_lodging(tmp_path)))
+        assert [i["source"] for i in _open_product_incidents(daemon)] == [
+            "scheduled/gone"
+        ]
+
+        # Remove the incident's own source: now it has no recovery edge -> close.
+        (tmp_path / "sources" / "scheduled" / "gone.yaml").unlink()
+        asyncio.run(daemon.apply_lodging(load_lodging(tmp_path)))
+        assert _open_product_incidents(daemon) == []
+        assert any(
+            "no longer lodged" in b
+            for b in _clearance_bodies(daemon, "scheduled/gone")
+        )
+    finally:
+        daemon.connection.close()
+
+
+def test_product_reconcile_keeps_transiently_absent_source_incident(
+    tmp_path: Path,
+) -> None:
+    """A source whose file transiently fails to parse leaves apply_lodging
+    UNCALLED (the reloader swaps self.lodging only on a validated load), so the
+    source is still in self.lodging.sources and its incident must stay open.
+    The reconcile keys off self.lodging.sources -- the live validated set --
+    not the on-disk files."""
+    _lodge(tmp_path)  # lodges scheduled/s
+    daemon = AngelusDaemon(tmp_path)
+    try:
+        _seed_product_incident(daemon, "scheduled/s", "thesis-trigger", "e")
+
+        # Corrupt the source file on disk, but do NOT call apply_lodging --
+        # exactly what the reloader does when load_lodging raises: it keeps the
+        # prior snapshot. self.lodging.sources still holds scheduled/s.
+        (tmp_path / "sources" / "scheduled" / "s.yaml").write_text(
+            "cadence: 1h\ncheck: [not, valid\n", encoding="utf-8"
+        )
+        assert "scheduled/s" in daemon.lodging.sources
+
+        daemon._reconcile_orphaned_product_incidents()
+        assert [i["source"] for i in _open_product_incidents(daemon)] == [
+            "scheduled/s"
+        ]
+    finally:
+        daemon.connection.close()
+
+
+def test_product_reconcile_clears_all_incidents_on_one_removed_source(
+    tmp_path: Path,
+) -> None:
+    """Multiple open incidents on one removed source all close in a single
+    pass (the sweep iterates every open incident, not just the first)."""
+    _lodge(tmp_path)
+    daemon = AngelusDaemon(tmp_path)
+    try:
+        _seed_product_incident(daemon, "scheduled/gone", "thesis-trigger", "e1")
+        _seed_product_incident(
+            daemon, "scheduled/gone", "watch-check-failed", "e2"
+        )
+        assert len(_open_product_incidents(daemon)) == 2
+
+        daemon._reconcile_orphaned_product_incidents()
+
+        assert _open_product_incidents(daemon) == []
+        assert len(_clearance_bodies(daemon, "scheduled/gone")) == 2
+    finally:
+        daemon.connection.close()
+
+
+def test_product_reconcile_is_idempotent(tmp_path: Path) -> None:
+    """A second reconcile pass writes nothing -- write_clearance is a gate-
+    dropped no-op once the incident is already closed."""
+    _lodge(tmp_path)
+    daemon = AngelusDaemon(tmp_path)
+    try:
+        _seed_product_incident(daemon, "scheduled/gone", "thesis-trigger", "e")
+        daemon._reconcile_orphaned_product_incidents()
+        assert len(_clearance_bodies(daemon, "scheduled/gone")) == 1
+
+        daemon._reconcile_orphaned_product_incidents()
+        assert len(_clearance_bodies(daemon, "scheduled/gone")) == 1
+    finally:
+        daemon.connection.close()

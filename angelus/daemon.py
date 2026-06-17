@@ -512,6 +512,7 @@ class AngelusDaemon:
             # first post-restart failure.
             self.catalog.clear_immediate_channel_attempts()
             self._reconcile_orphaned_internal_incidents()
+            self._reconcile_orphaned_product_incidents()
             self._reconcile_dead_letter_incidents()
             self._validate_channel_config()
             self._sync_pipe_sla()
@@ -758,6 +759,67 @@ class AngelusDaemon:
             LOGGER.info(
                 "startup recovery: reconciled orphaned internal incidents (%s)",
                 ", ".join(f"{s}={n}" for s, n in sorted(reconciled.items())),
+            )
+
+    def _reconcile_orphaned_product_incidents(self) -> None:
+        """Clear PRODUCT incidents whose source has left lodging.
+
+        A product incident (source = a real scheduled source, e.g.
+        scheduled/thesis-trigger; type = thesis-trigger / web-important / ...;
+        keyed (source, type, entity)) closes ONLY via a type="clearance"
+        finding for (source, entity), which the source emits when it fires
+        again and the condition clears. A source REMOVED from lodging is
+        unscheduled and never fires again -- _fire_source bails for an unlodged
+        ref -- so the only close path is gone and the incident orphans forever,
+        re-surfacing in every daily digest. (Observed in prod: warp's
+        `thesis watch sync` deletes a thesis-watch entity when a thesis closes,
+        the reloader removes the source, and the product incident is stranded.)
+
+        This is the product-incident analogue of the internal/source coverage
+        in _reconcile_orphaned_internal_incidents (startup) and apply_lodging
+        (hot reload): a source absent from self.lodging.sources has no remaining
+        recovery edge, so close the incident through the same path live
+        recoveries use -- re-arming the B30 gate so a re-added source can alert
+        again, and surfacing the closure once in the digest's recent_closures.
+
+        self.lodging.sources is the authoritative LIVE set: the reloader swaps
+        self.lodging in only after a successful, validated load, so a source
+        missing from it is genuinely gone -- not transiently failing to parse or
+        mid-reload (that case leaves the prior snapshot in place, so the source
+        is still present here and the incident is correctly left open).
+
+        Predicate is the simple form -- any non-internal open incident whose
+        source is not lodged -- mirroring how internal/source keys off
+        self.lodging.sources. A product incident whose source was never a real
+        source_ref also closes; that is benign (it can never clear anyway).
+        Internal incidents are excluded by _is_internal and handled by their own
+        reconcile. Gate-safe and idempotent: write_clearance is a no-op for any
+        (source, entity) with nothing open, so a second run writes nothing.
+
+        Synchronous and self-committing (write_clearance -> write_finding has no
+        await between write and commit), same single-writer contract as the
+        adjacent internal/source clearance: startup runs before the loops spin
+        up, apply_lodging runs on the single event loop.
+        """
+        known_pipes = set(self.lodging.pipes)
+        lodged = set(self.lodging.sources)
+        closed = 0
+        for incident in self.catalog.open_incidents():
+            source = incident["source"]
+            if _is_internal(source) or source in lodged:
+                continue
+            self.catalog.write_clearance(
+                source,
+                incident["entity"],
+                f"{source} no longer lodged; incident reconciled",
+                known_pipes,
+            )
+            closed += 1
+        if closed:
+            LOGGER.info(
+                "reconciled %d orphaned product incident(s) whose source "
+                "left lodging",
+                closed,
             )
 
     def _reconcile_dead_letter_incidents(self) -> None:
@@ -1610,6 +1672,18 @@ class AngelusDaemon:
         for drain in self.pipe_drains.values():
             drain.channels = new_lodging.channels
             drain.known_pipes = new_known
+
+        # A hot-removed source strands its PRODUCT incident exactly as it
+        # strands its internal/source one (handled in the removal loop above):
+        # the source never fires again, so the clearance finding that is the
+        # incident's only close path can never arrive. This is the hot-reload
+        # path that actually fired in prod (warp deletes a thesis-watch entity
+        # -> reloader -> apply_lodging). Run the sweep here, where self.lodging
+        # is already the new snapshot, alongside the other "reflect the new
+        # lodged set" reconciles. Synchronous and self-committing, cancel-safe
+        # like the rest of the reload; the startup sweep covers a remove that
+        # happened while the daemon was down.
+        self._reconcile_orphaned_product_incidents()
 
     def _spawn_pipe_loop(self, pipe_name: str) -> None:
         task = asyncio.create_task(self._pipe_loop(pipe_name), name=f"pipe-{pipe_name}")

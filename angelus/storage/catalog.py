@@ -1700,6 +1700,15 @@ class Catalog:
             known_pipes,
         )
 
+    # write_internal_clearance is named for its original caller (internal/*
+    # recovery edges) but is mechanically source-agnostic: it closes the open
+    # incident for (source, entity) on the same path every recovery uses, with
+    # no `now`-pipe noise. Product incidents (source = scheduled/*) whose source
+    # left lodging have no live clearance edge of their own, so the reconcile
+    # sweep closes them through this same mechanism. This alias lets those call
+    # sites read honestly without duplicating the body.
+    write_clearance = write_internal_clearance
+
     def recover_triage_processing_rows(self) -> int:
         """Delete observation_triage rows left at status='processing' from
         a prior daemon's hard exit (SIGKILL, OS kill, host crash). Returns
