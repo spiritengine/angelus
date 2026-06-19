@@ -1,0 +1,20 @@
+{# Pitch seed cards for the daily `seeds` digest. Renders one card per seed
+   finding routed to this pipe since the last drain. Inline `{{ }}` only and
+   `{% ... -%}` whitespace control -- the Environment uses trim_blocks=True, so a
+   bare `{% endfor %}` at end-of-line eats the per-iteration newline and collapses
+   the cards onto one line. See incident-status.j2 for the same footgun. #}
+{% if findings_since_last_drain %}
+Pitch seeds since last digest ({{ findings_since_last_drain|length }}):
+{% for f in findings_since_last_drain -%}
+{% if f.type == "store_corrupt" -%}
+- [{{ f.severity|default("high", true) }}] seed store corruption -- {{ f.body.malformed_lines|default("?", true) }} malformed line(s)
+  preserved in state/pitch-seeds.jsonl -- inspect and repair so the row drains
+{% else -%}
+- [{{ f.severity|default("low", true) }}] {{ f.body.event|default(f.entity, true) }}
+  cannon: {{ f.body.cannon|default("?", true) }}
+  build: {{ f.body.build_move|default("?", true) }}
+{% endif -%}
+{% endfor -%}
+{% else %}
+No new Pitch seeds since last digest.
+{% endif %}

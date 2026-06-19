@@ -1,0 +1,30 @@
+# The Pitch seed digest (brief-20260619-opi5). Low-urgency, daily: batches every
+# seed the drip dripped since the last drain into ONE notification. Seeds are
+# never an emergency -- the window is days, not minutes -- so this is its own
+# pipe, NOT `now`. (The rare severity=="high" xz-scale seed is the exception: the
+# triager routes THOSE to `now` directly, jumping this queue.)
+#
+# 8:00 AM local time. CronTrigger.from_crontab() defaults the trigger timezone to
+# LOCAL (see daily.yaml's note), so this fires at 08:00 in the box's local TZ --
+# one hour after the ops digest, keeping the two reports distinct.
+cadence: "0 8 * * *"
+# No max_interval (delivery SLA) on purpose: a quiet day with no seeds drips
+# nothing, and a digest with nothing pending does not send (PipeDrain._drain_
+# digest skips the same-day empty case). An SLA here would false-page on every
+# seedless day. Seed loss is guarded by the drip's emitted_at stamp and the
+# catalog emission gate, not by a delivery deadline.
+channels:
+  - email
+  - push
+render:
+  preamble:
+    # Deterministic seed cards on the email leg (and the structured push-compact
+    # summary lists each new finding). The cannon/event/build_move ride through
+    # the finding body; the chronicler body below adds synthesis on top.
+    - kind: structured
+      template: seed-cards
+  body:
+    kind: llm
+    mantle: chronicler
+    inputs:
+      - findings_since_last_drain

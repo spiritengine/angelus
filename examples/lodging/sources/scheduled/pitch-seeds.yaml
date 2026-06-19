@@ -1,0 +1,23 @@
+cadence: 10m
+check:
+  kind: shell
+  # The Pitch seed drip (brief-20260619-opi5 option C). Pitch -- the daily LLM
+  # scan that finds build-worthy SEEDS -- runs on its OWN schedule (the `pitch`
+  # mill chain, minutes long, decoupled so it never runs inside this seconds-
+  # bounded source-fire) and writes seeds to state/pitch-seeds.jsonl. This fast
+  # source is a thin reader: each tick drains the OLDEST unemitted seed, stamps
+  # its emitted_at, and prints ONE observation.
+  #
+  # `state` is the observation-collapse token: the seed id. Distinct seeds are
+  # distinct states, so N seeds drain one-per-tick into N observations with no
+  # engine change; a fully-drained store prints state="idle", which collapses to
+  # no observation. Identical re-fires (idle->idle) write nothing.
+  #
+  # cwd is the lodging root (the daemon's working directory), so the relative
+  # bin/ and state/ paths resolve there. The live store + the `pitch` schedule
+  # that writes it are deployed from the PRIVATE lodging repo, not this examples
+  # tree.
+  command: python3 bin/pitch_seed_drip.py state/pitch-seeds.jsonl
+  # A trivial file read; well under the 30s default, but pinned short because a
+  # drip that ever hangs should fail fast rather than stall the fire loop.
+  timeout_seconds: 15

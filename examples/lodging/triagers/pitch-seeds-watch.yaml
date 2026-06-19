@@ -1,0 +1,14 @@
+inputs:
+  source: scheduled/pitch-seeds
+handler:
+  kind: python
+  path: triagers/handlers/pitch_seed.py
+metadata:
+  # Normal seeds batch into the daily `seeds` digest. severity=="high" (the rare
+  # xz-scale seed) ALSO routes to `urgent_pipe`, jumping the daily queue while
+  # `seeds` stays a never-drop floor -- see the handler's _route. Both name real
+  # pipes; target_pipe is cross-ref validated at load, but urgent_pipe is NOT
+  # (the handler floor covers that gap; engine follow-up recommended in the
+  # tender). clearance_pipe is omitted because seeds never recover/clear.
+  target_pipe: seeds
+  urgent_pipe: now
