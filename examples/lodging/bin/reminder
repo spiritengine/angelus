@@ -32,8 +32,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import reminder_store as rs  # noqa: E402  (path injected above)
 
 
+def _default_store() -> str:
+    """The store path the daemon's drip reads, resolved from THIS script's own
+    location (``<lodging>/bin/reminder`` -> ``<lodging>/state/reminders.jsonl``).
+
+    The CLI goes on PATH like notify-pat, so it is run from arbitrary cwds. A
+    cwd-relative default (rs.DEFAULT_STORE) would write to ``./state/...`` wherever
+    the user happens to be -- a store the daemon never reads. Resolving from
+    ``__file__`` makes ``reminder add`` write the SAME store the drip drains no
+    matter where it is invoked. ``resolve()`` follows the PATH symlink to the real
+    script in the lodging bin, so ``.parent.parent`` is the lodging root. (This is
+    correct ``__file__`` use: the script genuinely lives in the lodging, unlike the
+    engine-repo derivation CLAUDE.md warns against.) --store / $REMINDER_STORE
+    still override, e.g. for tests.
+    """
+    return str(Path(__file__).resolve().parent.parent / "state" / "reminders.jsonl")
+
+
 def _store_path(args: argparse.Namespace) -> str:
-    return args.store or os.environ.get("REMINDER_STORE", rs.DEFAULT_STORE)
+    return args.store or os.environ.get("REMINDER_STORE") or _default_store()
 
 
 def parse_date(token: str, today: date) -> date:

@@ -724,6 +724,34 @@ def test_reminder_cards_renders_store_corrupt() -> None:
     assert "2 malformed line(s)" in rendered
 
 
+def test_cli_default_store_is_lodging_relative_not_cwd(tmp_path: Path) -> None:
+    """The CLI goes on PATH and is run from arbitrary cwds. With no --store and no
+    $REMINDER_STORE it must write the store relative to ITS OWN location (the
+    deployed <lodging>/bin/reminder -> <lodging>/state/), not the caller's cwd --
+    otherwise the daemon (cwd=lodging root) never sees the reminder."""
+    import os
+    import shutil
+
+    root = tmp_path / "lodging"
+    (root / "bin").mkdir(parents=True)
+    shutil.copy(CLI, root / "bin" / "reminder")
+    shutil.copy(BIN / "reminder_store.py", root / "bin" / "reminder_store.py")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    env = {k: v for k, v in os.environ.items() if k != "REMINDER_STORE"}
+    result = subprocess.run(
+        [sys.executable, str(root / "bin" / "reminder"), "add", "2030-01-01", "from anywhere"],
+        cwd=str(elsewhere),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (root / "state" / "reminders.jsonl").exists(), "store resolves to <lodging>/state"
+    assert not (elsewhere / "state").exists(), "must NOT write relative to cwd"
+
+
 def test_cli_overflow_relative_date_clean_error(tmp_path: Path) -> None:
     store = tmp_path / "reminders.jsonl"
     r1 = _cli("add", "+999999999999d", "x", store=store)
