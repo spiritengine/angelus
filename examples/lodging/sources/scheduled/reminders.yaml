@@ -1,0 +1,27 @@
+cadence: 10m
+check:
+  kind: shell
+  # The reminder drip. Agents (or Patrick) file dated reminders into
+  # state/reminders.jsonl via the `reminder` CLI; this fast source drains the
+  # OLDEST DUE unfired reminder (fire_date <= local today) per tick, stamps
+  # fired_at, and prints ONE observation whose `state` is the reminder id.
+  #
+  # `state` is the observation-collapse token: the reminder id (random per add).
+  # Distinct reminders are distinct states, so N reminders due the same day drain
+  # one-per-tick into N observations with no engine change; a tick with nothing
+  # due prints state="idle", which collapses to no observation. A torn store
+  # prints state="store-corrupt" (one incident).
+  #
+  # 10m cadence: the due-flip happens at local midnight and the reminders digest
+  # renders in the morning, an hours-wide window -- 10m drains dozens of same-day
+  # reminders well before it, and recovers same-day if the daemon was briefly
+  # down around the window. The drip also prunes fired rows older than 30 days
+  # each tick (safe: random ids never recur).
+  #
+  # cwd is the lodging root (the daemon's working directory), so the relative
+  # bin/ and state/ paths resolve there. The live store is written by the
+  # `reminder` CLI; this examples tree ships the contract + fixtures only.
+  command: python3 bin/reminder_drip.py state/reminders.jsonl
+  # A file read + prune; well under the 30s default, but pinned short because a
+  # drip that ever hangs should fail fast rather than stall the fire loop.
+  timeout_seconds: 15

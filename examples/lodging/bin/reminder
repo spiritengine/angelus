@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""``reminder`` -- file agent-authored reminders for the angelus daily digest.
+
+A reminder is a calendar date plus a message: it surfaces ONCE in the daily
+``reminders`` digest on (or near) its date, then retires. Any agent (cast, spin,
+mill) or Patrick can file one -- it goes on PATH like notify-pat, so when an
+agent learns of a dated obligation (a CFP, a renewal, "revisit after the deploy
+settles") it has somewhere durable to park it.
+
+    reminder add 2026-08-25 "check the thing"        # fire on Aug 25
+    reminder add +3w "ping me about X"               # fire 3 weeks from today
+    reminder add 2026-09-01 --lead 3d "CFP closes"   # fire Aug 29; deadline Sep 1
+    reminder ls                                       # pending + recently fired
+    reminder done 9ed0                                # cancel/clear by id prefix
+
+The store and the daemon's drip source share reminder_store.py (beside this
+script). The CLI's date math uses the SAME local zone (reminder_store.local_today
+/ REMINDER_TZ) the drip compares against, so a reminder filed for "today" and the
+tick that fires it agree on what "today" is.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from datetime import date, timedelta
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import reminder_store as rs  # noqa: E402  (path injected above)
+
+
+def _store_path(args: argparse.Namespace) -> str:
+    return args.store or os.environ.get("REMINDER_STORE", rs.DEFAULT_STORE)
+
+
+def parse_date(token: str, today: date) -> date:
+    """Parse a date token: ISO ``YYYY-MM-DD`` or relative ``+Nd`` / ``+Nw``.
+
+    Relative tokens are calendar arithmetic off ``today`` (the local-zone today,
+    so a ``+3d`` filed late in the day still lands on the right calendar date),
+    NOT ``now + 24h`` timestamp math. Raises ValueError on anything else.
+    """
+    token = token.strip()
+    if token.startswith("+") and len(token) >= 3 and token[-1] in ("d", "w"):
+        try:
+            n = int(token[1:-1])
+        except ValueError:
+            raise ValueError(f"bad relative date {token!r} (want +Nd or +Nw)")
+        if n < 0:
+            raise ValueError(f"relative date must not be negative: {token!r}")
+        days = n * (7 if token[-1] == "w" else 1)
+        try:
+            return today + timedelta(days=days)
+        except OverflowError:
+            raise ValueError(f"relative date too far out: {token!r}")
+    try:
+        return date.fromisoformat(token)
+    except ValueError:
+        raise ValueError(
+            f"bad date {token!r} (want YYYY-MM-DD, +Nd, or +Nw)"
+        )
+
+
+def parse_lead(token: str) -> int:
+    """Parse a lead token ``Nd`` / ``Nw`` into a non-negative number of days."""
+    token = token.strip()
+    if len(token) >= 2 and token[-1] in ("d", "w"):
+        try:
+            n = int(token[:-1])
+        except ValueError:
+            raise ValueError(f"bad lead {token!r} (want Nd or Nw)")
+        if n < 0:
+            raise ValueError(f"lead must not be negative: {token!r}")
+        return n * (7 if token[-1] == "w" else 1)
+    raise ValueError(f"bad lead {token!r} (want Nd or Nw, e.g. 3d or 2w)")
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    store = _store_path(args)
+    today = rs.local_today()
+    try:
+        given = parse_date(args.date, today)
+    except ValueError as exc:
+        print(f"reminder: {exc}", file=sys.stderr)
+        return 2
+
+    deadline: date | None = None
+    fire = given
+    if args.lead is not None:
+        try:
+            lead_days = parse_lead(args.lead)
+        except ValueError as exc:
+            print(f"reminder: {exc}", file=sys.stderr)
+            return 2
+        # With --lead the positional date is the DEADLINE; fire that many days
+        # before it. The deadline is stored as data so the digest can render
+        # "in N days" at render time.
+        deadline = given
+        try:
+            fire = given - timedelta(days=lead_days)
+        except OverflowError:
+            print(f"reminder: lead {args.lead!r} pushes the fire date out of range",
+                  file=sys.stderr)
+            return 2
+
+    message = " ".join(args.message).strip()
+    if not message:
+        print("reminder: message must be non-empty", file=sys.stderr)
+        return 2
+
+    try:
+        reminder = rs.make_reminder(
+            fire.isoformat(),
+            message,
+            deadline=deadline.isoformat() if deadline else None,
+            severity=args.severity,
+            created_by=args.by or os.environ.get("USER") or "cli",
+        )
+        rs.add_reminder(store, reminder)
+    except ValueError as exc:
+        print(f"reminder: {exc}", file=sys.stderr)
+        return 2
+
+    short = reminder["id"][:8]
+    when = _describe_fire(fire, today)
+    print(f"filed {short}: {message} (fires {fire.isoformat()}, {when})")
+    if fire < today:
+        print(
+            f"reminder: fire date {fire.isoformat()} is in the PAST -- it will "
+            "surface in the next digest. Was that the year you meant?",
+            file=sys.stderr,
+        )
+    elif fire == today:
+        print(
+            "reminder: fires TODAY -- it lands in the next digest only if that "
+            "has not rendered yet today; otherwise tomorrow.",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def _describe_fire(fire: date, today: date) -> str:
+    delta = (fire - today).days
+    if delta == 0:
+        return "today"
+    if delta == 1:
+        return "tomorrow"
+    if delta > 1:
+        return f"in {delta} days"
+    if delta == -1:
+        return "yesterday"
+    return f"{-delta} days ago"
+
+
+def cmd_ls(args: argparse.Namespace) -> int:
+    store = _store_path(args)
+    reminders = rs.load_reminders(store)
+    pending = [r for r in reminders if r.get("fired_at") is None]
+    fired = [r for r in reminders if r.get("fired_at") is not None]
+    pending.sort(key=lambda r: r["fire_date"])
+    fired.sort(key=lambda r: str(r.get("fired_at")), reverse=True)
+
+    if not pending and not fired:
+        print("no reminders")
+        return 0
+
+    # Plain one-per-line output (screen-reader friendly): no tables, no columns.
+    for r in pending:
+        print(f"pending {r['fire_date']} {r['message']} {r['id'][:8]}")
+    for r in fired:
+        fired_day = str(r.get("fired_at", ""))[:10]
+        print(f"fired {fired_day} {r['message']} {r['id'][:8]}")
+    return 0
+
+
+def cmd_done(args: argparse.Namespace) -> int:
+    store = _store_path(args)
+    try:
+        removed = rs.remove_reminder(store, args.id)
+    except ValueError as exc:
+        print(f"reminder: {exc}", file=sys.stderr)
+        return 2
+    if removed is None:
+        print(f"reminder: no reminder matches {args.id!r}", file=sys.stderr)
+        return 1
+    print(f"removed {removed['id'][:8]}: {removed.get('message')}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="reminder", description="File reminders for the angelus daily digest."
+    )
+    parser.add_argument(
+        "--store",
+        default=None,
+        help="store path (default: $REMINDER_STORE or state/reminders.jsonl)",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    add = sub.add_parser("add", help="file a reminder")
+    add.add_argument("date", help="fire date: YYYY-MM-DD, +Nd, or +Nw")
+    add.add_argument("message", nargs="+", help="the reminder text")
+    add.add_argument(
+        "--lead",
+        default=None,
+        help="treat DATE as the deadline; fire this long before it (Nd or Nw)",
+    )
+    add.add_argument("--severity", default="low", help="finding severity (default low)")
+    add.add_argument("--by", default=None, help="who filed it (default $USER)")
+    add.set_defaults(func=cmd_add)
+
+    ls = sub.add_parser("ls", help="list pending + recently fired reminders")
+    ls.set_defaults(func=cmd_ls)
+
+    done = sub.add_parser("done", help="cancel/clear a reminder by id or id prefix")
+    done.add_argument("id", help="reminder id or a unique prefix")
+    done.set_defaults(func=cmd_done)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

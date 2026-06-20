@@ -1,0 +1,24 @@
+{# Reminder cards for the daily `reminders` digest. Renders one card per reminder
+   finding routed to this pipe since the last drain. Inline `{{ }}` only and
+   `{% ... -%}` whitespace control -- the Environment uses trim_blocks=True, so a
+   bare `{% endfor %}` at end-of-line eats the per-iteration newline and collapses
+   the cards onto one line. See seed-cards.j2 for the same footgun.
+
+   The card shows the bare deadline DATE (not a computed "in N days"): the digest
+   renders hours after the drip stamped the finding, so a countdown baked at emit
+   time would be stale -- the date is correct whenever it renders. #}
+{% if findings_since_last_drain %}
+Reminders ({{ findings_since_last_drain|length }}):
+{% for f in findings_since_last_drain -%}
+{% if f.type == "store_corrupt" -%}
+- [{{ f.severity|default("high", true) }}] reminder store corruption -- {{ f.body.malformed_lines|default("?", true) }} malformed line(s)
+  preserved in state/reminders.jsonl -- inspect and repair so the row drains
+{% else -%}
+- {{ f.body.message|default(f.entity, true) }}
+{% if f.body.deadline %}  deadline: {{ f.body.deadline }}
+{% endif -%}
+{% endif -%}
+{% endfor -%}
+{% else %}
+No reminders today.
+{% endif %}

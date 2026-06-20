@@ -1,0 +1,39 @@
+# The reminder digest. Low-urgency, daily: batches every reminder the drip
+# surfaced since the last drain into ONE notification. Reminders are dated
+# obligations Patrick (or an agent) filed -- never an emergency -- so this is its
+# own pipe, NOT `now`. (The rare store_corrupt alert is the exception: the
+# triager routes THAT to `now` directly, jumping this queue.)
+#
+# Its OWN pipe, NOT the ops `daily` pipe, and deliberately so: `daily` renders
+# open_incidents/recent_closures/suppressed_findings on top of new findings, and
+# a reminder finding opens a catalog incident that never clears (reminders fire
+# once and retire). Routed to `daily`, every fired reminder would re-appear in
+# every future digest. This pipe renders ONLY findings_since_last_drain -- the
+# same one-shot shape the `seeds` pipe uses -- so each reminder shows exactly once.
+#
+# 7:30 AM local time. CronTrigger.from_crontab() defaults the trigger timezone to
+# LOCAL, so this fires at 07:30 in the box's local TZ -- between the ops digest
+# (07:00) and the seeds digest (08:00), keeping the three morning reports
+# distinct. The drip's local-today due-flip uses the SAME local zone, so a
+# reminder due "today" has already drained by the time this renders.
+cadence: "30 7 * * *"
+# No max_interval (delivery SLA) on purpose: a day with nothing due drips nothing,
+# and a digest with nothing pending does not send (PipeDrain skips the same-day
+# empty case). An SLA here would false-page on every quiet day. Reminder loss is
+# guarded by the drip's fired_at stamp and the catalog emission gate, not by a
+# delivery deadline.
+channels:
+  - email
+  - push
+render:
+  preamble:
+    # Deterministic reminder cards on the email leg (and the structured
+    # push-compact summary lists each new finding). message/fire_date/deadline
+    # ride through the finding body; the chronicler body below adds synthesis.
+    - kind: structured
+      template: reminder-cards
+  body:
+    kind: llm
+    mantle: chronicler
+    inputs:
+      - findings_since_last_drain
