@@ -319,6 +319,8 @@ def test_digest_partial_channel_failure_does_not_resend_success_channel(
     monkeypatch.setattr(pipe_runner, "send_push", fake_push)
     monkeypatch.setattr(pipe_runner, "send_email", fake_email)
     monkeypatch.setattr(PipeDrain, "_render_llm_body", fake_llm)
+    # Digest sends now retry-with-backoff (issue-20260620-rnoh); no real sleeps.
+    monkeypatch.setattr(pipe_runner, "DIGEST_SEND_BACKOFF_SECONDS", (0.0, 0.0))
 
     try:
         asyncio.run(drain.drain_once())
@@ -369,7 +371,10 @@ def test_digest_partial_channel_failure_does_not_resend_success_channel(
     assert first_queue["next_attempt_at"] is None
     assert first_drain_at is not None
     assert len(push_messages) == 1
-    assert email_attempts == 1
+    # email fails every attempt, so the digest retry (issue-20260620-rnoh) exhausts
+    # all attempts within the one drain; the SUCCESS channel (push) is still sent
+    # exactly once -- a failing channel's retries never resend a co-routed success.
+    assert email_attempts == pipe_runner.DIGEST_SEND_ATTEMPTS
     assert [row["channel"] for row in failed_dispatches] == ["email"]
     assert failed_dispatches[0]["last_error"] == "email broke"
     assert internal["type"] == "channel_unhealthy"
@@ -651,12 +656,15 @@ def test_digest_channel_success_resets_failure_counter(tmp_path, monkeypatch) ->
         + ["ok"]
         + ["fail"] * (MAX_RETRY_ATTEMPTS - 1)
     )
-    cycle_index = {"i": 0}
+    # The digest failure COUNTER is per-DRAIN: one outcome per cycle, reset by a
+    # successful cycle. The send now retries within a failing drain
+    # (issue-20260620-rnoh), so outcomes are indexed per-drain (set in the loop),
+    # not per fake_email call -- every retry in a failing cycle sees the same
+    # "fail", and the drain records exactly one counter increment.
+    current = {"outcome": "ok"}
 
     async def fake_email(_channel, _subject: str, _body: str, _workdir: Path) -> None:
-        outcome = cycle_outcomes[cycle_index["i"]]
-        cycle_index["i"] += 1
-        if outcome == "fail":
+        if current["outcome"] == "fail":
             raise RuntimeError("smtp dead")
 
     async def fake_llm(self, _pipe, _structured):
@@ -665,9 +673,11 @@ def test_digest_channel_success_resets_failure_counter(tmp_path, monkeypatch) ->
     monkeypatch.setattr(pipe_runner, "send_email", fake_email)
     monkeypatch.setattr(PipeDrain, "_render_llm_body", fake_llm)
     monkeypatch.setattr(pipe_runner, "_is_same_utc_day", lambda *_args: False)
+    monkeypatch.setattr(pipe_runner, "DIGEST_SEND_BACKOFF_SECONDS", (0.0, 0.0))
 
     try:
-        for cycle in range(len(cycle_outcomes)):
+        for cycle, outcome in enumerate(cycle_outcomes):
+            current["outcome"] = outcome
             catalog.write_finding(
                 None,
                 {
@@ -694,8 +704,9 @@ def test_digest_channel_success_resets_failure_counter(tmp_path, monkeypatch) ->
     finally:
         connection.close()
 
-    assert cycle_index["i"] == len(cycle_outcomes)
     assert final_attempts_row is not None
+    # The mid-run "ok" cycle reset the per-channel counter, so the trailing
+    # (MAX-1) failed cycles leave it at MAX-1 -- below threshold, never unhealthy.
     assert int(final_attempts_row["attempts"]) == MAX_RETRY_ATTEMPTS - 1
     assert final_health == []
 
@@ -720,6 +731,8 @@ def test_digest_attempts_send_even_when_channel_marked_unhealthy(
 
     monkeypatch.setattr(pipe_runner, "send_email", fake_email)
     monkeypatch.setattr(PipeDrain, "_render_llm_body", fake_llm)
+    # Digest sends now retry-with-backoff (issue-20260620-rnoh); no real sleeps.
+    monkeypatch.setattr(pipe_runner, "DIGEST_SEND_BACKOFF_SECONDS", (0.0, 0.0))
 
     try:
         catalog.write_finding(
@@ -744,7 +757,10 @@ def test_digest_attempts_send_even_when_channel_marked_unhealthy(
     finally:
         connection.close()
 
-    assert len(attempts) == 1
+    # The digest attempts an already-unhealthy channel (unlike the immediate path,
+    # which skips it) and now retries within the drain (issue-20260620-rnoh), so
+    # all attempts are spent before the single failed dispatch is recorded.
+    assert len(attempts) == pipe_runner.DIGEST_SEND_ATTEMPTS
     assert dispatch is not None
     assert dispatch["status"] == "failed"
     assert dispatch["last_error"] == "still broken"

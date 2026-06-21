@@ -34,6 +34,16 @@ LOGGER = logging.getLogger(__name__)
 # order, flip this string too. fell-r1 BLOCK #1.
 LLM_FALLBACK_FOOTER = "LLM digest body unavailable — see structured data below."
 
+# Digest-path send retry (issue-20260620-rnoh). The digest opens a
+# channel_unhealthy incident on the FIRST failed send, so a single transient
+# Telegram/SMTP hiccup latches a multi-hour belfry page until the next successful
+# send (~24h on the low-traffic push channel). _send_channel_with_retry re-attempts
+# the transport this many times, sleeping the backoff between, before letting the
+# failure open the incident -- absorbing the transient case. The immediate path is
+# deliberately NOT retried here (it fails fast and fails over to channel.backup).
+DIGEST_SEND_ATTEMPTS = 3
+DIGEST_SEND_BACKOFF_SECONDS = (2.0, 5.0)
+
 # Where each digest drain stages the chronicler prompt, and how many to keep.
 DEFAULT_DIGEST_STAGING_DIRNAME = "digest-staging"
 DEFAULT_DIGEST_STAGING_KEEP = 30
@@ -892,7 +902,7 @@ class PipeDrain:
             # counter and the channel could never recover without a daemon
             # restart.
             try:
-                await self._send_channel(channel, payload, subject)
+                await self._send_channel_with_retry(channel, payload, subject)
             except Exception as exc:
                 failed += 1  # B25: this digest send attempt raised.
                 # The daily digest is the routine-delivery contract; a failed
@@ -1157,13 +1167,97 @@ class PipeDrain:
         # overlay never touches the channel's real config -- it is a pure
         # in-memory check, so it adds no blocking work and the no-hang shutdown
         # bound is unaffected.
+        #
+        # The IMMEDIATE path uses this single-attempt send on purpose: it is
+        # designed to fail FAST and fail OVER to channel.backup (B13), so an
+        # in-send retry here would only delay that failover. In-send retry is the
+        # digest path's tool (see _send_channel_with_retry), where there is no
+        # failover and a single transient timeout otherwise latches a multi-hour
+        # page (issue-20260620-rnoh).
         self.faults.raise_if_armed(channel.name)
+        await self._dispatch_to_channel(channel, message, subject)
+
+    async def _dispatch_to_channel(
+        self, channel: Channel, message: str, subject: str
+    ) -> None:
+        """The raw transport send, with NO fault injection and NO retry.
+
+        Split out so the digest retry wrapper can re-attempt the real transport
+        without re-running fault injection (a B28 armed fault must raise ONCE, not
+        once per retry) -- _send_channel_with_retry raises the fault itself, then
+        retries only this.
+        """
         if channel.kind == "push":
             await send_push(channel, message, self.workdir)
         elif channel.kind == "email":
             await send_email(channel, subject, message, self.workdir)
         else:
             raise RuntimeError(f"unsupported channel kind: {channel.kind}")
+
+    async def _send_channel_with_retry(
+        self, channel: Channel, message: str, subject: str
+    ) -> None:
+        """Digest-path send: bounded retry-with-backoff around the transport.
+
+        A single Telegram/SMTP hiccup (the 30s push timeout in
+        issue-20260620-rnoh) must not latch a multi-hour belfry page. The digest
+        path opens an internal/dispatch `channel_unhealthy` incident on the FIRST
+        failed send (unlike the immediate path, which ladders to a threshold), so
+        without retry one transient blip pages until the next successful send --
+        ~24h on the low-traffic push channel. Retrying the transport here absorbs
+        the transient case so no incident opens at all.
+
+        Fault injection is raised ONCE up front (not retried): a B28 armed fault
+        is a test/persistent signal, so it propagates immediately exactly as
+        before, keeping the digest fault-injection escalation tests intact. Only a
+        real transport exception is retried. CancelledError (daemon shutdown)
+        propagates immediately and is never slept through.
+
+        AT-LEAST-ONCE, not exactly-once. A non-zero CLI exit means the send did
+        not happen -- safe to retry. A timeout is best-effort: it almost always
+        means a stuck connection that never delivered, but it CAN rarely straddle a
+        successful send (notify-pat delivered, then hung before exit), so a retry
+        would double-post. This is the same at-least-once trade-off the whole
+        system makes (emit-then-stamp, the immediate cross-drain ladder, the
+        next-day digest re-send): a rare duplicate digest is preferred over a
+        silently-missed one. This change does not introduce the edge -- the digest
+        already re-sent on the next cycle after a failure; it only narrows the
+        re-send window from ~24h to seconds, and removes the multi-hour false page.
+
+        Worst case on a genuinely-dead channel is attempts * per-send-timeout +
+        the backoffs (~97s for push), paid once per daily digest -- acceptable for
+        a non-latency-sensitive digest, and the channel still escalates after. The
+        rarer "real outage straddling the digest" case is the residual the active
+        re-probe follow-up (issue option 3) would close.
+        """
+        self.faults.raise_if_armed(channel.name)
+        last_exc: Exception | None = None
+        for attempt in range(1, DIGEST_SEND_ATTEMPTS + 1):
+            try:
+                await self._dispatch_to_channel(channel, message, subject)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= DIGEST_SEND_ATTEMPTS:
+                    raise
+                delay = DIGEST_SEND_BACKOFF_SECONDS[
+                    min(attempt - 1, len(DIGEST_SEND_BACKOFF_SECONDS) - 1)
+                ]
+                LOGGER.warning(
+                    "pipe digest: channel %s send attempt %d/%d failed, "
+                    "retrying in %.0fs: %s",
+                    channel.name,
+                    attempt,
+                    DIGEST_SEND_ATTEMPTS,
+                    delay,
+                    exc,
+                )
+                await asyncio.sleep(delay)
+        # Unreachable (the loop returns or raises), but keeps type-checkers happy.
+        assert last_exc is not None
+        raise last_exc
 
     def _structured_inputs(self, pipe: Pipe, last_drain_at: str | None) -> dict[str, Any]:
         open_incidents = self.catalog.open_incidents()
