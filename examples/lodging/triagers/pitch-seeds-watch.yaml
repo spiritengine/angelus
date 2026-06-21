@@ -7,8 +7,8 @@ metadata:
   # Normal seeds batch into the daily `seeds` digest. severity=="high" (the rare
   # xz-scale seed) ALSO routes to `urgent_pipe`, jumping the daily queue while
   # `seeds` stays a never-drop floor -- see the handler's _route. Both name real
-  # pipes; target_pipe is cross-ref validated at load, but urgent_pipe is NOT
-  # (the handler floor covers that gap; engine follow-up recommended in the
-  # tender). clearance_pipe is omitted because seeds never recover/clear.
+  # pipes; both target_pipe and urgent_pipe are cross-ref validated at load
+  # (a typo fails the config -- finding-20260619-dle0), with the handler floor as
+  # defense-in-depth beneath that. clearance_pipe is omitted: seeds never clear.
   target_pipe: seeds
   urgent_pipe: now

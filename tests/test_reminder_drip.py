@@ -325,8 +325,10 @@ def test_idle_observation_yields_no_finding() -> None:
 
 
 def test_typod_urgent_pipe_still_delivers_via_floor() -> None:
-    """urgent_pipe is NOT cross-ref validated at load, so a typo must not be able
-    to drop the alert -- the daily reminders pipe stays a never-drop floor."""
+    """urgent_pipe is now cross-ref validated at load (finding-20260619-dle0), so a
+    typo fails the config -- but the handler floor stays as defense-in-depth: were
+    an unknown urgent_pipe ever to reach the handler, the daily reminders pipe is a
+    never-drop floor and the alert still delivers. This exercises that floor."""
     findings = _run_handler(
         rs.corruption_observation(1),
         {"target_pipe": "reminders", "urgent_pipe": "nwo"},  # typo

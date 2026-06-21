@@ -24,10 +24,10 @@ finding.
 Routing: low/medium seeds -> the daily `seeds` pipe (metadata.target_pipe).
 severity == "high" (rare, xz-scale) -> the urgent `now` pipe
 (metadata.urgent_pipe) AS WELL, jumping the daily queue while keeping the daily
-pipe as a never-drop floor (see _route -- urgent_pipe is not cross-ref
-validated at load, so an unknown urgent_pipe must not be able to drop the seed).
-Per-finding target_pipes is the same mechanism the canary/http handlers use to
-route by severity; no engine change.
+pipe as a never-drop floor (see _route). urgent_pipe is cross-ref validated at
+load now (finding-20260619-dle0), so a typo fails the config; the floor stays as
+defense-in-depth beneath that. Per-finding target_pipes is the same mechanism the
+canary/http handlers use to route by severity; no engine change.
 """
 
 from __future__ import annotations
@@ -122,20 +122,14 @@ def _route(severity: str, target_pipe: str, urgent_pipe: str) -> list[str]:
 
     A normal seed batches into the daily `target_pipe`. The rare severity=="high"
     (xz-scale) seed ADDITIONALLY routes to `urgent_pipe` ahead of it, jumping the
-    daily queue. Crucially the daily pipe stays a FLOOR beneath the urgent jump:
-    lodging/config.py cross-ref validates target_pipe but NOT urgent_pipe, so a
-    typo (`urgent_pipe: nwo`) is an unknown pipe the engine silently skips at
-    enqueue -- and with no floor that high seed would be dropped AND its now-open
-    incident would suppress the corrected re-alert (silently lost forever, the
-    failure this source exists to prevent). Keeping the daily pipe in the list
-    guarantees the seed is delivered even when urgent_pipe is unknown; if
-    urgent_pipe is valid the seed is also pushed urgently. Order preserved, dups
-    collapsed (urgent_pipe may equal target_pipe).
-
-    Engine follow-up (separate, human's call -- see the tender): extend the
-    config.py cross-ref validator to check urgent_pipe like target_pipe, which
-    would catch the typo at load and make this floor a belt over a fixed
-    suspender rather than the only line of defense.
+    daily queue. lodging/config.py now cross-ref validates urgent_pipe too
+    (finding-20260619-dle0), so a typo (`urgent_pipe: nwo`) fails the config at
+    load rather than being silently skipped at enqueue. The daily pipe is kept as
+    a FLOOR beneath the urgent jump anyway -- defense-in-depth: were an unknown
+    urgent_pipe ever to reach here, the seed would still deliver (and its now-open
+    incident would not suppress a corrected re-alert -- the silent-loss failure
+    this source exists to prevent). Order preserved, dups collapsed (urgent_pipe
+    may equal target_pipe).
     """
     pipes = [urgent_pipe, target_pipe] if severity == "high" else [target_pipe]
     seen: set[str] = set()

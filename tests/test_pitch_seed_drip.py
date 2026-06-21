@@ -549,8 +549,9 @@ def test_concurrent_appends_and_drains_no_loss_no_corruption(tmp_path: Path) -> 
 
 def test_unknown_urgent_pipe_falls_back_to_seeds_floor() -> None:
     """WORTH-FIXING 3: a typo'd urgent_pipe (not a real pipe) must NOT drop the
-    seed -- the daily `seeds` floor still carries it. The high seed is never
-    silently lost even though urgent_pipe is unvalidated at load."""
+    seed -- the daily `seeds` floor still carries it. urgent_pipe is now validated
+    at load (finding-20260619-dle0), so a typo fails the config; this exercises the
+    handler floor that stays as defense-in-depth beneath that load-time check."""
     seed = _seed("cannon", "xz-scale", "ship now", severity="high", discovered_at="2026-06-19T10:00:00.000Z")
     obs = ss.seed_observation(seed)
     findings = _run_handler(obs, {"target_pipe": "seeds", "urgent_pipe": "nwo"})
@@ -1026,12 +1027,12 @@ def test_drip_main_emits_observation_before_stamping(
 
 
 def test_example_urgent_pipe_names_a_real_pipe() -> None:
-    """WORTH-FIXING 3 (config guard): the shipped example's urgent_pipe must name
-    a real pipe, since config.py does NOT cross-ref validate it at load."""
+    """The shipped example's urgent_pipe must name a real pipe. config.py now
+    cross-ref validates urgent_pipe at load (finding-20260619-dle0), so a bad value
+    would make load_lodging raise; this asserts the example is clean explicitly."""
     lodging = load_lodging(LODGING)
     triager = lodging.triagers["pitch-seeds-watch"]
     urgent_pipe = triager.metadata["urgent_pipe"]
     assert urgent_pipe in lodging.pipes, (
-        f"urgent_pipe {urgent_pipe!r} is not a real pipe (config.py does not "
-        f"catch this -- engine follow-up recommended)"
+        f"urgent_pipe {urgent_pipe!r} is not a real pipe"
     )

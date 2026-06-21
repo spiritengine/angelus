@@ -18,8 +18,10 @@ Routing: a normal reminder -> the daily `reminders` pipe (metadata.target_pipe),
 which renders only new findings (no incident recurrence). A store_corrupt
 observation (a possibly-lost reminder) -> the urgent `now` pipe
 (metadata.urgent_pipe) AS WELL, jumping the daily queue while keeping the daily
-pipe as a never-drop floor (urgent_pipe is not cross-ref validated at load, so an
-unknown urgent_pipe must not be able to drop the alert).
+pipe as a never-drop floor. urgent_pipe is cross-ref validated at load now
+(finding-20260619-dle0), so a typo fails the config; the floor stays as
+defense-in-depth -- were an unknown urgent_pipe ever to reach here it still
+could not drop the alert.
 """
 
 from __future__ import annotations
@@ -119,12 +121,13 @@ def _route(severity: str, target_pipe: str, urgent_pipe: str) -> list[str]:
 
     A normal reminder batches into the daily `target_pipe`. A high-severity
     finding (only the store_corrupt alert today) ADDITIONALLY routes to
-    `urgent_pipe` ahead of it. The daily pipe stays a FLOOR beneath the urgent
-    jump: config.py cross-ref validates target_pipe but NOT urgent_pipe, so a typo
-    (`urgent_pipe: nwo`) is an unknown pipe the engine silently skips at enqueue --
-    and with no floor the alert would be dropped AND its now-open incident would
-    suppress the corrected re-alert. Keeping the daily pipe in the list guarantees
-    delivery even when urgent_pipe is unknown. Order preserved, dups collapsed.
+    `urgent_pipe` ahead of it. config.py now cross-ref validates urgent_pipe too
+    (finding-20260619-dle0), so a typo (`urgent_pipe: nwo`) fails the config at
+    load rather than being silently skipped at enqueue. The daily pipe is kept as
+    a FLOOR beneath the urgent jump anyway -- defense-in-depth: were an unknown
+    urgent_pipe ever to reach here, the alert would still deliver (and its now-open
+    incident would not suppress a corrected re-alert). Order preserved, dups
+    collapsed.
     """
     pipes = [urgent_pipe, target_pipe] if severity == "high" else [target_pipe]
     seen: set[str] = set()

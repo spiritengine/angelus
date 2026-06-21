@@ -107,9 +107,10 @@ Normal seeds batch into the daily `seeds` pipe. `severity == "high"` (rare,
 xz-scale) **also** routes to the urgent `now` pipe via the triager's per-finding
 `target_pipes`, jumping the daily queue — the same mechanism the canary/http
 handlers use; no engine change. The daily `seeds` pipe stays a **never-drop
-floor** beneath the urgent jump: `urgent_pipe` is not cross-ref validated at
-load (only `target_pipe` is), so a typo in it must not be able to drop the seed.
-See the handler's `_route`.
+floor** beneath the urgent jump: `urgent_pipe` is cross-ref validated at load now
+(finding-20260619-dle0), so a typo fails the config; the floor is
+defense-in-depth, so were an unknown `urgent_pipe` ever to reach it the seed still
+could not be dropped. See the handler's `_route`.
 
 ## Firing discipline
 

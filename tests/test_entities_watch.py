@@ -380,6 +380,40 @@ def test_load_lodging_rejects_synth_metadata_pipe_typo(tmp_path: Path) -> None:
         load_lodging(tmp_path)
 
 
+def test_load_lodging_rejects_urgent_pipe_typo(tmp_path: Path) -> None:
+    """A typo in a triager's metadata.urgent_pipe (the Pitch/reminders
+    severity-jump pipe) was previously caught only by the handler's never-drop
+    floor at runtime, never at load (finding-20260619-dle0). validate_cross_refs
+    now checks urgent_pipe too, so a bad urgent route fails the config instead of
+    relying on the floor.
+    """
+    (tmp_path / "sources" / "scheduled").mkdir(parents=True)
+    (tmp_path / "sources" / "scheduled" / "s.yaml").write_text(
+        "cadence: 10m\ncheck: {kind: shell, command: 'true'}\n", encoding="utf-8"
+    )
+    handler = tmp_path / "triagers" / "handlers" / "h.py"
+    handler.parent.mkdir(parents=True)
+    handler.write_text("pass\n", encoding="utf-8")
+    (tmp_path / "triagers" / "t.yaml").write_text(
+        "inputs: {source: scheduled/s}\n"
+        "handler: {kind: python, path: triagers/handlers/h.py}\n"
+        "metadata: {target_pipe: now, urgent_pipe: nwo}\n",  # urgent typo
+        encoding="utf-8",
+    )
+    (tmp_path / "pipes").mkdir()
+    (tmp_path / "pipes" / "now.yaml").write_text(
+        "cadence: immediate\nchannels: [email]\n"
+        "render:\n  kind: dumb-alert\n  template: '{type}'\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "channels").mkdir()
+    (tmp_path / "channels" / "email.yaml").write_text(
+        "kind: email\ncommand: 'true'\nto: x@example.com\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="missing pipe 'nwo'"):
+        load_lodging(tmp_path)
+
+
 def test_load_lodging_detects_synth_vs_handwritten_collision(tmp_path: Path) -> None:
     """If a hand-written sources/scheduled/foo.yaml exists with the same
     ref a watch would synthesize, the loader refuses to start instead of

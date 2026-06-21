@@ -9,13 +9,13 @@ metadata:
   # `daily` pipe -- a reminder is a one-shot, and `daily` additionally renders
   # open_incidents, so routing reminders there would re-show every fired reminder
   # in every future digest (its catalog incident stays open; reminders never
-  # clear). target_pipe is cross-ref validated at load.
+  # clear).
   #
   # A store-corruption observation (a possibly-lost reminder = a missed deadline)
   # ALSO routes to `urgent_pipe`, jumping the daily queue while `reminders` stays
-  # a never-drop floor -- see the handler's _route. urgent_pipe is NOT cross-ref
-  # validated at load (the handler floor covers that gap; engine follow-up
-  # recommended in the tender). clearance_pipe is omitted: reminders fire once and
-  # retire, they never recover/clear.
+  # a never-drop floor -- see the handler's _route. Both target_pipe and
+  # urgent_pipe are cross-ref validated at load (a typo fails the config --
+  # finding-20260619-dle0), with the handler floor as defense-in-depth beneath
+  # that. clearance_pipe is omitted: reminders fire once and retire, never clear.
   target_pipe: reminders
   urgent_pipe: now

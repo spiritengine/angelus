@@ -258,7 +258,13 @@ def validate_cross_refs(lodging: Lodging) -> list[str]:
         # silently drops every finding from that watch because
         # Catalog.write_finding skips unknown pipes. Same protection
         # extends to hand-written triagers that opt into the same shape.
-        for key in ("target_pipe", "clearance_pipe"):
+        #
+        # urgent_pipe (the Pitch/reminders severity-jump pipe) is checked too
+        # (finding-20260619-dle0): a typo'd urgent route was previously caught
+        # only by the handler's never-drop floor at runtime, never at load. The
+        # floor stays as defense-in-depth, but a load-time error is the earlier,
+        # louder catch -- a bad urgent_pipe now fails the config, it doesn't ship.
+        for key in ("target_pipe", "clearance_pipe", "urgent_pipe"):
             ref = triager.metadata.get(key)
             if ref is None:
                 continue
