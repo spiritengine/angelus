@@ -31,6 +31,7 @@ SUPPORTED_DIGEST_INPUTS = (
     "suppressed_findings",
     "recent_closures",
     "fixer_actions",
+    "informational_since_last_drain",
 )
 
 DISABLED_SUFFIX = ".disabled"

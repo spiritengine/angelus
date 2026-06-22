@@ -1281,9 +1281,11 @@ class PipeDrain:
             ),
             # The informational lane: one-shot content (seeds, reminders, other
             # systems' heads-ups) delivered through this pipe. Rendered
-            # deterministically in the email's "Updates" section, NOT handed to
-            # the chronicler (the daily body inputs do not list it), so the
-            # synthesis paragraph stays ops-framed.
+            # deterministically in the email's "Updates" section AND (when the
+            # daily body lists this input) handed to the chronicler, which is
+            # prompt-framed to mention it briefly after the ops summary and never
+            # lead with it -- so the synthesis covers the whole email while
+            # keeping ops primacy.
             "informational_since_last_drain": self.catalog.findings_for_pipe_since(
                 pipe.name, last_drain_at, lane="informational"
             ),
@@ -1382,14 +1384,23 @@ class PipeDrain:
             "no bulleted lists, no tables, no emoji, no horizontal rules.\n"
             "- Do not enumerate every item. The reader sees a structured "
             "list directly below your paragraph; do not duplicate it.\n"
-            "- Lead with the most severe or unusual item.\n"
+            "- Lead with the most severe or unusual OPERATIONAL item -- an open "
+            "incident, a new finding, a failed delivery. These are problems.\n"
+            "- The `informational_since_last_drain` items are UPDATES (build "
+            "seeds, reminders, heads-ups from other systems), NOT problems. "
+            "Mention them BRIEFLY at the END, after the operational summary "
+            "(e.g. 'Also: a couple of build seeds and a reminder'). NEVER lead "
+            "with an update, and never let one outrank an incident. If there is "
+            "no operational news, a one-line note on the updates is the whole "
+            "paragraph.\n"
             "- Use entity names (e.g. 'speakbot', 'example.com') when "
             "there are fewer than five things to mention; otherwise count "
             "and summarize by category.\n"
             "- Times in your prose should use local clock times when "
             "*_local fields are present (e.g. 'since Tue 21:07 EDT'), not "
             "the UTC originals.\n"
-            "- If nothing notable happened, say so in a single sentence.\n"
+            "- If nothing notable happened (no operational news and no "
+            "updates), say so in a single sentence.\n"
             "\n"
             "Structured inputs (JSON):\n"
             + json.dumps(inputs, sort_keys=True, default=str)

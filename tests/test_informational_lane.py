@@ -352,3 +352,74 @@ def test_updates_multi_item_does_not_collapse(tmp_path) -> None:
     # Each card on its own line (no collapse).
     card_lines = [ln for ln in out.splitlines() if ln.startswith("- ")]
     assert len(card_lines) == 4
+
+
+def test_chronicler_receives_informational_with_framing(tmp_path, monkeypatch) -> None:
+    """When daily.yaml lists informational_since_last_drain in body.inputs, the
+    chronicler prompt carries the informational items AND the framing rule
+    (mention briefly, never lead) so the summary covers the whole email."""
+    import asyncio
+    import json as _json
+
+    from angelus.lodging import Channel, Pipe
+    from angelus.pipes import PipeDrain
+    from angelus.pipes import runner as pipe_runner
+
+    catalog = _catalog(tmp_path)
+    catalog.write_finding(
+        None,
+        {
+            "source": "scheduled/informational",
+            "type": "info",
+            "entity": "u1",
+            "severity": "low",
+            "target_pipes": ["daily"],
+            "body": {"title": "nightly green", "source": "build-bot"},
+        },
+        {"daily"},
+        lane="informational",
+    )
+    pipe = Pipe(
+        name="daily",
+        cadence="0 7 * * *",
+        render_kind="digest",
+        template=None,
+        channels=["email"],
+        render={
+            "body": {
+                "kind": "llm",
+                "mantle": "chronicler",
+                "inputs": ["open_incidents", "informational_since_last_drain"],
+            }
+        },
+    )
+    channels = {"email": Channel(name="email", kind="email", command="true")}
+    drain = PipeDrain(catalog, pipe, channels, tmp_path, {"daily"})
+
+    captured: dict[str, str] = {}
+
+    async def capture_create(*args, **kwargs):
+        argv = list(args)
+        captured["message"] = Path(argv[argv.index("--message-file") + 1]).read_text(
+            encoding="utf-8"
+        )
+
+        class _Proc:
+            returncode = 0
+
+            async def communicate(self, stdin_bytes=None):
+                return b'{"result": "ok."}', b""
+
+        return _Proc()
+
+    monkeypatch.setattr(pipe_runner.asyncio, "create_subprocess_exec", capture_create)
+    asyncio.run(drain._render_llm_body(pipe, drain._structured_inputs(pipe, None)))
+
+    message = captured["message"]
+    # The framing rule is present.
+    assert "informational_since_last_drain` items are UPDATES" in message
+    assert "NEVER lead with an update" in message
+    # The informational data actually reached the chronicler payload.
+    payload = _json.loads(message.rsplit("Structured inputs (JSON):\n", 1)[1])
+    assert "informational_since_last_drain" in payload
+    assert payload["informational_since_last_drain"][0]["type"] == "info"
