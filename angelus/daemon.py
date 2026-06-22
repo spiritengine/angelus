@@ -2044,8 +2044,19 @@ class AngelusDaemon:
                 triager.name, triager.source_ref, new_state
             )
             for finding in findings:
+                # The lane is derived from the finding TYPE against the lodged
+                # informational_types set -- NOT from the triager -- so a triager
+                # that emits both informational content and a real condition
+                # (e.g. the seed/reminder handlers' `store_corrupt`) lanes each
+                # finding correctly. Empty set => every finding is a condition,
+                # the pre-lane behavior.
+                lane = (
+                    "informational"
+                    if str(finding.get("type")) in self.lodging.informational_types
+                    else "condition"
+                )
                 finding_id = self.catalog.write_finding(
-                    observation_id, finding, set(self.lodging.pipes)
+                    observation_id, finding, set(self.lodging.pipes), lane=lane
                 )
                 LOGGER.info("finding %s ready from observation %s", finding_id, observation_id)
             self.catalog.mark_triage_success(observation_id, triager.name)

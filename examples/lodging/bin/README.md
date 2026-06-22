@@ -123,3 +123,30 @@ minute of triage. Do not tune this for silence.
 The live `pitch` schedule that **writes** the store, the real cannons, and the
 live `state/pitch-seeds.jsonl`. This repo ships the contract and fixtures only —
 never real cannons or seed data.
+
+---
+
+# Informational inbox (`inform`)
+
+The generic producer front door for the **informational lane** (migration 0017).
+Any system drops a one-shot update — a build result, a heads-up, "CI flaked twice
+overnight" — and it surfaces **once** in the daily email under **Updates**,
+opening **no incident**.
+
+- `bin/inform add --source <label> [--body B] [--id ID] "<title>"` appends a
+  record to `state/informational.jsonl` (resolved from the script's own location,
+  like `reminder`, so it works from any cwd). `--id` is optional; a stable id
+  makes a re-drop idempotent.
+- `sources/scheduled/informational.yaml` (10m) runs `informational_drip.py`,
+  which drains **every** pending record into **one batch observation** (so a
+  burst does not serialise behind a one-per-tick reader).
+- `triagers/handlers/informational.py` fans the batch out into one `info` finding
+  per record, routed only to the daily digest (`metadata.target_pipe`), with a
+  **source-namespaced `dedup_key`** (`<source>:<id>`) so two producers cannot
+  silently collide. `info` is declared in `informational.yaml`, so the engine
+  lanes these informational; a torn-inbox `store_corrupt` is **not** listed and
+  stays a real condition (it opens an incident and jumps to `now`).
+
+A new producer needs no source/triager/handler of its own — it just calls
+`inform` (or appends a record). The live store and any real producers live in the
+private lodging repo, not this examples tree.

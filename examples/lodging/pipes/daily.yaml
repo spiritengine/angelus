@@ -27,6 +27,13 @@ render:
       template: rate-limit-callout
     - kind: structured
       template: incident-status
+    # The informational lane (migration 0017): one-shot content delivered into
+    # this one daily email under "Updates" -- seeds, reminders, heads-ups from
+    # other systems. Rendered deterministically here (a structured preamble),
+    # NOT handed to the chronicler synthesis, so the LLM paragraph stays
+    # ops-framed. Empty -> renders nothing.
+    - kind: structured
+      template: updates-cards
     # Behind-master deploy staleness (brief-20260613-3spy item 1c): a
     # low-severity, never-pages FYI that renders only when the installed pin
     # trails master past the staleness threshold. The push leg renders the same

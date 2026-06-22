@@ -590,11 +590,30 @@ class Catalog:
         observation_id: int | None,
         finding: dict[str, Any],
         known_pipes: set[str],
+        *,
+        lane: str = "condition",
     ) -> int:
         """Write a finding, gated on incident transitions (B30).
 
-        A finding registers (a row + pipe enqueue) only when it moves an
-        incident across an edge:
+        `lane` selects between the two delivery models (migration 0017):
+
+        - `condition` (default): the incident-bearing path below. A finding
+          opens/refreshes an incident and the B30 gate dedups on the open
+          incident.
+        - `informational`: a one-shot content delivery (seed, reminder, a
+          heads-up from another system). Written + enqueued but opens NO
+          incident -- it never appears in `open_incidents()` and never needs a
+          clearance. With no incident to dedup against, the gate instead drops a
+          repeat against an existing DELIVERED (`ready`) informational row with
+          the same dedup_key: the at-least-once triage retry (write_finding then
+          mark_triage_success) re-emits the same finding, and this restores
+          exactly the "deliver once" the incident gate gave conditions. A
+          half-written (`writing`) row a crash never flipped to `ready` is
+          deliberately NOT matched, so startup recovery can fail it and the
+          retry re-delivers rather than silently dropping.
+
+        For a CONDITION finding the path is unchanged. A condition registers (a
+        row + pipe enqueue) only when it moves an incident across an edge:
 
         - A non-clearance finding emits only when it OPENS a NEW incident for
           its key (source, type, entity). A repeat while that incident is
@@ -606,13 +625,17 @@ class Catalog:
           that log/track a finding_id still reference the real opening row.
         - A clearance finding emits only when it CLOSES an open incident for
           (source, entity). A clearance with nothing open is a no-op and is
-          dropped; it returns _NO_FINDING (0).
+          dropped; it returns _NO_FINDING (0). Clearances are always
+          condition-laned -- an informational item never clears -- so a
+          clearance ignores `lane`.
 
         The pre-check is a plain SELECT before any write, so the dropped
         (common, under-a-flood) case touches neither the findings table nor
         the body store. This whole class is synchronous and self-committing,
         so the check-then-write below cannot interleave with another finding.
         """
+        if lane not in ("condition", "informational"):
+            raise ValueError(f"unknown finding lane {lane!r}")
         source = str(finding["source"])
         finding_type = str(finding["type"])
         entity = str(finding["entity"])
@@ -620,9 +643,28 @@ class Catalog:
         target_pipes = list(finding.get("target_pipes") or [])
         body = finding.get("body")
         body_obj = body if isinstance(body, dict) else {"text": body} if body else {}
+        # A clearance is inherently a condition recovery edge; never let an
+        # informational lane reach the incident-closing branch below.
+        informational = lane == "informational" and finding_type != "clearance"
 
         # --- EMISSION / RECOVERY GATE (B30) ---------------------------------
-        if finding_type == "clearance":
+        if informational:
+            # No incident to gate on. Dedup against an already-DELIVERED
+            # informational row with the same key (the retry case). `writing`
+            # rows are excluded so a crashed half-write does not block the
+            # retry -- see the docstring.
+            existing = self.connection.execute(
+                """
+                SELECT id FROM findings
+                WHERE dedup_key = ? AND lane = 'informational' AND status = 'ready'
+                ORDER BY id
+                LIMIT 1
+                """,
+                (dedup_key,),
+            ).fetchone()
+            if existing is not None:
+                return int(existing["id"])
+        elif finding_type == "clearance":
             # Recovery edge. _close_incident closes by (source, entity)
             # regardless of type, so the gate mirrors that key: a clearance
             # fires only when some open incident exists for the entity.
@@ -642,9 +684,9 @@ class Catalog:
             """
             INSERT INTO findings (
                 observation_id, source, type, entity, dedup_key, target_pipes,
-                status, severity, occurred_at, created_at
+                status, severity, occurred_at, created_at, lane
             )
-            VALUES (?, ?, ?, ?, ?, ?, 'writing', ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, 'writing', ?, ?, ?, ?)
             """,
             (
                 observation_id,
@@ -670,6 +712,9 @@ class Catalog:
                 # comparable; in production now_iso() equals the wall-clock
                 # default at insert, so this is behaviour-preserving there.
                 now,
+                # Stored lane. `informational` already excludes clearances, so a
+                # clearance always records 'condition' here.
+                "informational" if informational else "condition",
             ),
         )
         finding_id = int(cursor.lastrowid)
@@ -683,7 +728,13 @@ class Catalog:
             """,
             (body_ref, self._clock.now_iso(), finding_id),
         )
-        if finding_type == "clearance":
+        if informational:
+            # No incident lifecycle for the informational lane: the finding is
+            # delivered through its pipe(s) and recorded, full stop. This is the
+            # single behavioral fork of the lane -- everything else (row, body,
+            # pipe enqueue below) is the shared path.
+            pass
+        elif finding_type == "clearance":
             self._close_incident(source, entity, finding_id)
         else:
             opened_new = self._upsert_incident(
@@ -963,7 +1014,17 @@ class Catalog:
         pipe: str,
         since: str | None,
         exclude_types: tuple[str, ...] = (),
+        lane: str | None = None,
     ) -> list[dict[str, Any]]:
+        """Findings routed to `pipe` since `since`, in queue order.
+
+        `lane`, when given, restricts to one delivery lane. The daily digest's
+        `findings_since_last_drain` input passes lane='condition' so an
+        informational item routed to the same pipe is NOT also rendered in the
+        incident-framed section (it renders only in the Updates section, fed by
+        the lane='informational' read). With lane=None the read spans both
+        lanes (the pre-lane behavior).
+        """
         clauses: list[str] = []
         params: list[Any] = [pipe]
         if since:
@@ -973,6 +1034,9 @@ class Catalog:
             placeholders = ",".join("?" for _ in exclude_types)
             clauses.append(f"AND f.type NOT IN ({placeholders})")
             params.extend(exclude_types)
+        if lane is not None:
+            clauses.append("AND f.lane = ?")
+            params.append(lane)
         extra = " ".join(clauses)
         rows = self.connection.execute(
             f"""

@@ -1,0 +1,13 @@
+inputs:
+  source: scheduled/informational
+handler:
+  kind: python
+  path: triagers/handlers/informational.py
+metadata:
+  # The one digest informational items land in: the daily email's "Updates"
+  # section. Cross-ref validated at load (a typo fails the config). The intake
+  # routes EVERY record here -- it does not honour a per-record pipe (runtime
+  # data write_finding would silently drop on a typo). urgent_pipe carries only
+  # the store_corrupt CONDITION alert (a torn inbox), never content.
+  target_pipe: daily
+  urgent_pipe: now

@@ -166,7 +166,7 @@ def test_non_editable_install_locates_and_applies_migrations(
 
     # Every migration applied.
     assert report["versions"] == ALL_MIGRATIONS
-    assert len(report["versions"]) == 16
+    assert len(report["versions"]) == len(ALL_MIGRATIONS)
 
     # A known late-migration effect took: 0015 rebuilt observations to widen the
     # status CHECK to include 'consumed'. Its presence proves the chain ran to

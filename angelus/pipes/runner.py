@@ -1102,6 +1102,7 @@ class PipeDrain:
         new_findings = structured.get("findings_since_last_drain") or []
         closures = structured.get("recent_closures") or []
         suppressed = structured.get("suppressed_findings") or []
+        updates = structured.get("informational_since_last_drain") or []
 
         # Closures are counted in the summary line but deliberately not listed
         # as their own section: resolved items are good news, and the compact
@@ -1112,6 +1113,7 @@ class PipeDrain:
             (
                 f"{len(new_findings)} new finding(s), "
                 f"{len(open_incidents)} open incident(s), "
+                f"{len(updates)} update(s), "
                 f"{len(closures)} closed since last digest."
             ),
         ]
@@ -1142,6 +1144,14 @@ class PipeDrain:
                 f"{f.get('severity') or 'unknown'} "
                 f"{f.get('type') or ''} on {f.get('entity') or ''}".rstrip()
             ),
+        )
+        # Informational updates -- content, not conditions. Headlined by title
+        # (falling back to the body text or entity), never with a severity/type
+        # prefix, so the compact leg does not read them as incidents.
+        _section(
+            "Updates",
+            updates,
+            lambda u: _informational_headline(u),
         )
         if suppressed:
             lines.append("")
@@ -1262,8 +1272,20 @@ class PipeDrain:
     def _structured_inputs(self, pipe: Pipe, last_drain_at: str | None) -> dict[str, Any]:
         open_incidents = self.catalog.open_incidents()
         raw = {
+            # CONDITION-laned only. An informational item routed to this pipe is
+            # excluded here (it renders in `informational_since_last_drain`
+            # below) so it is never framed as an incident finding or fed to the
+            # ops chronicler synthesis.
             "findings_since_last_drain": self.catalog.findings_for_pipe_since(
-                pipe.name, last_drain_at, exclude_types=("clearance",)
+                pipe.name, last_drain_at, exclude_types=("clearance",), lane="condition"
+            ),
+            # The informational lane: one-shot content (seeds, reminders, other
+            # systems' heads-ups) delivered through this pipe. Rendered
+            # deterministically in the email's "Updates" section, NOT handed to
+            # the chronicler (the daily body inputs do not list it), so the
+            # synthesis paragraph stays ops-framed.
+            "informational_since_last_drain": self.catalog.findings_for_pipe_since(
+                pipe.name, last_drain_at, lane="informational"
             ),
             "suppressed_findings": self.catalog.suppressed_findings_since(last_drain_at),
             "open_incidents": open_incidents,
@@ -1643,6 +1665,23 @@ _LOCAL_TS_FIELDS = (
     "opened_at",
     "closed_at",
 )
+
+
+def _informational_headline(item: dict[str, Any]) -> str:
+    """A one-line headline for an informational item on the compact push leg.
+
+    Prefers the producer-supplied `title`, falling back to the body text and
+    then the entity. Deliberately carries NO severity/type prefix -- an update
+    is content, not a condition, and must not read like an incident headline.
+    """
+    body = item.get("body") if isinstance(item.get("body"), dict) else {}
+    title = str(body.get("title") or "").strip()
+    if title:
+        return title
+    text = str(item.get("body_text") or "").strip()
+    if text:
+        return text.splitlines()[0]
+    return str(item.get("entity") or "").strip()
 
 
 def _cap_digest_input(

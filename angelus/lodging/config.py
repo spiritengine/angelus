@@ -174,6 +174,16 @@ class Lodging:
     channels: dict[str, Channel]
     dependencies: dict[str, Dependency]
     fixers: dict[str, Fixer] = field(default_factory=dict)
+    # Finding TYPES that deliver on the informational lane (migration 0017):
+    # one-shot content (e.g. `info`, `seed`, `reminder`) delivered once, opening
+    # NO incident. The lane is derived from the finding TYPE -- not the triager
+    # -- because a single triager can emit both an informational content finding
+    # AND a real condition (the seed/reminder handlers also emit a high-severity
+    # `store_corrupt` that MUST stay an incident); a per-type set keeps
+    # `store_corrupt` a condition by omission. Empty by default, so a lodging
+    # that declares no informational types behaves exactly as before. Declared in
+    # the optional top-level informational.yaml.
+    informational_types: frozenset[str] = field(default_factory=frozenset)
 
 
 def load_lodging(root: Path) -> Lodging:
@@ -228,7 +238,19 @@ def load_lodging(root: Path) -> Lodging:
         channels=_load_channels(root),
         dependencies=_load_dependencies(root),
         fixers=_load_fixers(root),
+        informational_types=_load_informational_types(root),
     )
+    # informational_types is a top-level singleton, NOT a per-file entry in a
+    # watched dir, so the hot-reloader does not pick it up: it is applied at
+    # STARTUP and a change requires a daemon restart. Logging the loaded set
+    # here makes that explicit rather than silent -- an operator who edits
+    # informational.yaml live sees the unchanged set in the journal and knows a
+    # restart is needed.
+    if lodging.informational_types:
+        LOGGER.info(
+            "informational lane types (applied at startup; restart to change): %s",
+            sorted(lodging.informational_types),
+        )
     errors = validate_cross_refs(lodging)
     if errors:
         raise ValueError("; ".join(errors))
@@ -748,6 +770,48 @@ def _load_fixers(root: Path) -> dict[str, Fixer]:
         fixer = parse_fixer(root, path)
         loaded[fixer.name] = fixer
     return loaded
+
+
+def _load_informational_types(root: Path) -> frozenset[str]:
+    """Read the optional top-level informational.yaml.
+
+    Shape: `{types: [info, seed, reminder]}`. Absent file -> empty set (a
+    lodging with no informational producers, identical to pre-lane behavior).
+    Each entry must be a non-empty string; anything else fails the config loud
+    (a malformed informational map would otherwise silently mis-lane content).
+
+    HAS-CLEARANCE INVARIANT (load-bearing): a type listed here is delivered
+    one-shot and opens NO incident, so it can NEVER be closed by a clearance.
+    Listing a type that PAIRS WITH A CLEARANCE (a watch's `down`, a `stale_pr`,
+    a `store_corrupt`) would silently break its open/close lifecycle -- the open
+    side becomes a one-shot with no incident, and the later clearance finds
+    nothing to close and is dropped as a no-op. The engine cannot enumerate
+    every clearance-paired type statically (they live in triager handlers), so
+    this is a curation invariant: only list types that are genuinely one-shot
+    content (`info`, `seed`, `reminder`). `clearance` itself is rejected here as
+    the one statically-knowable violation; the rest is the operator's contract.
+    """
+    path = root / "informational.yaml"
+    if not path.exists():
+        return frozenset()
+    data = _read_yaml(path)
+    raw = data.get("types", [])
+    if not isinstance(raw, list):
+        raise ValueError(f"{path}: expected `types` to be a list (got {raw!r})")
+    types: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, str) or not entry.strip():
+            raise ValueError(
+                f"{path}: every `types` entry must be a non-empty string "
+                f"(got {entry!r})"
+            )
+        if entry == "clearance":
+            raise ValueError(
+                f"{path}: `clearance` cannot be informational -- a clearance is "
+                f"a condition recovery edge, not one-shot content"
+            )
+        types.add(entry)
+    return frozenset(types)
 
 
 def _read_yaml(path: Path) -> dict[str, Any]:

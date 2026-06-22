@@ -1,0 +1,18 @@
+{# The "Updates" section of the daily email: the informational lane. One card
+   per informational finding routed to this pipe since the last drain (seeds,
+   reminders, heads-ups from other systems). These are content, NOT incidents --
+   no severity/type framing, never an "Open incident". Inline `{{ }}` only and
+   `{% ... -%}` whitespace control: the Environment uses trim_blocks=True, so a
+   bare `{% endfor %}` at end-of-line eats the per-iteration newline and
+   collapses the cards onto one line. See incident-status.j2 for the same
+   footgun. Renders to the empty string when there is nothing informational, so
+   the "\n\n".join in _render_preamble drops it cleanly. #}
+{% if informational_since_last_drain %}
+Updates ({{ informational_since_last_drain|length }}):
+{% for u in informational_since_last_drain -%}
+- {{ u.body.title|default(u.body_text|default(u.entity, true), true) }}{{ " (" ~ u.body.source ~ ")" if u.body.source else "" }}
+{% if u.body.body -%}
+  {{ u.body.body }}
+{% endif -%}
+{% endfor -%}
+{% endif %}

@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""``inform`` -- drop an informational update into the angelus daily email.
+
+The producer front door for the informational lane: any system (a build bot, a
+research drip, a "heads up" from another tool) files a one-shot update that
+surfaces ONCE in the daily email under "Updates" and opens NO incident. It goes
+on PATH like notify-pat/reminder, so a system that learns something worth
+surfacing has somewhere durable to park it.
+
+    inform add --source build-bot "nightly build is green"
+    inform add --source pitch --body "write the piece" "VulMask seed"
+    inform add --source ci --id flake-4821 "test_foo flaked twice overnight"
+    inform ls
+
+`--source` is the producing system's label (shown in the email). `--id` is
+optional; supply a STABLE id to make a re-drop idempotent (the lane delivers each
+(source, id) once). The store and the daemon's drip share informational_store.py
+beside this script.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import informational_store as ins  # noqa: E402 (path injected above)
+
+
+def _default_store() -> str:
+    """The store the daemon's drip reads, resolved from THIS script's own
+    location (``<lodging>/bin/inform`` -> ``<lodging>/state/informational.jsonl``).
+
+    Like the `reminder` CLI: the script is on PATH and run from arbitrary cwds, so
+    a cwd-relative default would write a store the daemon never reads. resolve()
+    follows the PATH symlink to the real script in the lodging bin, so
+    .parent.parent is the lodging root. --store / $INFORMATIONAL_STORE override.
+    """
+    return str(Path(__file__).resolve().parent.parent / "state" / "informational.jsonl")
+
+
+def _store_path(args: argparse.Namespace) -> str:
+    return args.store or os.environ.get("INFORMATIONAL_STORE") or _default_store()
+
+
+def cmd_add(args: argparse.Namespace) -> int:
+    store = _store_path(args)
+    title = " ".join(args.title).strip()
+    try:
+        record = ins.make_record(
+            source=args.source,
+            title=title,
+            body=args.body,
+            severity=args.severity,
+            record_id=args.id,
+        )
+        ins.add_record(store, record)
+    except ValueError as exc:
+        print(f"inform: {exc}", file=sys.stderr)
+        return 2
+    print(f"filed {record['id'][:8]} from {record['source']}: {record['title']}")
+    return 0
+
+
+def cmd_ls(args: argparse.Namespace) -> int:
+    store = _store_path(args)
+    records = ins.load_records(store)
+    pending = [r for r in records if r.get("emitted_at") is None]
+    emitted = [r for r in records if r.get("emitted_at") is not None]
+    if not pending and not emitted:
+        print("no updates")
+        return 0
+    # Plain one-per-line output (screen-reader friendly).
+    for r in pending:
+        print(f"pending {r['source']} {r['title']} {r['id'][:8]}")
+    for r in sorted(emitted, key=lambda r: str(r.get("emitted_at")), reverse=True):
+        day = str(r.get("emitted_at", ""))[:10]
+        print(f"sent {day} {r['source']} {r['title']} {r['id'][:8]}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="inform", description="Drop an informational update into the daily email."
+    )
+    parser.add_argument(
+        "--store",
+        default=None,
+        help="store path (default: $INFORMATIONAL_STORE or state/informational.jsonl)",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    add = sub.add_parser("add", help="file an update")
+    add.add_argument("title", nargs="+", help="the headline shown in the email")
+    add.add_argument("--source", required=True, help="the producing system's label")
+    add.add_argument("--body", default=None, help="optional longer text")
+    add.add_argument("--severity", default="low", help="display-only (default low)")
+    add.add_argument(
+        "--id",
+        default=None,
+        help="stable id to make a re-drop idempotent (default: random)",
+    )
+    add.set_defaults(func=cmd_add)
+
+    ls = sub.add_parser("ls", help="list pending + recently sent updates")
+    ls.set_defaults(func=cmd_ls)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

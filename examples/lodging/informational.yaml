@@ -1,0 +1,17 @@
+# Finding TYPES that deliver on the informational lane (migration 0017): one-shot
+# content delivered once into the daily email under "Updates", opening NO
+# incident. The lane is derived from the finding TYPE -- a triager that emits
+# both informational content AND a real condition (the intake's store_corrupt
+# torn-inbox alert) lanes each correctly, because store_corrupt is NOT listed
+# here and so stays a condition by omission.
+#
+# HAS-CLEARANCE INVARIANT: only list types that are genuinely one-shot content.
+# A type that pairs with a `clearance` (a watch's `down`, `stale_pr`) must NEVER
+# appear here -- it would become a one-shot with no incident, and its later
+# clearance would find nothing to close and be silently dropped. The engine
+# rejects `clearance` itself; the rest is this curation contract.
+#
+# Applied at STARTUP (this top-level file is not hot-reloaded); a change needs a
+# daemon restart. The loaded set is logged at startup.
+types:
+  - info

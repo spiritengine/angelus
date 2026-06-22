@@ -188,6 +188,12 @@ def test_migration_renames_failed_to_dead_letter(tmp_path) -> None:
     pre_dir = _migrations_through(tmp_path, "0010_immediate_channel_attempts.sql")
     db = tmp_path / "angelus.sqlite3"
     connection = init_db(db, migrations_dir=pre_dir)
+    # The lane column (0017) is orthogonal to the 0011 rename under test, but the
+    # current write_finding writes it; add it to this synthetic pre-0011 schema
+    # so the helper works without pulling in 0011+.
+    connection.execute(
+        "ALTER TABLE findings ADD COLUMN lane TEXT NOT NULL DEFAULT 'condition'"
+    )
     catalog = Catalog(connection, tmp_path)
     finding_id = _write_finding(catalog, "old.example")
     # Old terminal, allowed under the pre-0011 CHECK. Set sibling columns too so
@@ -234,6 +240,12 @@ def test_migration_leaves_non_terminal_rows_untouched(tmp_path) -> None:
     """
     pre_dir = _migrations_through(tmp_path, "0010_immediate_channel_attempts.sql")
     connection = init_db(tmp_path / "angelus.sqlite3", migrations_dir=pre_dir)
+    # The lane column (0017) is orthogonal to the 0011 rename under test; add it
+    # to this synthetic pre-0011 schema so write_finding works (see the sibling
+    # test for the full rationale).
+    connection.execute(
+        "ALTER TABLE findings ADD COLUMN lane TEXT NOT NULL DEFAULT 'condition'"
+    )
     catalog = Catalog(connection, tmp_path)
     states = {"pending": "a.com", "dispatched": "b.com", "suppressed": "c.com"}
     ids: dict[str, int] = {}

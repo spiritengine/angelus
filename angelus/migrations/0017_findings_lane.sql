@@ -1,0 +1,18 @@
+-- The informational delivery lane (brief: PLAN_informational_path.md).
+--
+-- A finding is either a CONDITION (the default: it opens/refreshes an incident,
+-- participates in the open/close lifecycle, surfaces in "Open incidents", and
+-- clears via a `clearance` finding) or INFORMATIONAL (a one-shot content
+-- delivery -- a build seed, a reminder, a heads-up from another system -- that
+-- is delivered once through its pipe and recorded for audit, but opens NO
+-- incident and needs no clearance).
+--
+-- Adding the column with a constant DEFAULT is the backfill: every pre-existing
+-- row reads back 'condition' with no separate UPDATE, preserving current
+-- behavior for everything already written. SQLite cannot ALTER a CHECK
+-- constraint onto an existing column without a full table rebuild, so the
+-- allowed lane set is enforced in the write path / config validation instead of
+-- at the column (see Catalog.write_finding and the lane-derivation in the
+-- triager loop). A plain additive ADD COLUMN is the lowest-risk migration shape
+-- in this framework -- no table rebuild, so the FK-disable dance never engages.
+ALTER TABLE findings ADD COLUMN lane TEXT NOT NULL DEFAULT 'condition';

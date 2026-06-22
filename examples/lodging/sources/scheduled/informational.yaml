@@ -1,0 +1,19 @@
+  # The shared informational inbox drip (the producer front door for the lane).
+  # Any system drops a record into state/informational.jsonl (via the `inform`
+  # CLI or a direct append); each tick this drains EVERY pending record into one
+  # batch observation and the generic informational triager fans them out into
+  # findings. Because the drip batches (drain-all, not one-per-tick), a burst of
+  # drops does not serialise -- they all land in the next tick's batch.
+  #
+  # 10m cadence: the items deliver into the daily email, an hours-wide window, so
+  # 10m drains everything dropped through the day well before the morning render
+  # and recovers same-day if the daemon was briefly down. cwd is the lodging root
+  # (the daemon's working directory), so the relative bin/ and state/ paths
+  # resolve there.
+cadence: 10m
+check:
+  kind: shell
+  command: python3 bin/informational_drip.py state/informational.jsonl
+  # A file read + prune; well under the 30s default, pinned short because a drip
+  # that ever hangs should fail fast rather than stall the fire loop.
+  timeout_seconds: 15
