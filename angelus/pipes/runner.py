@@ -1365,6 +1365,21 @@ class PipeDrain:
             return None, "daily digest body missing mantle"
         input_names = body_config.get("inputs") or []
         inputs = {name: structured[name] for name in input_names}
+        # The `severity` on informational items is a ROUTING signal (a HOT build
+        # seed maps to "high" so it can escalate to the `now` pipe), not an
+        # incident severity. Left in the JSON the chronicler reads, it gets
+        # surfaced as e.g. "a high-severity seed" -- incident framing on a build
+        # opportunity. Drop it from the chronicler's view only; copy the items so
+        # the preamble templates (which render the same structured list) are
+        # untouched. Operational inputs keep severity -- the prompt leads on it.
+        info = inputs.get("informational_since_last_drain")
+        if isinstance(info, list):
+            inputs["informational_since_last_drain"] = [
+                {k: v for k, v in item.items() if k != "severity"}
+                if isinstance(item, dict)
+                else item
+                for item in info
+            ]
         # Tight constraints on the chronicler output: the preamble (jinja
         # templates) owns the structured item rendering; the LLM owns ONLY
         # a short synthesis paragraph at the top. Previous loose prompt
