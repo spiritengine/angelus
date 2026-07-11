@@ -2813,9 +2813,94 @@ def _mute_duration_seconds(duration: str) -> int:
     )
 
 
+# Crontab day-of-week numbering: 0-7 where BOTH 0 and 7 mean Sunday (0=Sun,
+# 1=Mon, ... 6=Sat). APScheduler's CronTrigger.from_crontab does NOT honor this:
+# it forwards the number straight into its own day_of_week field, which is
+# 0=Mon..6=Sun, so a plain "0" fires MONDAY and every numeric day/range is
+# shifted a day. (Its weekday NAMES -- mon..sun -- are already correct.) angelus
+# documents its cadence as crontab, so _translate_crontab_dow_field rewrites the
+# day-of-week field from crontab numbering into an explicit list of weekday
+# names, which from_crontab reads correctly. Names are used rather than a numeric
+# remap because they also sidestep the Sunday-wrap: crontab "0-3" is Sun..Wed,
+# which has no valid ascending numeric range once Sunday is renumbered to APS's
+# 6, whereas the expanded name list "sun,mon,tue,wed" is unambiguous.
+_CRON_DOW_NAMES = ("sun", "mon", "tue", "wed", "thu", "fri", "sat")  # crontab 0..6
+_CRON_DOW_NUM = {name: index for index, name in enumerate(_CRON_DOW_NAMES)}
+
+
+def _crontab_dow_token(token: str) -> int:
+    """One crontab day-of-week token -> its crontab number.
+
+    Accepts a case-insensitive weekday NAME (sun..sat -> 0..6) or a NUMBER 0-7.
+    Numbers keep their literal value (7 is returned as 7 and folded to Sunday only
+    during range expansion, so "1-7" = every day resolves correctly). Raises
+    ValueError on anything else.
+    """
+    lowered = token.strip().lower()
+    if lowered in _CRON_DOW_NUM:
+        return _CRON_DOW_NUM[lowered]
+    value = int(lowered)  # ValueError on a non-numeric, non-name token
+    if not 0 <= value <= 7:
+        raise ValueError(f"day-of-week out of range (0-7): {token!r}")
+    return value
+
+
+def _translate_crontab_dow_field(field: str) -> str:
+    """Rewrite a crontab day-of-week field into APScheduler-correct weekday names.
+
+    '*' passes through. EVERY other form -- numbers, names, comma lists, ranges,
+    steps, and mixes of them -- is expanded to the explicit set of days it matches
+    under CRONTAB numbering (0=Sun..6=Sat, 7 also Sunday) and re-emitted as a comma
+    list of names ordered Sun..Sat. Names must be parsed too, not passed through:
+    APScheduler numbers names mon=0..sun=6, so a numeric leak in a mixed list
+    ("0,sun") or a Sunday-initial name range ("sun-thu") would otherwise mis-fire
+    or crash. Emitting NAMES (rather than remapped numbers) keeps the output free
+    of the Sunday-wrap that a numeric range would hit. Raises ValueError on a
+    malformed field so a bad cadence fails loud at load, never mis-schedules.
+    """
+    field = field.strip()
+    if field == "*":
+        return field
+    days: set[int] = set()
+    for item in field.split(","):
+        base, sep, step_str = item.strip().partition("/")
+        step = int(step_str) if sep else 1
+        if step <= 0:
+            raise ValueError(f"invalid step in day-of-week field {field!r}")
+        if base == "*":
+            lo, hi = 0, 6
+        elif "-" in base:
+            lo_str, _, hi_str = base.partition("-")
+            lo, hi = _crontab_dow_token(lo_str), _crontab_dow_token(hi_str)
+        else:
+            lo = _crontab_dow_token(base)
+            # A bare number/name is a single day; "N/step" means N..Saturday/step
+            # (Vixie crontab), so a step widens a single base to the week's end.
+            hi = 6 if sep else lo
+        if lo > hi:
+            raise ValueError(f"descending day-of-week range in {field!r}")
+        # Expand in crontab space, folding 7 -> 0 (Sunday) as each value lands, so
+        # ranges/steps that touch 7 (e.g. "1-7" = every day) resolve correctly.
+        for value in range(lo, hi + 1):
+            if (value - lo) % step == 0:
+                days.add(0 if value == 7 else value)
+    if not days:
+        raise ValueError(f"day-of-week field {field!r} matches no days")
+    return ",".join(_CRON_DOW_NAMES[day] for day in sorted(days))
+
+
 def _make_trigger(cadence: str):
-    """Build an APScheduler trigger from an interval or crontab cadence."""
+    """Build an APScheduler trigger from an interval or crontab cadence.
+
+    The crontab day-of-week field is translated to APScheduler-correct weekday
+    names first (see _translate_crontab_dow_field); without this a "* * 0" Sunday
+    cron would silently fire on Monday.
+    """
     if _is_crontab_cadence(cadence):
+        fields = cadence.split()
+        if len(fields) == 5:
+            fields[4] = _translate_crontab_dow_field(fields[4])
+            cadence = " ".join(fields)
         return CronTrigger.from_crontab(cadence)
     return IntervalTrigger(seconds=_cadence_seconds(cadence))
 
