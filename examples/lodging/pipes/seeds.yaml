@@ -1,8 +1,8 @@
 # The Pitch seed digest (brief-20260619-opi5). Low-urgency, daily: batches every
 # seed the drip dripped since the last drain into ONE notification. Seeds are
-# never an emergency -- the window is days, not minutes -- so this is its own
-# pipe, NOT `now`. (The rare severity=="high" xz-scale seed is the exception: the
-# triager routes THOSE to `now` directly, jumping this queue.)
+# informational -- the window is days, not minutes -- so this is its own pipe,
+# NOT `now`, and no seed ever jumps to `now`. (Only the store_corrupt torn-store
+# CONDITION uses the urgent pipe -- see the triager.)
 #
 # 8:00 AM local time. CronTrigger.from_crontab() defaults the trigger timezone to
 # LOCAL (see daily.yaml's note), so this fires at 08:00 in the box's local TZ --
@@ -19,8 +19,8 @@ channels:
 render:
   preamble:
     # Deterministic seed cards on the email leg (and the structured push-compact
-    # summary lists each new finding). The cannon/event/build_move ride through
-    # the finding body; the chronicler body below adds synthesis on top.
+    # summary lists each new finding). The event/source/date ride through the
+    # finding body; the chronicler body below adds synthesis on top.
     - kind: structured
       template: seed-cards
   body:

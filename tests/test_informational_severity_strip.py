@@ -1,11 +1,11 @@
 """The chronicler must not frame informational items by their routing severity.
 
-A HOT build seed is stored with severity="high" purely so it can escalate to the
-`now` pipe (pitch_ingest maps URGENCY HOT -> "high"). Left in the JSON the
-chronicler reads, that field made the digest synthesis describe a build seed as
-"high-severity" -- incident framing on an opportunity. _render_llm_body drops
-`severity` from the informational items it feeds the chronicler (only);
-operational inputs keep it, and the shared structured data is untouched.
+An informational item can arrive carrying a routing severity (a producer tags a
+heads-up "high" so it escalates). Left in the JSON the chronicler reads, that
+field made the digest synthesis describe an update as "high-severity" -- incident
+framing on content. _render_llm_body drops `severity` from the informational
+items it feeds the chronicler (only); operational inputs keep it, and the shared
+structured data is untouched.
 """
 
 from __future__ import annotations
@@ -63,8 +63,8 @@ def test_chronicler_input_drops_informational_severity(tmp_path, monkeypatch):
     connection = init_db(tmp_path / "angelus.sqlite3")
     catalog = Catalog(connection, tmp_path)
 
-    # Operational finding (keeps severity) + an informational seed whose HOT
-    # routing maps to severity="high" (must NOT reach the chronicler as severity).
+    # Operational finding (keeps severity) + an informational item that arrived
+    # carrying a routing severity (must NOT reach the chronicler as severity).
     catalog.write_finding(
         None,
         {"source": "scheduled/test", "type": "down", "entity": "site",
@@ -73,7 +73,7 @@ def test_chronicler_input_drops_informational_severity(tmp_path, monkeypatch):
     )
     catalog.write_finding(
         None,
-        {"source": "scheduled/pitch", "type": "seed", "entity": "ShareLock",
+        {"source": "build-bot", "type": "info", "entity": "ShareLock",
          "severity": "high", "target_pipes": ["daily"]},
         {"daily"},
         lane="informational",
@@ -94,7 +94,7 @@ def test_chronicler_input_drops_informational_severity(tmp_path, monkeypatch):
         mf = argv[argv.index("--message-file") + 1]
         captured["prompt"] = Path(mf).read_text(encoding="utf-8")
         return _FakeProc(
-            json.dumps({"result": "All quiet; a build seed arrived."}).encode()
+            json.dumps({"result": "All quiet; an update arrived."}).encode()
         )
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
@@ -105,7 +105,7 @@ def test_chronicler_input_drops_informational_severity(tmp_path, monkeypatch):
         connection.close()
 
     assert err is None
-    assert output == "All quiet; a build seed arrived."
+    assert output == "All quiet; an update arrived."
 
     # The JSON the chronicler was actually handed.
     payload = json.loads(captured["prompt"].split("Structured inputs (JSON):\n", 1)[1])

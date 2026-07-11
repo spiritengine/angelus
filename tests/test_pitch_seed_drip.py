@@ -1,6 +1,6 @@
 """Pitch seed drip (brief-20260619-opi5 option C).
 
-Pitch produces N build-worthy SEEDS per run, but a native source fire writes at
+Pitch produces N SEEDS per run, but a native source fire writes at
 most ONE observation. The drip adapter resolves that lodging-side: Pitch writes
 seeds to a store; a fast source drains the OLDEST unemitted seed per tick,
 stamping emitted_at and printing one observation whose `state` is the seed id,
@@ -12,8 +12,8 @@ Coverage:
     fire, idle JSON when fully drained.
   - _fire_source: distinct seeds each write an observation; a re-fired idle
     state collapses to NO observation (the engine's change-signature, no patch).
-  - the triager: a seed observation triages into a finding routed to `seeds`;
-    severity=="high" jumps to `now`; idle yields no finding.
+  - the triager: a seed observation triages into a finding routed digest-only to
+    the daily pipe (informational -- never jumps to `now`); idle yields no finding.
   - dedup end to end: the same seed never alerts twice through the catalog
     emission gate.
   - the shipped example lodging wires the source/triager/pipe and cross-refs
@@ -59,14 +59,16 @@ def _load_seed_store():
 ss = _load_seed_store()
 
 
-def _seed(cannon, event, build_move, *, severity="low", discovered_at):
-    return ss.make_seed(
-        cannon,
-        event,
-        build_move,
-        severity=severity,
-        discovered_at=discovered_at,
-    )
+def _seed(cannon, event, build_move, *, severity="low", discovered_at, source="", date=""):
+    """Build a seed for the drain/corruption tests below.
+
+    The seed schema is now event-only: the id hashes the event, with source/date
+    as optional context; cannon/build_move/severity are gone. This helper keeps
+    the legacy positional shape so the many drain/order/corruption call sites
+    below stay put -- only ``event`` (and optional source/date) feed the new
+    make_seed; the cannon/build_move/severity args are ignored.
+    """
+    return ss.make_seed(event, source=source, date=date, discovered_at=discovered_at)
 
 
 def _drip(store: Path) -> dict:
@@ -113,15 +115,15 @@ def test_drain_one_missing_store_is_none(tmp_path: Path) -> None:
 def test_append_seed_dedups_on_id(tmp_path: Path) -> None:
     store = tmp_path / "seeds.jsonl"
     assert ss.append_seed(store, _seed("cA", "same", "a", discovered_at="2026-06-19T10:00:00.000Z"))
-    # Same cannon+event -> same id -> not added again (idempotent ingest).
+    # Same event -> same id -> not added again (idempotent ingest).
     assert not ss.append_seed(store, _seed("cA", "same", "a", discovered_at="2026-06-19T11:00:00.000Z"))
     assert len(ss.load_seeds(store)) == 1
 
 
-def test_seed_id_stable_and_separator_safe() -> None:
-    assert ss.seed_id("cannon", "event") == ss.seed_id("cannon", "event")
-    # The NUL separator keeps ("ab","c") distinct from ("a","bc").
-    assert ss.seed_id("ab", "c") != ss.seed_id("a", "bc")
+def test_seed_id_stable_and_event_keyed() -> None:
+    assert ss.seed_id("the world changed") == ss.seed_id("the world changed")
+    # Distinct events -> distinct ids (the id is the dedup key).
+    assert ss.seed_id("event a") != ss.seed_id("event b")
 
 
 # --------------------------------------------------------------------------
@@ -259,7 +261,14 @@ def _run_handler(observation: dict, metadata: dict) -> list[dict]:
 
 
 def test_seed_observation_triages_to_seeds_pipe() -> None:
-    seed = _seed("cannon", "the world changed", "build the audit", discovered_at="2026-06-19T10:00:00.000Z")
+    seed = _seed(
+        "cannon",
+        "the world changed",
+        "ignored",
+        discovered_at="2026-06-19T10:00:00.000Z",
+        source="https://example.com/change",
+        date="2026-06-19",
+    )
     obs = ss.seed_observation(seed)
     obs["emitted_at"] = "2026-06-19T12:00:00.000Z"
     findings, _state = _triage(obs)
@@ -268,24 +277,27 @@ def test_seed_observation_triages_to_seeds_pipe() -> None:
     assert finding["type"] == "seed"
     assert finding["entity"] == seed["id"]
     assert finding["severity"] == "low"
+    # Seeds are informational -- digest-only, never `now` (target_pipe only).
     assert finding["target_pipes"] == ["seeds"]
-    # The buildable content rides through the body for the digest card.
-    assert finding["body"]["cannon"] == "cannon"
+    # The change content rides through the body for the digest card.
     assert finding["body"]["event"] == "the world changed"
-    assert finding["body"]["build_move"] == "build the audit"
+    assert finding["body"]["source"] == "https://example.com/change"
+    assert finding["body"]["date"] == "2026-06-19"
+    # body.title = event so the compact push leg headlines the event, not the
+    # opaque seed id (_informational_headline prefers body.title).
+    assert finding["body"]["title"] == "the world changed"
 
 
-def test_high_severity_seed_jumps_to_now() -> None:
-    seed = _seed("cannon", "xz-scale", "ship now", severity="high", discovered_at="2026-06-19T10:00:00.000Z")
+def test_seed_never_jumps_to_now() -> None:
+    """Seeds are informational: every seed routes digest-only, regardless of what
+    urgent_pipe is configured. Only the store_corrupt CONDITION uses urgent_pipe
+    (see test_corruption_observation_triages_to_now_and_seeds_floor)."""
+    seed = _seed("cannon", "a notable change", "ignored", discovered_at="2026-06-19T10:00:00.000Z")
     obs = ss.seed_observation(seed)
     obs["emitted_at"] = "2026-06-19T12:00:00.000Z"
-    findings, _state = _triage(obs)
-    # The rare high seed jumps to `now` (urgent, first), AND keeps the daily
-    # `seeds` pipe as a never-drop floor beneath it.
-    assert findings[0]["target_pipes"] == ["now", "seeds"], (
-        "high seed jumps to the urgent pipe but seeds stays a floor"
-    )
-    assert findings[0]["severity"] == "high"
+    findings = _run_handler(obs, {"target_pipe": "seeds", "urgent_pipe": "now"})
+    assert len(findings) == 1
+    assert findings[0]["target_pipes"] == ["seeds"], "a seed never jumps to now"
 
 
 def test_idle_observation_yields_no_finding() -> None:
@@ -351,14 +363,19 @@ def test_seed_cards_template_renders_cards() -> None:
         {
             "severity": "low",
             "entity": "abc123",
-            "body": {"event": "Skills shipped", "cannon": "Bad Skillz", "build_move": "ship an audit"},
+            "body": {
+                "event": "New model shipped",
+                "source": "https://example.com/model",
+                "date": "2026-06-20",
+            },
         }
     ]
     rendered = template.render(findings_since_last_drain=findings)
     assert "Pitch seeds since last digest (1)" in rendered
-    assert "Skills shipped" in rendered
-    assert "cannon: Bad Skillz" in rendered
-    assert "build: ship an audit" in rendered
+    assert "New model shipped" in rendered
+    assert "https://example.com/model" in rendered
+    assert "(2026-06-20)" in rendered
+    assert "cannon:" not in rendered and "build:" not in rendered
 
     empty = template.render(findings_since_last_drain=[])
     assert "No new Pitch seeds" in empty
@@ -519,7 +536,7 @@ def test_concurrent_appends_and_drains_no_loss_no_corruption(tmp_path: Path) -> 
 
     store = tmp_path / "seeds.jsonl"
     count = 30
-    expected_ids = {ss.seed_id(f"c{i}", f"e{i}") for i in range(count)}
+    expected_ids = {ss.seed_id(f"e{i}") for i in range(count)}
 
     barrier = threading.Barrier(count + 6)
 
@@ -549,17 +566,18 @@ def test_concurrent_appends_and_drains_no_loss_no_corruption(tmp_path: Path) -> 
 
 def test_unknown_urgent_pipe_falls_back_to_seeds_floor() -> None:
     """WORTH-FIXING 3: a typo'd urgent_pipe (not a real pipe) must NOT drop the
-    seed -- the daily `seeds` floor still carries it. urgent_pipe is now validated
-    at load (finding-20260619-dle0), so a typo fails the config; this exercises the
-    handler floor that stays as defense-in-depth beneath that load-time check."""
-    seed = _seed("cannon", "xz-scale", "ship now", severity="high", discovered_at="2026-06-19T10:00:00.000Z")
-    obs = ss.seed_observation(seed)
+    store_corrupt alert -- the daily `seeds` floor still carries it. urgent_pipe is
+    validated at load (finding-20260619-dle0), so a typo fails the config; this
+    exercises the handler floor that stays as defense-in-depth beneath that
+    load-time check. (Seeds themselves never use urgent_pipe -- only this
+    torn-store CONDITION does.)"""
+    obs = ss.corruption_observation(1)
     findings = _run_handler(obs, {"target_pipe": "seeds", "urgent_pipe": "nwo"})
     assert len(findings) == 1
     # The typo'd "nwo" is carried (the engine skips it as unknown at enqueue),
-    # but `seeds` is in the list as the never-drop floor -> the seed is delivered.
+    # but `seeds` is in the list as the never-drop floor -> the alert is delivered.
     assert "seeds" in findings[0]["target_pipes"], (
-        "an unknown urgent_pipe must not drop the seed -- seeds is the floor"
+        "an unknown urgent_pipe must not drop the alert -- seeds is the floor"
     )
 
 
@@ -758,9 +776,12 @@ def test_non_scalar_id_is_malformed_no_livelock(tmp_path: Path) -> None:
     drains, and the bad row is never selected as a seed or re-emitted."""
     store = tmp_path / "seeds.jsonl"
     good = _seed("cA", "good", "x", discovered_at="2026-06-19T10:00:00.000Z")
-    # A row with every required key present but a NON-SCALAR id -- the livelock.
+    # A row with every OTHER required key present (incl. a valid event) but a
+    # NON-SCALAR id -- the livelock. The valid event keeps the id-scalar check the
+    # single defect under test, not masked by the missing-event rejection.
     bad_id = json.dumps(
-        {"id": [], "discovered_at": "2026-06-19T09:00:00.000Z", "emitted_at": None}
+        {"id": [], "discovered_at": "2026-06-19T09:00:00.000Z", "emitted_at": None,
+         "event": "e"}
     )
     store.write_text(
         json.dumps(good, sort_keys=True) + "\n" + bad_id + "\n",
@@ -793,14 +814,43 @@ def test_non_scalar_id_is_malformed_no_livelock(tmp_path: Path) -> None:
     assert third["type"] == ss.CORRUPT_TYPE and third["state"] == ss.CORRUPT_STATE
 
 
+def test_missing_or_empty_event_is_malformed(tmp_path: Path) -> None:
+    """`event` is the one content field a seed exists to carry, and the drip emits
+    it verbatim into the daily card. A row missing it (or with an empty/non-str
+    event) would drain into a contentless card that falls back to the opaque seed
+    id, with NO corruption alert. So such a row is malformed (preserved + counted),
+    not a seed -- the fail-loud contract, not a silent low-information delivery."""
+    store = tmp_path / "seeds.jsonl"
+    good = _seed("cA", "good", "x", discovered_at="2026-06-19T10:00:00.000Z")
+    missing = json.dumps(
+        {"id": "deadbeefdeadbeef", "discovered_at": "2026-06-19T09:00:00.000Z", "emitted_at": None}
+    )
+    empty = json.dumps(
+        {"id": "feedfacefeedface", "discovered_at": "2026-06-19T09:30:00.000Z",
+         "emitted_at": None, "event": ""}
+    )
+    store.write_text(
+        json.dumps(good, sort_keys=True) + "\n" + missing + "\n" + empty + "\n",
+        encoding="utf-8",
+    )
+    assert not ss._is_seed_row(json.loads(missing)), "a row with no event is not a seed"
+    assert not ss._is_seed_row(json.loads(empty)), "a row with an empty event is not a seed"
+    seeds, malformed = ss._parse_store(store)
+    assert [s["event"] for s in seeds] == ["good"], "only the row with an event is a seed"
+    assert set(malformed) == {missing, empty}, "contentless rows preserved + counted malformed"
+
+
 def test_non_str_discovered_at_is_malformed(tmp_path: Path) -> None:
     """ROUND-5 BLOCKING (companion): discovered_at drives the lexicographic drain
     order; a non-str value could mis-order the drain, so a row with a non-str
     discovered_at is malformed, not a seed."""
     store = tmp_path / "seeds.jsonl"
     good = _seed("cA", "good", "x", discovered_at="2026-06-19T10:00:00.000Z")
+    # Valid event so the non-str discovered_at is the single defect under test
+    # (not masked by the missing-event rejection).
     bad_ts = json.dumps(
-        {"id": "deadbeefdeadbeef", "discovered_at": 12345, "emitted_at": None}
+        {"id": "deadbeefdeadbeef", "discovered_at": 12345, "emitted_at": None,
+         "event": "e"}
     )
     store.write_text(
         json.dumps(good, sort_keys=True) + "\n" + bad_ts + "\n",
@@ -819,11 +869,14 @@ def test_wrong_typed_emitted_at_is_malformed_not_silently_skipped(tmp_path: Path
     is malformed (preserved + counted), not a seed."""
     store = tmp_path / "seeds.jsonl"
     good = _seed("cA", "good", "x", discovered_at="2026-06-19T10:00:00.000Z")
+    # Valid event so the wrong-typed emitted_at is the single defect under test
+    # (not masked by the missing-event rejection).
     bad = json.dumps(
         {
             "id": "deadbeefdeadbeef",
             "discovered_at": "2026-06-19T09:00:00.000Z",
             "emitted_at": False,
+            "event": "e",
         }
     )
     store.write_text(
@@ -926,13 +979,13 @@ def test_lone_surrogate_in_seed_string_is_malformed_not_normalized(
     MALFORMED (preserved verbatim + store_corrupt fires), not accepted+normalized."""
     store = tmp_path / "seeds.jsonl"
     good = _seed("cA", "good", "x", discovered_at="2026-06-19T10:00:00.000Z")
-    # A COMPLETE JSON seed (closes its quotes and braces) whose build_move carries
-    # a raw 0xFF byte INSIDE the string -- valid JSON structure, invalid UTF-8.
-    # json.dumps is pure ASCII, so splice the 0xFF into the build_move value's
-    # bytes directly (still a closed, parseable line once surrogateescape-decoded).
-    bad_seed = _seed("cB", "b", "BUILD", discovered_at="2026-06-19T11:00:00.000Z")
+    # A COMPLETE JSON seed (closes its quotes and braces) whose event carries a raw
+    # 0xFF byte INSIDE the string -- valid JSON structure, invalid UTF-8. json.dumps
+    # is pure ASCII, so splice the 0xFF into the event value's bytes directly (still
+    # a closed, parseable line once surrogateescape-decoded).
+    bad_seed = _seed("cB", "EVENTTOK", "y", discovered_at="2026-06-19T11:00:00.000Z")
     bad_line_bytes = (
-        json.dumps(bad_seed, sort_keys=True).encode("utf-8").replace(b"BUILD", b"BU\xffLD")
+        json.dumps(bad_seed, sort_keys=True).encode("utf-8").replace(b"EVENTTOK", b"EVEN\xffTOK")
     )
     store.write_bytes(
         (json.dumps(good, sort_keys=True) + "\n").encode("utf-8")

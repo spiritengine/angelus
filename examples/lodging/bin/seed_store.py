@@ -2,12 +2,12 @@
 """Pitch seed store -- the drip adapter's shared data layer.
 
 Pitch (the daily ``pitch`` mill chain) is a long LLM scan that finds SEEDS:
-events where the world changed AND Patrick has a prepared CANNON to BUILD a
-response (a tool, audit, repo, experiment) while attention is on it -- never
-"write a take". Pitch produces several seeds per run. Angelus is the scheduling
-spine that gives them a home, but a native source fire writes AT MOST ONE
-observation (collapsed on a single ``state`` change-signature), so N seeds per
-run do not drop into the one-observation-per-fire model.
+events that changed the world in one of Patrick's areas of interest -- what
+happened, where, and when. It reports the change, never a move to make on it.
+Pitch produces several seeds per run. Angelus is the scheduling spine that gives
+them a home, but a native source fire writes AT MOST ONE observation (collapsed
+on a single ``state`` change-signature), so N seeds per run do not drop into the
+one-observation-per-fire model.
 
 The drip adapter (brief-20260619-opi5 option C) resolves that without touching
 the engine: Pitch writes seeds to this store on its OWN schedule; a fast lodging
@@ -26,26 +26,22 @@ so the source command resolves ``state/pitch-seeds.jsonl`` relative to cwd.
 
 Seed schema (every row)
 -----------------------
-- ``id``            stable hash of (cannon, event); the dedup key and the
-                    observation ``state`` token. Identical cannon+event ->
-                    identical id -> never alerts twice (see append_seed and the
-                    catalog emission gate).
+- ``id``            stable hash of ``event``; the dedup key and the observation
+                    ``state`` token. Identical event -> identical id -> never
+                    alerts twice (see append_seed and the catalog emission gate).
 - ``discovered_at`` ISO-8601 UTC millisecond timestamp (when Pitch found it).
                     Drip order is OLDEST discovered_at first.
-- ``cannon``        the prepared capability aimed at the event.
-- ``event``         what changed in the world.
-- ``build_move``    the buildable response (the thing to ship).
-- ``severity``      ``"low"`` by default; ``"high"`` is reserved for the rare
-                    xz-scale seed and is the only severity that jumps to the
-                    urgent ``now`` pipe (see triagers/handlers/pitch_seed.py).
+- ``event``         what changed in the world (one line).
+- ``source``        the primary URL for the change (may be empty).
+- ``date``          when the change happened, as Pitch reported it (may be empty).
 - ``emitted_at``    ``null`` until the drip source drains it, then the ISO-8601
                     UTC stamp of the tick that emitted it. A seed is drained
                     exactly once.
 
 Out of scope here (deployed from the PRIVATE lodging repo, not this examples
-tree): the live ``pitch`` schedule that WRITES to the store, the real cannons,
-and the live state/ file. This repo ships the contract and the fixtures only --
-never real cannons or seed data.
+tree): the live ``pitch`` schedule that WRITES to the store, the real interest
+list, and the live state/ file. This repo ships the contract and the fixtures
+only -- never real interests or seed data.
 """
 
 from __future__ import annotations
@@ -97,20 +93,21 @@ RESERVED_OBSERVATION_TOKENS = frozenset({IDLE_STATE, CORRUPT_STATE, CORRUPT_ENTI
 # Default store location, relative to the daemon's cwd (the lodging root).
 DEFAULT_STORE = "state/pitch-seeds.jsonl"
 
-# Keys every seed row must carry to be a seed (the dedup id, the drain-order
-# timestamp, and the emitted-stamp slot). A JSON line that parses but lacks any
-# of these is NOT a seed -- it is treated as a torn row (preserved + counted
-# malformed), so a non-seed object can never reach next_unemitted's seed.get(...)
-# and crash the drip while starving the good seed behind it. make_seed always
-# populates all three (emitted_at starts as null, but the KEY is present).
+# Keys every seed row must carry to be a seed: the dedup id, the drain-order
+# timestamp, the emitted-stamp slot, and the one content field a seed exists to
+# carry (the event). A JSON line that parses but lacks any of these is NOT a seed
+# -- it is treated as a torn row (preserved + counted malformed), so a non-seed
+# object can never reach next_unemitted's seed.get(...) and crash the drip while
+# starving the good seed behind it. make_seed always populates all four
+# (emitted_at starts as null, but the KEY is present).
 #
-# Requiring discovered_at and emitted_at (not just id) is INTENTIONAL: a row
-# missing them is quarantined + alerted (preserved verbatim, counted malformed),
-# never silently dropped. So a future live writer that drifts from make_seed (a
-# new schema, a dropped field) trips a loud corruption alert by design rather
-# than mis-draining -- strict classification is the fail-loud contract, not an
-# accident.
-REQUIRED_SEED_KEYS = ("id", "discovered_at", "emitted_at")
+# Requiring discovered_at, emitted_at, AND event (not just id) is INTENTIONAL: a
+# row missing any is quarantined + alerted (preserved verbatim, counted
+# malformed), never silently dropped. So a future live writer that drifts from
+# make_seed (a new schema, a dropped field) trips a loud corruption alert by
+# design rather than mis-draining a contentless seed (an empty daily card) --
+# strict classification is the fail-loud contract, not an accident.
+REQUIRED_SEED_KEYS = ("id", "discovered_at", "emitted_at", "event")
 
 
 def _row_has_lone_surrogate(obj: Any) -> bool:
@@ -192,6 +189,14 @@ def _is_seed_row(obj: Any) -> bool:
         return False
     if not isinstance(obj.get("discovered_at"), str):
         return False
+    if not isinstance(obj.get("event"), str) or not obj["event"]:
+        # ``event`` is the one content field a seed exists to carry, and the drip
+        # emits it verbatim into the daily card. A row missing it (or with an
+        # empty/non-str event) would drain into a contentless card that falls
+        # back to the opaque seed id, with NO corruption alert -- a silent,
+        # low-information delivery. Rejecting it routes the row to the malformed
+        # path (preserved + counted + store_corrupt alert) instead.
+        return False
     if not (obj["emitted_at"] is None or isinstance(obj["emitted_at"], str)):
         # emitted_at is the drained-marker: null until drained, then an ISO
         # timestamp str. next_unemitted treats ANY non-None value as "already
@@ -202,36 +207,32 @@ def _is_seed_row(obj: Any) -> bool:
     return True
 
 
-def seed_id(cannon: str, event: str) -> str:
-    """Stable 16-hex-char id for a (cannon, event) pair.
+def seed_id(event: str) -> str:
+    """Stable 16-hex-char id for an event.
 
-    The same cannon aimed at the same event is the same seed, so its id is
-    stable across Pitch runs -- that identity is what dedups a recurring seed
-    (append_seed skips a duplicate id; the catalog emission gate drops a repeat
-    finding for the same entity). A NUL separator keeps ("ab", "c") distinct
-    from ("a", "bc").
+    The same event is the same seed, so its id is stable across Pitch runs --
+    that identity is what dedups a recurring event (append_seed skips a duplicate
+    id; the catalog emission gate drops a repeat finding for the same entity).
     """
-    digest = hashlib.sha256(f"{cannon}\x00{event}".encode()).hexdigest()
+    digest = hashlib.sha256(event.encode()).hexdigest()
     return digest[:16]
 
 
 def make_seed(
-    cannon: str,
     event: str,
-    build_move: str,
     *,
-    severity: str = "low",
+    source: str = "",
+    date: str = "",
     discovered_at: str | None = None,
     sid: str | None = None,
 ) -> dict[str, Any]:
     """Build a seed row with emitted_at unset (null until drained)."""
     return {
-        "id": sid or seed_id(cannon, event),
+        "id": sid or seed_id(event),
         "discovered_at": discovered_at or utcnow(),
-        "cannon": cannon,
         "event": event,
-        "build_move": build_move,
-        "severity": severity,
+        "source": source,
+        "date": date,
         "emitted_at": None,
     }
 
@@ -530,10 +531,9 @@ def seed_observation(seed: dict[str, Any]) -> dict[str, Any]:
         "entity": str(seed["id"]),
         "type": "seed",
         "seed_id": str(seed["id"]),
-        "cannon": seed.get("cannon"),
         "event": seed.get("event"),
-        "build_move": seed.get("build_move"),
-        "severity": seed.get("severity") or "low",
+        "source": seed.get("source"),
+        "date": seed.get("date"),
         "discovered_at": seed.get("discovered_at"),
         "emitted_at": seed.get("emitted_at"),
         "state": str(seed["id"]),

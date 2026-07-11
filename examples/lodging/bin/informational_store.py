@@ -2,7 +2,7 @@
 """The shared informational inbox: a JSONL store any system drops updates into.
 
 This is the producer front door for the informational lane (migration 0017): a
-one-shot content delivery -- a build seed, a heads-up, a "CI flaked twice
+one-shot content delivery -- a seed, a heads-up, a "CI flaked twice
 overnight" -- that reaches Patrick in the daily email under "Updates" and opens
 NO incident. A producer adds an item by calling the `inform` CLI (or appending a
 record line directly); the `informational_drip` source drains the inbox and a

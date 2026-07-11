@@ -1,8 +1,10 @@
 # Pitch seed drip (lodging-side)
 
-Wires **Pitch** — the daily LLM scan that finds build-worthy **seeds** — into
-angelus as a scheduled source, without any engine change. This is option C
-(the "drip") from SKEIN brief `brief-20260619-opi5`.
+Wires **Pitch** — the daily LLM scan for **what changed in the world** in
+Patrick's areas of interest — into angelus as a scheduled source, without any
+engine change. This is option C (the "drip") from SKEIN brief
+`brief-20260619-opi5`. Each seed is an event: what happened, its source, and
+when — never a move to make on it.
 
 ## Why a drip
 
@@ -38,12 +40,11 @@ is the lodging root, so the source resolves `state/pitch-seeds.jsonl` from cwd.
 
 | field          | meaning                                                              |
 | -------------- | ------------------------------------------------------------------- |
-| `id`           | stable hash of (`cannon`, `event`); dedup key + observation `state`. |
+| `id`           | stable hash of `event`; dedup key + observation `state`.            |
 | `discovered_at`| ISO-8601 UTC ms; drip order is oldest-first.                        |
-| `cannon`       | the prepared capability aimed at the event.                         |
-| `event`        | what changed in the world.                                          |
-| `build_move`   | the buildable response (the thing to ship).                        |
-| `severity`     | `"low"` default; `"high"` is reserved for the rare xz-scale seed.   |
+| `event`        | what changed in the world (one line).                              |
+| `source`       | primary URL for the change (may be empty).                         |
+| `date`         | when the change happened, as Pitch reported it (may be empty).     |
 | `emitted_at`   | `null` until drained, then the ISO-8601 UTC stamp of the tick.      |
 
 ### `discovered_at` ordering contract
@@ -103,14 +104,13 @@ store ⇒ one visible alert, no good seed blocked, torn bytes recoverable.
 
 ## Routing
 
-Normal seeds batch into the daily `seeds` pipe. `severity == "high"` (rare,
-xz-scale) **also** routes to the urgent `now` pipe via the triager's per-finding
-`target_pipes`, jumping the daily queue — the same mechanism the canary/http
-handlers use; no engine change. The daily `seeds` pipe stays a **never-drop
-floor** beneath the urgent jump: `urgent_pipe` is cross-ref validated at load now
-(finding-20260619-dle0), so a typo fails the config; the floor is
-defense-in-depth, so were an unknown `urgent_pipe` ever to reach it the seed still
-could not be dropped. See the handler's `_route`.
+Seeds are **informational**: every seed batches into the daily digest pipe,
+whatever its content, and opens **no incident** (decision 2026-06-22,
+finding-20260622-tf7x). A seed **never** jumps to `now`. The urgent `now` pipe
+carries only the `store_corrupt` torn-store CONDITION (see Torn rows) — a
+possibly-lost seed, a real alert. `urgent_pipe` is cross-ref validated at load
+(finding-20260619-dle0), and the daily pipe stays a **never-drop floor** beneath
+the corruption jump. See the handler's `_route`.
 
 ## Firing discipline
 
@@ -120,9 +120,9 @@ minute of triage. Do not tune this for silence.
 
 ## Out of scope here (private lodging repo, not this examples tree)
 
-The live `pitch` schedule that **writes** the store, the real cannons, and the
-live `state/pitch-seeds.jsonl`. This repo ships the contract and fixtures only —
-never real cannons or seed data.
+The live `pitch` schedule that **writes** the store, the real interest list, and
+the live `state/pitch-seeds.jsonl`. This repo ships the contract and fixtures only
+— never real interests or seed data.
 
 ---
 

@@ -2,7 +2,7 @@ cadence: 10m
 check:
   kind: shell
   # The Pitch seed drip (brief-20260619-opi5 option C). Pitch -- the daily LLM
-  # scan that finds build-worthy SEEDS -- runs on its OWN schedule (the `pitch`
+  # scan for what changed in the world -- runs on its OWN schedule (the `pitch`
   # mill chain, minutes long, decoupled so it never runs inside this seconds-
   # bounded source-fire) and writes seeds to state/pitch-seeds.jsonl. This fast
   # source is a thin reader: each tick drains the OLDEST unemitted seed, stamps

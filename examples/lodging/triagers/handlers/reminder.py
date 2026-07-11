@@ -10,7 +10,7 @@ fired_at and drains a reminder exactly once, and the catalog emission gate opens
 one incident per id and collapses an at-least-once re-emit. Because the id is
 random (never a content hash), two genuinely-distinct reminders that share a date
 and message still get distinct ids -> two findings, not one. (Contrast Pitch,
-whose stable cannon+event id is deliberate cross-run dedup.)
+whose stable event id is deliberate cross-run dedup.)
 
 Idle observations (nothing due) carry no reminder_id and produce no finding.
 

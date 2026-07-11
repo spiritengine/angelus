@@ -4,11 +4,12 @@ handler:
   kind: python
   path: triagers/handlers/pitch_seed.py
 metadata:
-  # Normal seeds batch into the daily `seeds` digest. severity=="high" (the rare
-  # xz-scale seed) ALSO routes to `urgent_pipe`, jumping the daily queue while
-  # `seeds` stays a never-drop floor -- see the handler's _route. Both name real
-  # pipes; both target_pipe and urgent_pipe are cross-ref validated at load
-  # (a typo fails the config -- finding-20260619-dle0), with the handler floor as
-  # defense-in-depth beneath that. clearance_pipe is omitted: seeds never clear.
+  # Seeds are INFORMATIONAL: every seed batches into the daily `seeds` digest,
+  # any content, and opens no incident. A seed never jumps to `now`
+  # (decision 2026-06-22, finding-20260622-tf7x). urgent_pipe carries ONLY the
+  # store_corrupt torn-store alert -- a real CONDITION, a possibly-lost seed --
+  # with `seeds` as the never-drop floor (see the handler's _route). Both
+  # target_pipe and urgent_pipe are cross-ref validated at load (a typo fails the
+  # config -- finding-20260619-dle0). clearance_pipe is omitted: seeds never clear.
   target_pipe: seeds
   urgent_pipe: now

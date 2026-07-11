@@ -2,11 +2,13 @@
 
 pitch_ingest.py parses the plain text the ``pitch`` mill chain emits and appends
 one seed per block to the store that the drip drains. Coverage:
-  - a multi-seed sample (mixed URGENCY) -> correct rows, correct severity
-    mapping (HOT -> high, WARM/MONITOR -> low).
-  - "No seeds today." (and empty input) -> store untouched.
-  - a malformed block (missing CANNON) among good ones -> skipped, the good ones
+  - a multi-seed sample -> correct rows (event/source/date), correct dedup id.
+  - source/date optional -> a block with only EVENT still ingests.
+  - "Nothing notable today." (and empty input) -> store untouched.
+  - a malformed block (missing EVENT) among good ones -> skipped, the good ones
     still ingest, no crash.
+  - a systemic store-write failure is NOT swallowed (crash loud, non-zero).
+  - an invalid-UTF-8 byte in a block value -> skipped loud, later blocks ingest.
   - idempotency: ingesting the same text twice -> no duplicate rows.
   - the ingested rows are valid seed rows and drain through the real drip.
 """
@@ -49,37 +51,22 @@ def _drip(store: Path) -> dict:
     return json.loads(result.stdout)
 
 
-# A realistic three-block sample with mixed urgency plus the NOISE FILTERED
-# trailer the chain appends.
+# A realistic three-block sample plus the NOISE FILTERED trailer the chain
+# appends.
 SAMPLE = """\
-EVENT: Skills shipped with no supply-chain guard
-SOURCE: https://example.com/skills
+EVENT: New frontier model shipped with a longer context window
+SOURCE: https://example.com/model
 DATE: 2026-06-20
-MARKERS: S1, S4, S7
-CANNON: 2. Bad Skillz audit cannon
-MOVE: Ship a scanner that flags malicious skill manifests.
-URGENCY: HOT (48h)
-SCOOP CHECK: not scooped
 ---
-EVENT: New Wayland a11y protocol draft landed
+EVENT: Wayland a11y protocol draft landed
 SOURCE: https://example.com/wayland
 DATE: 2026-06-19
-MARKERS: S2
-CANNON: 5. Tine/Wayland-a11y cannon
-MOVE: Prototype an accessibility bridge against the draft.
-URGENCY: WARM (5 days)
-SCOOP CHECK: n
 ---
-EVENT: Mass-LLM eval harness gap reported
-SOURCE: https://example.com/eval
+EVENT: Prediction-market platform added a new market class
+SOURCE: https://example.com/market
 DATE: 2026-06-18
-MARKERS: S3, S9
-CANNON: 3. mass-LLM-audit cannon
-MOVE: Build a batched eval runner for the reported gap.
-URGENCY: MONITOR
-SCOOP CHECK: n
 ---
-NOISE FILTERED: 9 (commentary-only, no cannon, already-shipped)
+NOISE FILTERED: 9 (commentary-only, no primary source, already covered)
 """
 
 
@@ -120,59 +107,52 @@ def _run_ingest_file(store: Path, input_file: Path) -> subprocess.CompletedProce
 
 
 # --------------------------------------------------------------------------
-# multi-seed parse + severity mapping
+# multi-seed parse -> event/source/date rows
 # --------------------------------------------------------------------------
 
 
-def test_multi_seed_sample_ingests_with_correct_severity(tmp_path: Path) -> None:
+def test_multi_seed_sample_ingests(tmp_path: Path) -> None:
     store = tmp_path / "seeds.jsonl"
     ingested, skipped, duplicate = ingest_mod.ingest(store, SAMPLE)
     assert (ingested, skipped, duplicate) == (3, 0, 0)
 
     seeds = ss.load_seeds(store)
-    by_cannon = {s["cannon"]: s for s in seeds}
+    by_event = {s["event"]: s for s in seeds}
     assert len(seeds) == 3
 
-    hot = by_cannon["2. Bad Skillz audit cannon"]
-    assert hot["event"] == "Skills shipped with no supply-chain guard"
-    assert hot["build_move"] == "Ship a scanner that flags malicious skill manifests."
-    assert hot["severity"] == "high", "HOT -> high (jumps to the now pipe)"
-
-    warm = by_cannon["5. Tine/Wayland-a11y cannon"]
-    assert warm["severity"] == "low", "WARM -> low (daily batch)"
-
-    monitor = by_cannon["3. mass-LLM-audit cannon"]
-    assert monitor["severity"] == "low", "MONITOR -> low (daily batch)"
-
-    # The id is the (cannon, event) digest seed_store keys dedup on.
-    assert hot["id"] == ss.seed_id(hot["cannon"], hot["event"])
+    first = by_event["New frontier model shipped with a longer context window"]
+    assert first["source"] == "https://example.com/model"
+    assert first["date"] == "2026-06-20"
+    # The id is the event digest seed_store keys dedup on.
+    assert first["id"] == ss.seed_id(first["event"])
 
 
-def test_missing_or_unknown_urgency_maps_low(tmp_path: Path) -> None:
+def test_source_and_date_optional(tmp_path: Path) -> None:
+    """EVENT is the only required field; a block with no SOURCE/DATE still ingests
+    (they default to empty strings)."""
     store = tmp_path / "seeds.jsonl"
     text = (
-        "EVENT: urgency line absent entirely\n"
-        "CANNON: 1. some cannon\n"
-        "MOVE: build the thing\n"
+        "EVENT: a change with no source line\n"
         "---\n"
-        "EVENT: urgency is gibberish\n"
-        "CANNON: 1. other cannon\n"
-        "MOVE: build the other thing\n"
-        "URGENCY: whenever-ish\n"
+        "EVENT: a change with only a date\n"
+        "DATE: 2026-06-20\n"
     )
     ingested, skipped, duplicate = ingest_mod.ingest(store, text)
     assert (ingested, skipped, duplicate) == (2, 0, 0)
-    assert {s["severity"] for s in ss.load_seeds(store)} == {"low"}
+    seeds = {s["event"]: s for s in ss.load_seeds(store)}
+    assert seeds["a change with no source line"]["source"] == ""
+    assert seeds["a change with no source line"]["date"] == ""
+    assert seeds["a change with only a date"]["date"] == "2026-06-20"
 
 
 # --------------------------------------------------------------------------
-# "No seeds today." / empty -> no-op
+# "Nothing notable today." / empty -> no-op
 # --------------------------------------------------------------------------
 
 
-def test_no_seeds_today_leaves_store_untouched(tmp_path: Path) -> None:
+def test_nothing_notable_leaves_store_untouched(tmp_path: Path) -> None:
     store = tmp_path / "seeds.jsonl"
-    ingested, skipped, duplicate = ingest_mod.ingest(store, "No seeds today.\n")
+    ingested, skipped, duplicate = ingest_mod.ingest(store, "Nothing notable today.\n")
     assert (ingested, skipped, duplicate) == (0, 0, 0)
     assert not store.exists(), "a no-seed scan writes nothing to the store"
     assert ss.load_seeds(store) == []
@@ -186,34 +166,28 @@ def test_empty_input_is_a_noop(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------
-# malformed block among good ones -> skipped, not fatal
+# malformed block (missing EVENT) among good ones -> skipped, not fatal
 # --------------------------------------------------------------------------
 
 
-def test_malformed_block_missing_cannon_is_skipped(tmp_path: Path) -> None:
+def test_malformed_block_missing_event_is_skipped(tmp_path: Path) -> None:
     store = tmp_path / "seeds.jsonl"
     text = (
         "EVENT: good one\n"
-        "CANNON: 1. real cannon\n"
-        "MOVE: build it\n"
-        "URGENCY: WARM\n"
+        "SOURCE: https://example.com/a\n"
         "---\n"
-        "EVENT: this block has no cannon\n"
-        "MOVE: build something\n"
-        "URGENCY: HOT (48h)\n"
+        "SOURCE: https://example.com/no-event\n"
+        "DATE: 2026-06-20\n"
         "---\n"
         "EVENT: another good one\n"
-        "CANNON: 2. real cannon\n"
-        "MOVE: build it too\n"
-        "URGENCY: MONITOR\n"
+        "SOURCE: https://example.com/b\n"
     )
     ingested, skipped, duplicate = ingest_mod.ingest(store, text)
     assert ingested == 2, "the two complete blocks ingest"
-    assert skipped == 1, "the block missing CANNON is skipped, not fatal"
+    assert skipped == 1, "the block missing EVENT is skipped, not fatal"
     assert duplicate == 0
     events = {s["event"] for s in ss.load_seeds(store)}
     assert events == {"good one", "another good one"}
-    assert "this block has no cannon" not in events
 
 
 def test_cli_skips_malformed_and_warns(tmp_path: Path) -> None:
@@ -221,10 +195,9 @@ def test_cli_skips_malformed_and_warns(tmp_path: Path) -> None:
     store = tmp_path / "seeds.jsonl"
     text = (
         "EVENT: good\n"
-        "CANNON: 1. c\n"
-        "MOVE: m\n"
+        "SOURCE: https://example.com/g\n"
         "---\n"
-        "EVENT: no move, no cannon\n"
+        "SOURCE: https://example.com/no-event\n"
     )
     result = _run_ingest(store, text)
     assert result.returncode == 0
@@ -248,12 +221,7 @@ def test_cli_skips_malformed_and_warns(tmp_path: Path) -> None:
 
 def test_store_write_failure_is_not_swallowed(tmp_path: Path, monkeypatch) -> None:
     store = tmp_path / "seeds.jsonl"
-    text = (
-        "EVENT: a perfectly good block\n"
-        "CANNON: 1. real cannon\n"
-        "MOVE: build it\n"
-        "URGENCY: WARM\n"
-    )
+    text = "EVENT: a perfectly good block\nSOURCE: https://example.com/x\n"
 
     def boom(*_args, **_kwargs):
         raise OSError(28, "No space left on device")
@@ -280,12 +248,7 @@ def test_cli_store_write_failure_exits_nonzero(tmp_path: Path) -> None:
     blocker = tmp_path / "not-a-dir"
     blocker.write_text("i am a file, not a directory\n")
     store = blocker / "seeds.jsonl"  # parent is a file -> mkdir/open fails
-    text = (
-        "EVENT: a perfectly good block\n"
-        "CANNON: 1. real cannon\n"
-        "MOVE: build it\n"
-        "URGENCY: WARM\n"
-    )
+    text = "EVENT: a perfectly good block\nSOURCE: https://example.com/x\n"
     result = subprocess.run(
         [sys.executable, str(INGEST), str(store)],
         input=text,
@@ -315,15 +278,9 @@ def test_cli_store_write_failure_exits_nonzero(tmp_path: Path) -> None:
 TOXIC_THEN_GOOD = (
     b"EVENT: toxic \xff event\n"
     b"SOURCE: https://example.com/toxic\n"
-    b"CANNON: 9. toxic cannon\n"
-    b"MOVE: build the toxic thing\n"
-    b"URGENCY: WARM\n"
     b"---\n"
     b"EVENT: good block after the toxic one\n"
     b"SOURCE: https://example.com/good\n"
-    b"CANNON: 8. good cannon\n"
-    b"MOVE: build the good thing\n"
-    b"URGENCY: HOT (48h)\n"
 )
 
 
@@ -338,7 +295,6 @@ def test_toxic_byte_skipped_later_block_ingests_stdin(tmp_path: Path) -> None:
     seeds = ss.load_seeds(store)
     assert len(seeds) == 1, "only the good block landed; later block not dropped"
     assert seeds[0]["event"] == "good block after the toxic one"
-    assert seeds[0]["severity"] == "high"
 
 
 def test_toxic_byte_skipped_later_block_ingests_file(tmp_path: Path) -> None:
@@ -356,29 +312,35 @@ def test_toxic_byte_skipped_later_block_ingests_file(tmp_path: Path) -> None:
     assert seeds[0]["event"] == "good block after the toxic one"
 
 
-# --------------------------------------------------------------------------
-# severity: HOT escalates from ANY token position; truly unknown stays low
-# --------------------------------------------------------------------------
+# A toxic byte in the now-STORED SOURCE (an OPTIONAL field), followed by a good
+# block. EVENT is strict-encoded via seed_id; SOURCE/DATE are strict-encoded at
+# ingest too so a bad byte there is a graceful skip-loud here -- NOT a clean
+# ingest that later trips the drain's surrogate quarantine and pages
+# store_corrupt (urgent) over an optional field.
+TOXIC_SOURCE_THEN_GOOD = (
+    b"EVENT: a clean event line\n"
+    b"SOURCE: https://example.com/\xff/toxic\n"
+    b"DATE: 2026-06-20\n"
+    b"---\n"
+    b"EVENT: good block after the toxic source\n"
+    b"SOURCE: https://example.com/good\n"
+)
 
 
-def test_severity_hot_matches_any_token_position() -> None:
-    # Canonical and decorated HOT markers all escalate -- the LLM does not always
-    # lead with the bare token.
-    assert ingest_mod._severity("HOT (48h)") == "high"
-    assert ingest_mod._severity("🔥 HOT") == "high"
-    assert ingest_mod._severity("Critical HOT") == "high"
-    assert ingest_mod._severity("Critical/HOT") == "high"
-    assert ingest_mod._severity("URGENT - HOT") == "high"
-    assert ingest_mod._severity("hot (48h)") == "high", "case-insensitive"
+def test_toxic_byte_in_source_skipped_at_ingest(tmp_path: Path) -> None:
+    store = tmp_path / "seeds.jsonl"
+    result = _run_ingest_stdin_bytes(store, TOXIC_SOURCE_THEN_GOOD)
+    assert result.returncode == 0, "a toxic SOURCE byte must not crash the run"
+    stderr = result.stderr.decode("utf-8", errors="replace")
+    assert "skipping unstorable block" in stderr, "the toxic-source block is skipped loud"
+    assert "1 seed(s) ingested, 1 skipped" in stderr, "summary printed; toxic counted"
 
-    # No HOT token -> low. A substring is not a token, so HOTEL does not escalate;
-    # truly unknown / missing / WARM / MONITOR never false-escalate to a page.
-    assert ingest_mod._severity("whenever") == "low"
-    assert ingest_mod._severity("HOTEL booking") == "low"
-    assert ingest_mod._severity("WARM (5 days)") == "low"
-    assert ingest_mod._severity("MONITOR") == "low"
-    assert ingest_mod._severity("") == "low"
-    assert ingest_mod._severity(None) == "low"
+    seeds = ss.load_seeds(store)
+    assert len(seeds) == 1, "only the clean block landed; the toxic-source block skipped"
+    assert seeds[0]["event"] == "good block after the toxic source"
+    # Nothing toxic reached the store, so a later drain raises no store_corrupt.
+    _, malformed = ss._parse_store(store)
+    assert malformed == [], "no torn row left behind -> no drain-time corruption page"
 
 
 # --------------------------------------------------------------------------
@@ -391,8 +353,8 @@ def test_ingest_is_idempotent(tmp_path: Path) -> None:
     first = ingest_mod.ingest(store, SAMPLE)
     assert first == (3, 0, 0)
 
-    # The same scan again: append_seed dedups on the (cannon, event) id, so no new
-    # rows land -- every block reports as a duplicate, none ingested.
+    # The same scan again: append_seed dedups on the event id, so no new rows
+    # land -- every block reports as a duplicate, none ingested.
     second = ingest_mod.ingest(store, SAMPLE)
     assert second == (0, 0, 3), "re-ingesting the same scan adds nothing"
     assert len(ss.load_seeds(store)) == 3, "no duplicate rows in the store"
@@ -417,7 +379,7 @@ def test_ingested_rows_are_valid_and_drain(tmp_path: Path) -> None:
     obs = _drip(store)
     assert obs["type"] == "seed"
     assert obs["state"] == obs["seed_id"]
-    assert obs["cannon"] in {s["cannon"] for s in seeds}
+    assert obs["event"] in {s["event"] for s in seeds}
 
     # That seed is now stamped emitted; the next drip drains the next one.
     emitted = [s for s in ss.load_seeds(store) if s["emitted_at"] is not None]

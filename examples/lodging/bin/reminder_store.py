@@ -30,8 +30,8 @@ drip process are TWO processes writing one file.
 
 How reminders DIFFER from seeds (the load-bearing deltas)
 ---------------------------------------------------------
-1. ID IS RANDOM, NOT A CONTENT HASH. A seed's id hashes (cannon, event) BECAUSE
-   the same seed legitimately recurs across Pitch runs and must dedup forever. A
+1. ID IS RANDOM, NOT A CONTENT HASH. A seed's id hashes its event BECAUSE
+   the same event legitimately recurs across Pitch runs and must dedup forever. A
    reminder does not recur -- each ``reminder add`` is a distinct intent, even if
    two carry the same date and message ("call mom" filed twice). A content hash
    would silently drop the second add (append dedups on id), collapse two

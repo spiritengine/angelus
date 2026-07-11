@@ -18,39 +18,32 @@ this at ``state/pitch-seeds.jsonl`` under the lodging root).
 
 The pitch text format (what ``mill crank pitch`` emits)
 -------------------------------------------------------
-Either the literal line ``No seeds today.`` (a no-op here), or up to five blocks
-delimited by lines of ``---``, each block::
+Either the literal line ``Nothing notable today.`` (a no-op here), or up to ten
+blocks delimited by lines of ``---``, each block::
 
-    EVENT: [one line]
-    SOURCE: [url]
-    DATE: [when]
-    MARKERS: [S1-S10 list]
-    CANNON: [number and name]
-    MOVE: [one sentence -- what to build]
-    URGENCY: HOT (48h) / WARM (5 days) / MONITOR
-    SCOOP CHECK: [scooped? y/n]
+    EVENT: [one line -- what changed]
+    SOURCE: [primary url]
+    DATE: [when it happened]
 
 followed by a trailing ``NOISE FILTERED: [count, reasons]`` line (ignored -- it
 carries none of the seed fields, so it parses to zero recognized fields and is
 skipped silently, like any blank/non-block chunk).
 
 Mapping to a seed (seed_store.make_seed):
-    cannon     <- CANNON      event      <- EVENT      build_move <- MOVE
-    severity   <- URGENCY:  HOT -> "high" (the rare seed that jumps to the urgent
-               ``now`` pipe); WARM, MONITOR, or a missing/unknown urgency ->
-               "low" (the daily ``seeds`` batch). seed_store keys dedup on
-               (cannon, event), so re-ingesting the same scan is idempotent.
+    event <- EVENT      source <- SOURCE      date <- DATE
+    seed_store keys dedup on the event, so re-ingesting the same scan is
+    idempotent.
 
 Defensive contract
 -------------------
 LLM output is not trusted to be well-formed. A chunk that carries at least one
-recognized field but is missing one a seed needs (EVENT, CANNON, or MOVE) is a
+recognized field but is missing EVENT (the one field a seed needs) is a
 MALFORMED block: it is skipped with a stderr warning and counted, never fatal --
 the remaining blocks still ingest. A chunk with no recognized fields at all (a
-blank chunk, the NOISE FILTERED trailer, the ``No seeds today.`` line) is not a
-block and is skipped silently. Dedup is automatic (append_seed is idempotent on
-the (cannon, event) id), so re-running the adapter on the same text adds nothing.
-A one-line summary (N ingested, M skipped, D duplicate) goes to stderr.
+blank chunk, the NOISE FILTERED trailer, the ``Nothing notable today.`` line) is
+not a block and is skipped silently. Dedup is automatic (append_seed is
+idempotent on the event id), so re-running the adapter on the same text adds
+nothing. A one-line summary (N ingested, M skipped, D duplicate) goes to stderr.
 """
 
 from __future__ import annotations
@@ -68,15 +61,13 @@ import seed_store  # noqa: E402  (path injected above)
 
 # The recognized field keys of a pitch block. A chunk that contains none of these
 # is not a block (it is the NOISE FILTERED trailer, a blank chunk, or the
-# "No seeds today." line) and is skipped silently. EVENT/CANNON/MOVE are the
-# three a seed actually needs; the rest are parsed-but-unused context.
-FIELD_KEYS = frozenset(
-    {"EVENT", "SOURCE", "DATE", "MARKERS", "CANNON", "MOVE", "URGENCY", "SCOOP CHECK"}
-)
+# "Nothing notable today." line) and is skipped silently. EVENT is the only field
+# a seed actually needs; SOURCE and DATE are parsed-but-optional context.
+FIELD_KEYS = frozenset({"EVENT", "SOURCE", "DATE"})
 
 # The fields make_seed needs to build a seed. A chunk that looks like a block (has
 # at least one recognized field) but lacks any of these is malformed -> skipped.
-REQUIRED_FIELDS = ("EVENT", "CANNON", "MOVE")
+REQUIRED_FIELDS = ("EVENT",)
 
 # A delimiter line: three or more dashes, nothing else (after stripping).
 _DELIMITER = re.compile(r"-{3,}")
@@ -122,37 +113,11 @@ def _parse_block(chunk: str) -> dict[str, str]:
     return fields
 
 
-def _severity(urgency: str | None) -> str:
-    """Map the URGENCY field to a seed severity.
-
-    HOT -> "high" (the rare seed that jumps to the urgent ``now`` pipe). WARM,
-    MONITOR, or a missing/blank/unknown urgency -> "low" (the daily ``seeds``
-    batch).
-
-    HOT is matched as a case-insensitive WHOLE TOKEN anywhere in the value, not
-    only in first position: the LLM decorates the marker in ways the canonical
-    "HOT (48h)" does not anticipate -- "🔥 HOT", "Critical/HOT", "URGENT - HOT".
-    A leading-token-only match buried all of those in the daily batch, losing the
-    be-first window this feature exists to protect. We split on non-alphanumerics
-    (so "HOT", "🔥HOT", "Critical/HOT", "HOT(48h)" all yield a bare "HOT" token)
-    and escalate if any token is "HOT". A substring "HOTEL" yields a "HOTEL"
-    token, not "HOT", so it does not false-escalate. Anything with no HOT token --
-    truly unknown, missing, WARM, MONITOR -- stays "low": ambiguous input never
-    false-escalates to a page.
-    """
-    if not urgency:
-        return "low"
-    tokens = re.split(r"[^0-9A-Za-z]+", urgency.upper())
-    if "HOT" in tokens:
-        return "high"
-    return "low"
-
-
 def ingest(store: str | Path, text: str) -> tuple[int, int, int]:
     """Parse pitch text and append each good block to the store.
 
     Returns (ingested, skipped, duplicate): newly-appended seeds, malformed
-    blocks skipped, and blocks whose (cannon, event) id was already in the store
+    blocks skipped, and blocks whose event id was already in the store
     (append_seed dedup). Never raises on malformed block CONTENT -- a bad block
     (missing field, or a toxic field value make_seed rejects) is skipped, not
     fatal. It DOES propagate a SYSTEMIC store-write failure (append_seed raising
@@ -167,7 +132,7 @@ def ingest(store: str | Path, text: str) -> tuple[int, int, int]:
         fields = _parse_block(chunk)
         if not fields:
             # No recognized fields: a blank chunk, the NOISE FILTERED trailer, or
-            # the "No seeds today." line. Not a block -- skipped silently.
+            # the "Nothing notable today." line. Not a block -- skipped silently.
             continue
         missing = [name for name in REQUIRED_FIELDS if not fields.get(name)]
         if missing:
@@ -199,14 +164,22 @@ def ingest(store: str | Path, text: str) -> tuple[int, int, int]:
         # preserved-line + store_corrupt alert path -- only a stderr line cron may
         # not surface). So a store-write failure PROPAGATES: the run crashes loud
         # and non-zero. Re-running is idempotent (append_seed dedups on the
-        # (cannon, event) id), so crash-then-fix-then-rerun loses nothing.
+        # event id), so crash-then-fix-then-rerun loses nothing.
         try:
             seed = seed_store.make_seed(
-                cannon=fields["CANNON"],
                 event=fields["EVENT"],
-                build_move=fields["MOVE"],
-                severity=_severity(fields.get("URGENCY")),
+                source=fields.get("SOURCE", ""),
+                date=fields.get("DATE", ""),
             )
+            # seed_id (inside make_seed) strict-encodes EVENT, so a lone surrogate
+            # there raises UnicodeEncodeError and is skipped-loud below. SOURCE and
+            # DATE are now STORED too, but make_seed does not encode them -- so
+            # strict-encode them here to keep the same graceful skip. Without this
+            # a toxic byte in SOURCE/DATE ingests "clean", then trips the drain's
+            # surrogate quarantine -> a store_corrupt urgent page over an optional
+            # field. The encoded bytes are discarded; we only want the raise.
+            seed["source"].encode()
+            seed["date"].encode()
         except (UnicodeEncodeError, ValueError, TypeError) as exc:
             sys.stderr.write(
                 "pitch_ingest: skipping unstorable block "

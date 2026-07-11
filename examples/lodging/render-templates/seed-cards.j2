@@ -10,9 +10,10 @@ Pitch seeds since last digest ({{ findings_since_last_drain|length }}):
 - [{{ f.severity|default("high", true) }}] seed store corruption -- {{ f.body.malformed_lines|default("?", true) }} malformed line(s)
   preserved in state/pitch-seeds.jsonl -- inspect and repair so the row drains
 {% else -%}
-- [{{ f.severity|default("low", true) }}] {{ f.body.event|default(f.entity, true) }}
-  cannon: {{ f.body.cannon|default("?", true) }}
-  build: {{ f.body.build_move|default("?", true) }}
+- [scan] {{ f.body.event|default(f.entity, true) }}
+{% if f.body.source %}  {{ f.body.source }}{{ "  (" ~ f.body.date ~ ")" if f.body.date else "" }}
+{% elif f.body.date %}  ({{ f.body.date }})
+{% endif -%}
 {% endif -%}
 {% endfor -%}
 {% else %}
