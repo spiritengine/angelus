@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import socket as socketlib
 import sqlite3
@@ -22,7 +23,7 @@ import pytest
 from click.testing import CliRunner
 
 from angelus.cli import _ro_connect, main
-from angelus.control import MAX_REQUEST_BYTES
+from angelus.control import MAX_REQUEST_BYTES, ControlServer
 from angelus.daemon import AngelusDaemon
 from angelus.storage import Catalog, init_db
 
@@ -149,6 +150,55 @@ def test_malformed_request_then_server_survives(tmp_path) -> None:
             daemon.connection.close()
 
     asyncio.run(driver())
+
+
+def test_escaped_response_crash_gets_generic_error_response(tmp_path) -> None:
+    async def unserializable(_args):
+        return object()
+
+    async def driver() -> None:
+        server = ControlServer(
+            tmp_path / "angelus.sock",
+            {"unserializable": unserializable},
+        )
+        await server.start()
+        try:
+            response = await _ask(
+                server.socket_path, {"op": "unserializable"}
+            )
+        finally:
+            await server.stop()
+
+        assert response == {"ok": False}
+
+    asyncio.run(driver())
+
+
+def test_undeliverable_response_is_logged(caplog) -> None:
+    class ResetAfterWrite:
+        def __init__(self) -> None:
+            self.written = b""
+
+        def write(self, data: bytes) -> None:
+            self.written += data
+
+        async def drain(self) -> None:
+            raise ConnectionResetError("peer reset after write")
+
+    writer = ResetAfterWrite()
+    server = ControlServer(Path("unused.sock"), {})
+
+    with caplog.at_level(logging.WARNING, logger="angelus.control"):
+        asyncio.run(server._respond(writer, {"ok": True}))
+
+    assert writer.written == b'{"ok": true}\n'
+    records = [
+        record
+        for record in caplog.records
+        if record.message == "failed to deliver control response"
+    ]
+    assert len(records) == 1
+    assert records[0].exc_info is not None
 
 
 def test_oversized_request_refused_and_server_survives(tmp_path) -> None:

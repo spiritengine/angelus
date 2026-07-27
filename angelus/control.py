@@ -176,6 +176,9 @@ class ControlServer:
         except Exception:
             # One bad client must not take the server down.
             LOGGER.exception("control connection handler crashed")
+            # The specific response path is already suspect; still give the
+            # client a parseable failure before closing whenever possible.
+            await self._respond(writer, {"ok": False})
         finally:
             if task is not None:
                 self._handlers.discard(task)
@@ -225,4 +228,4 @@ class ControlServer:
             writer.write((json.dumps(payload) + "\n").encode("utf-8"))
             await writer.drain()
         except (OSError, ConnectionError):
-            pass
+            LOGGER.warning("failed to deliver control response", exc_info=True)
