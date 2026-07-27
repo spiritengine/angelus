@@ -169,7 +169,8 @@ def load_env_file(state: Path) -> None:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return
-    except OSError:
+    except OSError as exc:
+        log_err(f"sre-runner: cannot read env file {path}: {exc}")
         return
     for raw in text.splitlines():
         line = raw.strip()
@@ -697,6 +698,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except OSError as exc:
         log_err(f"sre-runner: cannot acquire lock {lock_path}: {exc}")
+        append_fixers_log(
+            fixers_log_path(state),
+            "sre-runner",
+            "blocked-lock-error",
+            f"{lock_path}: {exc}",
+            "escalation-blocked",
+        )
         return 0
 
     try:
@@ -714,6 +722,7 @@ def _run(state: Path) -> int:
 
     # Step 2: sentinel check
     nsre_path = needs_sre_path(state)
+    flog_path = fixers_log_path(state)
     try:
         sentinel_text = nsre_path.read_text(encoding="utf-8").strip()
     except FileNotFoundError:
@@ -721,12 +730,18 @@ def _run(state: Path) -> int:
         return 0
     except OSError as exc:
         log_err(f"sre-runner: cannot read needs-sre sentinel {nsre_path}: {exc}")
+        append_fixers_log(
+            flog_path,
+            "sre-runner",
+            "blocked-sentinel-read",
+            f"{nsre_path}: {exc}",
+            "escalation-blocked",
+        )
         return 0
 
     sentinel_reason = sentinel_text
     log_err(f"sre-runner: needs-sre sentinel active: {sentinel_reason}")
 
-    flog_path = fixers_log_path(state)
     last_spawn_path = sre_last_spawn_path(state)
     spawn_log = sre_spawn_log_path(state)
     now_ts = time.time()
@@ -734,8 +749,15 @@ def _run(state: Path) -> int:
     # Step 3a: MIN_SPAWN_INTERVAL guard
     try:
         last_ts = read_last_spawn_ts(last_spawn_path)
-    except OSError:
+    except OSError as exc:
         log_err("sre-runner: cannot read last-spawn state; blocking spawn (fail-safe)")
+        append_fixers_log(
+            flog_path,
+            "sre-runner",
+            "blocked-last-spawn-read",
+            f"{last_spawn_path}: {exc}",
+            "escalation-blocked",
+        )
         return 0
 
     min_interval = min_spawn_interval_sec()
@@ -752,8 +774,15 @@ def _run(state: Path) -> int:
     # Step 3b: MAX_SPAWNS_PER_WINDOW guard
     try:
         all_spawn_ts = read_spawn_log(spawn_log)
-    except OSError:
+    except OSError as exc:
         log_err("sre-runner: cannot read spawn log; blocking spawn (fail-safe)")
+        append_fixers_log(
+            flog_path,
+            "sre-runner",
+            "blocked-spawn-log-read",
+            f"{spawn_log}: {exc}",
+            "escalation-blocked",
+        )
         return 0
 
     n_max = max_spawns_cfg()

@@ -144,6 +144,38 @@ def _spindle_dispatch(wait_stdout: str, spools_stdout: str):
     return _run
 
 
+def test_unreadable_env_file_is_stderr_diagnostic_only(tmp_path, capsys):
+    runner = _load_runner()
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / runner.DEFAULT_ENV_FILENAME).mkdir()
+
+    runner.load_env_file(state)
+
+    assert "cannot read env file" in capsys.readouterr().err
+    assert _read_fixers_log(state) == []
+
+
+def test_unreadable_sentinel_blocks_escalation_and_appends_fixers_log(
+    tmp_path, capsys
+):
+    runner = _load_runner()
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / runner.DEFAULT_NEEDS_SRE_FILENAME).mkdir()
+
+    with patch.object(runner, "spindle_spin") as mock_spin:
+        rc = runner._run(state)
+
+    assert rc == 0
+    mock_spin.assert_not_called()
+    assert "cannot read needs-sre sentinel" in capsys.readouterr().err
+    log_lines = _read_fixers_log(state)
+    assert len(log_lines) == 1
+    assert "action=blocked-sentinel-read" in log_lines[0]
+    assert "outcome=escalation-blocked" in log_lines[0]
+
+
 # ---------------------------------------------------------------------------
 # Test: no sentinel -> no spawn
 # ---------------------------------------------------------------------------
@@ -160,6 +192,7 @@ def test_no_sentinel_no_spawn(tmp_path):
     assert rc == 0
     mock_spin.assert_not_called()
     mock_notify.assert_not_called()
+    assert _read_fixers_log(state) == []
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +421,10 @@ def test_fail_safe_unreadable_spawn_log(tmp_path):
 
     assert rc == 0
     mock_spin.assert_not_called()
+    log_lines = _read_fixers_log(state)
+    assert len(log_lines) == 1
+    assert "action=blocked-spawn-log-read" in log_lines[0]
+    assert "outcome=escalation-blocked" in log_lines[0]
 
 
 def test_fail_safe_unreadable_last_spawn(tmp_path):
@@ -404,6 +441,10 @@ def test_fail_safe_unreadable_last_spawn(tmp_path):
 
     assert rc == 0
     mock_spin.assert_not_called()
+    log_lines = _read_fixers_log(state)
+    assert len(log_lines) == 1
+    assert "action=blocked-last-spawn-read" in log_lines[0]
+    assert "outcome=escalation-blocked" in log_lines[0]
 
 
 def test_fail_safe_unwritable_spawn_log(tmp_path):
@@ -494,6 +535,41 @@ def test_sentinel_cleared_when_daemon_healthy(tmp_path):
     assert not (state / "belfry-needs-sre").exists()
     # spawn state also cleared
     assert not (state / "sre-last-spawn-at").exists()
+
+
+def test_sentinel_clear_error_is_stderr_diagnostic_only(tmp_path, capsys):
+    runner = _load_runner()
+    state = tmp_path / "state"
+    _write_sentinel(state, "test")
+    sentinel_path = state / runner.DEFAULT_NEEDS_SRE_FILENAME
+    real_unlink = Path.unlink
+
+    def fail_only_sentinel_unlink(path, *args, **kwargs):
+        if path == sentinel_path:
+            raise OSError("EIO")
+        return real_unlink(path, *args, **kwargs)
+
+    with patch.object(
+        Path, "unlink", autospec=True, side_effect=fail_only_sentinel_unlink
+    ), patch.object(
+        runner, "resolve_engine_repo", return_value=REPO_ROOT
+    ), patch.object(
+        runner, "spindle_spin", side_effect=_spin_writes_report("spoolA")
+    ), patch.object(
+        runner, "spindle_wait", return_value="completed"
+    ), patch.object(
+        runner, "check_daemon_healthy", return_value=True
+    ), patch.object(runner, "notify_pat"):
+        rc = runner._run(state)
+
+    assert rc == 0
+    assert sentinel_path.exists()
+    assert "failed to clear needs-sre sentinel" in capsys.readouterr().err
+    log_lines = _read_fixers_log(state)
+    assert len(log_lines) == 2
+    assert any("action=spawn" in line for line in log_lines)
+    assert any("action=resolved" in line for line in log_lines)
+    assert not any("blocked-sentinel" in line for line in log_lines)
 
 
 def test_sentinel_retained_when_daemon_still_down(tmp_path):
@@ -1048,6 +1124,25 @@ def test_typed_error_spool_unhealthy_daemon_retains_sentinel(tmp_path):
 # Test: lock held -> tick no-ops.
 # ---------------------------------------------------------------------------
 
+def test_lock_error_blocks_escalation_and_appends_fixers_log(tmp_path, capsys):
+    runner = _load_runner()
+    state = tmp_path / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    _write_sentinel(state, "test")
+
+    with patch.object(runner.fcntl, "flock", side_effect=OSError("EIO")), \
+         patch.object(runner, "_run") as mock_run:
+        rc = runner.main([str(tmp_path)])
+
+    assert rc == 0
+    mock_run.assert_not_called()
+    assert "cannot acquire lock" in capsys.readouterr().err
+    log_lines = _read_fixers_log(state)
+    assert len(log_lines) == 1
+    assert "action=blocked-lock-error" in log_lines[0]
+    assert "outcome=escalation-blocked" in log_lines[0]
+
+
 def test_lock_held_exits_cleanly(tmp_path):
     runner = _load_runner()
     state = tmp_path / "state"
@@ -1069,6 +1164,7 @@ def test_lock_held_exits_cleanly(tmp_path):
 
     assert rc == 0
     mock_spin.assert_not_called()
+    assert _read_fixers_log(state) == []
 
 
 # ---------------------------------------------------------------------------
