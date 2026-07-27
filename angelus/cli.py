@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import socket
 import sqlite3
@@ -41,6 +42,8 @@ from angelus.daemon import main as daemon_main
 from angelus.lodging.config import _load_dependencies
 from angelus.sources import run_dep_check
 from angelus.storage import Catalog
+
+LOGGER = logging.getLogger(__name__)
 
 _ROOT_OPTION = click.option(
     "--root",
@@ -114,7 +117,15 @@ def _installed_version(root: Path) -> str:
             .strip()
             or "unknown"
         )
-    except OSError:
+    except FileNotFoundError:
+        return "unknown"
+    except OSError as exc:
+        LOGGER.warning(
+            "cannot read installed version %s: errno=%s (%s)",
+            root / "state" / "installed-version",
+            exc.errno,
+            exc,
+        )
         return "unknown"
 
 

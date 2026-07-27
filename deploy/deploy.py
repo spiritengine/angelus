@@ -906,7 +906,11 @@ def read_stamp(cfg: Config) -> str:
         return cfg.stamp_file.read_text(encoding="utf-8").strip() or "unknown"
     except FileNotFoundError:
         return "unknown"
-    except OSError:
+    except OSError as exc:
+        err(
+            f"cannot read installed-version stamp {cfg.stamp_file}: "
+            f"errno={exc.errno} ({exc})"
+        )
         return "unknown"
 
 

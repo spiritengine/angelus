@@ -30,9 +30,13 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
+import logging
+import stat
 import subprocess
 import urllib.parse
 from pathlib import Path
+
+LOGGER = logging.getLogger(__name__)
 
 # Default age (days) the oldest un-deployed commit must exceed before the daily
 # digest surfaces a behind-master staleness line. Master running ahead of the
@@ -123,13 +127,23 @@ def _is_engine_repo(path: Path) -> bool:
     stat calls raise ValueError) returns ``False`` rather than propagating, so
     the digest staleness path can never crash on a weird provenance url."""
     try:
-        return (
-            path.is_dir()
-            and (path / ".git").exists()
-            and (path / "angelus" / "__init__.py").is_file()
-            and (path / "Makefile").is_file()
+        if not stat.S_ISDIR(path.stat().st_mode):
+            return False
+        (path / ".git").stat()
+        if not stat.S_ISREG((path / "angelus" / "__init__.py").stat().st_mode):
+            return False
+        return stat.S_ISREG((path / "Makefile").stat().st_mode)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        LOGGER.warning(
+            "cannot inspect engine repo %s: errno=%s (%s)",
+            path,
+            exc.errno,
+            exc,
         )
-    except (OSError, ValueError):
+        return False
+    except ValueError:
         return False
 
 
@@ -198,7 +212,15 @@ def deploy_staleness(
         if log_proc.returncode != 0:
             return None
         oldest_epoch = float(log_proc.stdout.strip().splitlines()[0])
-    except (ValueError, IndexError, OSError, subprocess.SubprocessError):
+    except OSError as exc:
+        LOGGER.warning(
+            "cannot read deploy staleness for %s: errno=%s (%s)",
+            repo,
+            exc.errno,
+            exc,
+        )
+        return None
+    except (ValueError, IndexError, subprocess.SubprocessError):
         return None
     oldest_days = (now_epoch - oldest_epoch) / _SECONDS_PER_DAY
     if oldest_days < threshold_days:

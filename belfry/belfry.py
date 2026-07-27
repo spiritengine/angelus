@@ -518,7 +518,10 @@ def hold_status(state_dir: Path) -> tuple[str, float | None]:
     except FileNotFoundError:
         return ("absent", None)
     except OSError as exc:
-        log_err(f"angelus belfry: cannot stat deploy hold {path}: {exc}")
+        log_err(
+            f"angelus belfry: cannot stat deploy hold {path}: "
+            f"errno={exc.errno} ({exc})"
+        )
         return ("absent", None)
     age = time.time() - mtime
     if age < hold_max_age_sec():

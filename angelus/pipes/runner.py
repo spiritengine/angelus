@@ -1338,6 +1338,13 @@ class PipeDrain:
         omitted rather than crashing the daily digest."""
         try:
             return deploy_staleness(self._clock.now().timestamp())
+        except OSError as exc:
+            LOGGER.warning(
+                "cannot read deploy staleness: errno=%s (%s)",
+                exc.errno,
+                exc,
+            )
+            return None
         except Exception:  # pragma: no cover - belt-and-suspenders, digest-only
             return None
 
@@ -1823,10 +1830,22 @@ def _prune_digest_staging(
         return
     try:
         staged = sorted(
-            (p for p in staging_dir.glob("*.txt") if p.is_file()),
+            (
+                p
+                for p in staging_dir.iterdir()
+                if p.name.endswith(".txt") and p.is_file()
+            ),
             key=lambda p: p.name,
         )
-    except OSError:
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        LOGGER.warning(
+            "cannot read digest staging directory %s: errno=%s (%s)",
+            staging_dir,
+            exc.errno,
+            exc,
+        )
         return
     for stale in staged[:-keep]:
         with contextlib.suppress(OSError):
@@ -1843,11 +1862,17 @@ def _gather_fixer_actions(
     an optional report_excerpt dict (outcome/root-cause fields) is attached
     when the report file exists.
     """
-    if not log_path.exists():
-        return []
     try:
         text = log_path.read_text(encoding="utf-8")
-    except OSError:
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        LOGGER.warning(
+            "cannot read fixer actions log %s: errno=%s (%s)",
+            log_path,
+            exc.errno,
+            exc,
+        )
         return []
     actions: list[dict[str, Any]] = []
     for raw_line in text.splitlines():
@@ -1890,7 +1915,15 @@ def _excerpt_sre_report(report_path: Path) -> dict[str, str]:
     """
     try:
         text = report_path.read_text(encoding="utf-8")
-    except OSError:
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        LOGGER.warning(
+            "cannot read SRE report %s: errno=%s (%s)",
+            report_path,
+            exc.errno,
+            exc,
+        )
         return {}
     excerpt: dict[str, str] = {}
     for line in text.splitlines():
