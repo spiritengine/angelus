@@ -21,12 +21,15 @@ socket.
 
 from __future__ import annotations
 
+import errno
 import os
 import socket as socketlib
 import threading
 
+import pytest
 from click.testing import CliRunner
 
+import angelus.cli as cli
 from angelus.cli import _control_timeout, main
 from angelus.storage import Catalog, init_db
 
@@ -146,3 +149,78 @@ def test_cli_reports_not_reachable_when_socket_refused(tmp_path) -> None:
     assert "daemon: not reachable" in result.output
     assert "alive but control socket" not in result.output
     assert "observations pending triage: 1" in result.output
+
+
+@pytest.mark.parametrize(
+    "socket_error",
+    [
+        PermissionError(errno.EACCES, "Permission denied"),
+        OSError(errno.EMFILE, "Too many open files"),
+    ],
+    ids=["permission", "resource"],
+)
+def test_request_preserves_local_socket_error(
+    tmp_path, monkeypatch, socket_error
+) -> None:
+    state = tmp_path / "state"
+    state.mkdir()
+
+    class FailingSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, path):
+            raise socket_error
+
+    monkeypatch.setattr(cli.socket, "socket", lambda *args: FailingSocket())
+
+    response = cli._request(tmp_path, "health", {})
+
+    assert isinstance(response, cli._ControlSocketError)
+    assert response.error is socket_error
+
+
+@pytest.mark.parametrize(
+    ("socket_error", "detail"),
+    [
+        (
+            PermissionError(errno.EACCES, "Permission denied"),
+            "[Errno 13] Permission denied",
+        ),
+        (
+            OSError(errno.EMFILE, "Too many open files"),
+            "[Errno 24] Too many open files",
+        ),
+    ],
+    ids=["permission", "resource"],
+)
+def test_cli_renders_local_socket_error_for_reads_and_writes(
+    tmp_path, monkeypatch, socket_error, detail
+) -> None:
+    failure = cli._ControlSocketError(socket_error)
+    monkeypatch.setattr(cli, "_request", lambda root, op, args: failure)
+    runner = CliRunner()
+
+    for argv in (["health"], ["incident", "list"], ["mute", "list"]):
+        result = runner.invoke(main, [*argv, "--root", str(tmp_path)])
+        assert result.exit_code == 0, (argv, result.output)
+        assert f"daemon: control socket failed locally: {detail}" in result.output
+        assert "daemon: not running" not in result.output
+        assert "daemon: not reachable" not in result.output
+
+    result = runner.invoke(
+        main,
+        ["mute", "add", "scheduled/x", "30m", "--root", str(tmp_path)],
+    )
+    assert result.exit_code != 0, result.output
+    assert (
+        f"angelus control socket failed locally: {detail}; "
+        "mute add did not complete"
+    ) in result.output
+    assert "daemon is not running" not in result.output

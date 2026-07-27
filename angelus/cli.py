@@ -27,6 +27,7 @@ import os
 import socket
 import sqlite3
 import urllib.parse
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -67,6 +68,13 @@ _CONTROL_TIMEOUT_ENV = "ANGELUS_CONTROL_TIMEOUT"
 # daemon-status label changes, so a slow-but-healthy daemon is never misreported
 # as not running.
 _TIMED_OUT = object()
+
+@dataclass(frozen=True)
+class _ControlSocketError:
+    """A local access/resource failure distinct from daemon unavailability."""
+
+    error: OSError
+
 
 # Window duration units for `timeline --window`, mirroring the mute-duration
 # parser in daemon.py: a unit suffix is required so a bare integer can never
@@ -202,7 +210,13 @@ def _slow_socket_status() -> str:
     )
 
 
-def _request(root: Path, op: str, args: dict[str, Any]) -> dict[str, Any] | None:
+def _control_socket_error_status(failure: _ControlSocketError) -> str:
+    return f"control socket failed locally: {failure.error}"
+
+
+def _request(
+    root: Path, op: str, args: dict[str, Any]
+) -> dict[str, Any] | _ControlSocketError | None:
     """Send one op over the control socket and return the parsed response.
 
     Returns None if the socket is absent, the connection is refused, or the
@@ -218,10 +232,12 @@ def _request(root: Path, op: str, args: dict[str, Any]) -> dict[str, Any] | None
     than down -- a loaded-but-healthy daemon must not be misreported as absent.
     A timeout BEFORE connect (nothing accepting) is plain unreachable and stays
     None.
+
+    Returns _ControlSocketError for other local OSError failures, such as
+    permission denial or descriptor exhaustion. These are neither evidence
+    that the daemon is down nor safe to hide behind the normal down fallback.
     """
     sock_path = _socket_path(root)
-    if not sock_path.exists():
-        return None
     timeout = _control_timeout()
     connected = False
     try:
@@ -245,8 +261,10 @@ def _request(root: Path, op: str, args: dict[str, Any]) -> dict[str, Any] | None
         # from down. Only the post-connect case earns the slow signal; a timeout
         # while still connecting means nothing is accepting -> unreachable.
         return _TIMED_OUT if connected else None
-    except (ConnectionError, FileNotFoundError, OSError):
+    except (ConnectionError, FileNotFoundError):
         return None
+    except OSError as exc:
+        return _ControlSocketError(exc)
     if not buffer:
         return None
     try:
@@ -317,6 +335,13 @@ def _require_daemon(
             err=True,
         )
         raise SystemExit(1)
+    if isinstance(response, _ControlSocketError):
+        click.echo(
+            f"angelus {_control_socket_error_status(response)}; "
+            f"{command} did not complete",
+            err=True,
+        )
+        raise SystemExit(1)
     if response is None:
         click.echo(
             f"angelus daemon is not running; {command} requires the daemon",
@@ -352,6 +377,11 @@ def health(root: Path) -> None:
         # alive-but-slow rather than down, so the operator is not misled.
         _render_health_fallback(root, daemon_status=_slow_socket_status())
         return
+    if isinstance(response, _ControlSocketError):
+        _render_health_fallback(
+            root, daemon_status=_control_socket_error_status(response)
+        )
+        return
     if response is None:
         _render_health_fallback(root)
         return
@@ -374,6 +404,11 @@ def incident_list(root: Path) -> None:
     response = _request(root, "incident_list", {})
     if response is _TIMED_OUT:
         _render_incidents_fallback(root, daemon_status=_slow_socket_status())
+        return
+    if isinstance(response, _ControlSocketError):
+        _render_incidents_fallback(
+            root, daemon_status=_control_socket_error_status(response)
+        )
         return
     if response is None:
         _render_incidents_fallback(root)
@@ -449,6 +484,11 @@ def mute_list(root: Path) -> None:
     response = _request(root, "mute_list", {})
     if response is _TIMED_OUT:
         _render_mutes_fallback(root, daemon_status=_slow_socket_status())
+        return
+    if isinstance(response, _ControlSocketError):
+        _render_mutes_fallback(
+            root, daemon_status=_control_socket_error_status(response)
+        )
         return
     if response is None:
         _render_mutes_fallback(root)

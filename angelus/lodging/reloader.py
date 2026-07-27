@@ -14,6 +14,7 @@ directly after dropping a file. The runtime path uses the observer.
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import queue
 import time
@@ -96,6 +97,20 @@ def _identify(root: Path, path: Path) -> _Identified | None:
     if len(parts) == 2 and parts[0] == "fixers":
         return _Identified("fixer", stem, yaml_path)
     return None
+
+
+def _resolve_for_containment(path: Path) -> Path:
+    """Resolve a watched path while preserving missing-path handling.
+
+    Python 3.13 only reports a symlink loop from strict resolution; older
+    supported versions report it from both modes. Try strict resolution first
+    so loops stay visible on every supported version, then retain the original
+    non-strict behavior for deletion events and dangling paths.
+    """
+    try:
+        return path.resolve(strict=True)
+    except FileNotFoundError:
+        return path.resolve(strict=False)
 
 
 def _is_within(candidate: Path, base: Path) -> bool:
@@ -329,9 +344,17 @@ class LodgingReloader:
 
         base = self.root / path.relative_to(self.root).parts[0]
         try:
-            base_resolved = base.resolve(strict=False)
-            resolved = path.resolve(strict=False)
+            base_resolved = _resolve_for_containment(base)
+            resolved = _resolve_for_containment(path)
+        except RuntimeError as exc:
+            # pathlib uses RuntimeError for symlink loops on Python 3.11/3.12.
+            LOGGER.warning("lodging path symlink loop: %s (%s)", path, exc)
+            return
         except OSError as exc:
+            # Python 3.13 changed strict Path.resolve() loops to OSError(ELOOP).
+            if exc.errno == errno.ELOOP:
+                LOGGER.warning("lodging path symlink loop: %s (%s)", path, exc)
+                return
             LOGGER.warning("lodging path resolve failed: %s (%s)", path, exc)
             return
         if not _is_within(resolved, base_resolved):

@@ -9,6 +9,7 @@ in-loop, and assert effects on lodging and the scheduler.
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import time
 from pathlib import Path
@@ -217,6 +218,51 @@ def test_symlink_outside_base_is_refused(tmp_path, caplog) -> None:
             )
         )
         assert rows == []
+    finally:
+        daemon.connection.close()
+
+
+@pytest.mark.parametrize(
+    "resolve_error",
+    [
+        RuntimeError("Symlink loop from '/lodging/pipes/loop.yaml'"),
+        OSError(errno.ELOOP, "Too many levels of symbolic links"),
+    ],
+    ids=["python-3.11-3.12-runtime-error", "python-3.13-os-error"],
+)
+def test_symlink_loop_is_logged_distinctly_on_supported_pythons(
+    tmp_path, caplog, monkeypatch, resolve_error
+) -> None:
+    _write_lodging(tmp_path)
+    daemon, reloader = _make_daemon(tmp_path)
+    loop_path = tmp_path / "pipes" / "loop.yaml"
+    real_resolve = Path.resolve
+    resolve_calls: list[tuple[Path, bool]] = []
+
+    def fail_resolve(path: Path, strict: bool = False) -> Path:
+        resolve_calls.append((path, strict))
+        if path == loop_path:
+            raise resolve_error
+        return real_resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", fail_resolve)
+    try:
+        with caplog.at_level("WARNING"):
+            asyncio.run(reloader._handle_path(loop_path))
+
+        assert resolve_calls == [
+            (tmp_path / "pipes", True),
+            (loop_path, True),
+        ]
+        assert any(
+            "lodging path symlink loop" in record.message
+            and str(loop_path) in record.message
+            for record in caplog.records
+        )
+        assert not any(
+            "lodging path resolve failed" in record.message
+            for record in caplog.records
+        )
     finally:
         daemon.connection.close()
 
