@@ -1696,8 +1696,10 @@ class AngelusDaemon:
         task.cancel()
         try:
             await task
-        except (asyncio.CancelledError, Exception):
+        except asyncio.CancelledError:
             pass
+        except Exception:
+            LOGGER.exception("pipe loop %s failed during shutdown", pipe_name)
 
     async def _fire_source(self, source_ref: str) -> tuple[int | None, str] | None:
         """Run a source's shell check and write an observation ONLY when the

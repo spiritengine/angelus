@@ -277,8 +277,10 @@ class LodgingReloader:
             self._task.cancel()
             try:
                 await self._task
-            except (asyncio.CancelledError, Exception):
+            except asyncio.CancelledError:
                 pass
+            except Exception:
+                LOGGER.exception("lodging reload task failed during shutdown")
             self._task = None
 
     async def _poll_loop(self) -> None:
