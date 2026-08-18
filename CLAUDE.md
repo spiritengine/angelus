@@ -7,7 +7,10 @@ checkout is the one with sharp edges. The full migration plan is SKEIN brief
 ## The repo map
 
 - **This checkout (~/projects/angelus)** — the engine code, on the ORIGINAL
-  (pre-publication) history. Deliberately has **no git remote**.
+  (pre-publication) history. `origin` is a **private off-disk backup** at
+  `github.com/smythp/angelus` (this same pre-publication history; added
+  2026-07-02 to get the felled work off a single disk). It is NOT the public
+  repo — pushing to `origin` is safe; see Rule 1 about the public repo.
 - **github.com/spiritengine/angelus (public)** — the canonical published
   engine. Same content, **different commit hashes**: history was rewritten
   with git-filter-repo to strip the personal lodging before publication.
@@ -19,7 +22,10 @@ checkout is the one with sharp edges. The full migration plan is SKEIN brief
 
 ## Rules that will save you
 
-1. **Do not add the public repo as a remote here and do not push.** The
+1. **Do not add the _public_ `spiritengine/angelus` repo as a remote here and
+   do not push to it.** (The private `origin` = `smythp/angelus` off-disk
+   backup, added 2026-07-02, is fine and shares this checkout's real history —
+   this rule is only about the public repo.) The
    histories are unrelated; a push will be rejected or, forced, would
    destroy the published history. To publish work from here during the gap:
    clone the public repo, `git cherry-pick` the new master commits onto it,
